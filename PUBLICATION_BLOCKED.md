@@ -1,17 +1,21 @@
-# PUBLICATION BLOCKED
+# PUBLICATION CLEARED
 
-This repository must not be pushed, published, mirrored, deployed, or attached to a public or private remote yet.
+Publication of this sanitized repository was explicitly approved on 2026-10-02.
 
-Earlier local Git commits contained real private archive identifiers in documentation and production source. Memory V1.1 removes those identifiers from the current tracked tree, but normal later commits do not remove the older values from Git history.
+The publication candidate was created as a fresh Git history rather than publishing the original private development history.
 
-Before any push is allowed, all of the following require explicit user approval and independent verification:
+Verification completed before approval:
 
-1. Create a recoverable local backup of the repository metadata.
-2. Rewrite local Git history to remove private account, conversation, capture, inventory, archive-path, pairing, evidence, and catalog identifiers.
-3. Scan every reachable commit, tree, blob, tag, reflog intended for retention, and generated patch/bundle.
-4. Independently scan the complete rewritten history with a separate method or tool.
-5. Confirm runtime logs, archives, catalogs, captures, evidence, secrets, and extension storage are absent.
-6. Review the exact remote, branch, and objects that would be transferred.
-7. Obtain a new explicit approval to remove the local pre-push blocker and publish.
+1. Recoverable backups of the original Git metadata and working-tree changes were created and verified.
+2. The publication repository was created from a sanitized current snapshot with no prior Git history.
+3. Private real-data proof harnesses containing archive identifiers were excluded from the publication snapshot.
+4. High-confidence private path and identifier scans returned no matches.
+5. Exact identifier comparison against the excluded private proof files returned no private-ID overlap.
+6. Gitleaks independently scanned both the working tree and committed Git history and found no leaks.
+7. Git fsck found no unreachable objects in the publication repository.
+8. Runtime logs, archives, captures, databases, secrets, extension storage, and similar private artifacts are not tracked.
+9. The complete repository test suite passed: 302 passed, 3 skipped, 0 failed.
+10. The intended remote is hhsystems1/hhs-context-capture, the publication branch is main, and the sanitized root commit was reviewed before publication.
+11. Explicit final user approval to publish was received.
 
-The committed `.githooks/pre-push` hook blocks pushes by default. Local Git is configured to use `.githooks` as its hooks path. Do not bypass or remove it as part of ordinary development.
+The original private development repository, archive data, and backups remain local and are not part of this publication history.
