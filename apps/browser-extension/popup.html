@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HHS Context Capture</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>Context Capture</h1>
+    <p class="scope">Local preservation tools - Build 0.3.0</p>
+    <label for="pair-code">Collector pairing code</label>
+    <div class="row"><input id="pair-code" autocomplete="off" spellcheck="false"><button id="pair">Pair</button></div>
+    <button id="capture" class="primary" disabled>Capture Current Conversation</button>
+    <button id="discover">Discover This Site (Dry Run, Read-only)</button>
+    <button id="inventory" disabled>Inventory Sidebar (Read-only)</button>
+    <button id="prepare-recapture" disabled>Prepare Current Conversation for Recapture</button>
+    <button id="confirm-recapture" disabled>Confirm One Immutable Recapture</button>
+    <p id="status" role="status" aria-live="polite"></p>
+    <pre id="discovery-summary" hidden></pre>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "@hhs/browser-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hhs/adapter-chatgpt": "*",
+    "@hhs/canonical-schema": "*",
+    "@hhs/capture-engine": "*",
+    "@hhs/capture-planning": "*",
+    "@hhs/discovery-engine": "*",
+    "@hhs/discovery-schema": "*",
+    "@hhs/inventory-schema": "*"
+  },
+  "scripts": { "build": "node ../../scripts/build-extension.mjs" }
+}

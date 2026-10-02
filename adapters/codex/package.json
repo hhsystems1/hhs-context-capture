@@ -1,0 +1,10 @@
+{
+  "name": "@hhs/adapter-codex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/import-adapter.ts" },
+  "dependencies": {
+    "@hhs/canonical-schema": "*"
+  }
+}

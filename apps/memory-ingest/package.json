@@ -1,0 +1,11 @@
+{
+  "name": "@hhs/memory-ingest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hhs/capture-planning": "*",
+    "@hhs/memory-schema": "*",
+    "pg": "8.22.0"
+  }
+}

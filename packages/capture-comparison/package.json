@@ -1,0 +1,11 @@
+{
+  "name": "@hhs/capture-comparison",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hhs/canonical-schema": "*",
+    "@hhs/capture-versioning": "*"
+  }
+}

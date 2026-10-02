@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helpinghandsystems.local/schemas/discovery-run-0.1.0.json",
+  "title": "Universal Discovery Run",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "discovery_run_id",
+    "source",
+    "account",
+    "started_at",
+    "completed_at",
+    "status",
+    "boundary_verification",
+    "capabilities",
+    "containers",
+    "items",
+    "relationships",
+    "evidence",
+    "warnings",
+    "snapshot_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "discovery_run_id": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "source_kind", "observed_host", "transport", "adapter_id", "adapter_version"],
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1 },
+        "source_kind": { "type": "string", "minLength": 1 },
+        "observed_host": { "type": "string" },
+        "transport": { "enum": ["browser_dom", "local_file", "export_archive", "http_api", "filesystem"] },
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "adapter_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["opaque_account_reference"],
+      "properties": { "opaque_account_reference": { "type": "string", "minLength": 1 } }
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "needs_review"] },
+    "boundary_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enumeration_start_reached",
+        "enumeration_end_reached",
+        "traversal_stabilized",
+        "item_count_stabilized",
+        "initial_state_restored"
+      ],
+      "properties": {
+        "enumeration_start_reached": { "type": "boolean" },
+        "enumeration_end_reached": { "type": "boolean" },
+        "traversal_stabilized": { "type": "boolean" },
+        "item_count_stabilized": { "type": "boolean" },
+        "initial_state_restored": { "type": "boolean" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "enum": ["supported", "unsupported", "unknown"] }
+    },
+    "containers": { "type": "array", "items": { "$ref": "#/$defs/container" } },
+    "items": { "type": "array", "items": { "$ref": "#/$defs/item" } },
+    "relationships": { "type": "array", "items": { "$ref": "#/$defs/relationship" } },
+    "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "snapshot_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "$defs": {
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "container_id",
+        "container_kind",
+        "title",
+        "depth",
+        "position",
+        "observed_item_count",
+        "enumeration_status",
+        "observed_at",
+        "observation_fingerprint",
+        "evidence_ids",
+        "review_status",
+        "review_reasons",
+        "source_metadata"
+      ],
+      "properties": {
+        "container_id": { "type": "string", "minLength": 1 },
+        "source_native_id": { "type": "string" },
+        "parent_container_id": { "type": "string" },
+        "container_kind": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "source_url": { "type": "string" },
+        "depth": { "type": "integer", "minimum": 0 },
+        "position": { "type": "integer", "minimum": 0 },
+        "declared_item_count": { "type": "integer", "minimum": 0 },
+        "observed_item_count": { "type": "integer", "minimum": 0 },
+        "enumeration_status": { "enum": ["complete", "partial", "not_attempted", "blocked"] },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "observation_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } },
+        "review_status": { "enum": ["clear", "needs_review"] },
+        "review_reasons": { "type": "array", "items": { "type": "string" } },
+        "source_metadata": { "type": "object" }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item_id",
+        "container_id",
+        "item_kind",
+        "title",
+        "position",
+        "declared",
+        "evidence_class",
+        "capture_feasibility",
+        "observed_at",
+        "observation_fingerprint",
+        "evidence_ids",
+        "review_status",
+        "review_reasons",
+        "source_metadata"
+      ],
+      "properties": {
+        "item_id": { "type": "string", "minLength": 1 },
+        "source_native_id": { "type": "string" },
+        "container_id": { "type": "string", "minLength": 1 },
+        "item_kind": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "source_url": { "type": "string" },
+        "position": { "type": "integer", "minimum": 0 },
+        "declared": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "created_at": { "type": "string" },
+            "modified_at": { "type": "string" },
+            "size_bytes": { "type": "integer", "minimum": 0 },
+            "item_count": { "type": "integer", "minimum": 0 },
+            "message_count": { "type": "integer", "minimum": 0 },
+            "duration_seconds": { "type": "number", "minimum": 0 },
+            "mime_type": { "type": "string" },
+            "version_label": { "type": "string" },
+            "checksum": { "type": "string" }
+          }
+        },
+        "evidence_class": { "enum": ["original_evidence", "derived_generated", "mixed", "unknown"] },
+        "capture_feasibility": { "enum": ["capturable", "metadata_only", "blocked", "unknown"] },
+        "blocked_reason": { "type": "string" },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "observation_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } },
+        "review_status": { "enum": ["clear", "needs_review"] },
+        "review_reasons": { "type": "array", "items": { "type": "string" } },
+        "source_metadata": { "type": "object" }
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relationship_id", "from_item_id", "to_item_id", "kind", "confidence", "basis"],
+      "properties": {
+        "relationship_id": { "type": "string", "minLength": 1 },
+        "from_item_id": { "type": "string", "minLength": 1 },
+        "to_item_id": { "type": "string", "minLength": 1 },
+        "kind": {
+          "enum": ["derived_from", "attachment_of", "transcript_of", "duplicate_of", "version_of", "references", "contained_in"]
+        },
+        "confidence": { "enum": ["observed", "asserted_by_source", "inferred"] },
+        "basis": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "kind", "media_type", "value", "sha256", "evidence_locator", "captured_at"],
+      "properties": {
+        "evidence_id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["observation_log", "sanitized_dom", "screenshot"] },
+        "media_type": { "type": "string" },
+        "value": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidence_locator": { "type": "string" },
+        "captured_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>HHS Mission Control</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="shell">
+    <aside class="rail" aria-label="Mission Control navigation">
+      <div class="brand"><span class="brand-mark">H</span><span><strong>HHS</strong><small>Mission Control</small></span></div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="command"><span>01</span>Command Center</button>
+        <button class="nav-item" data-view="operations"><span>02</span>Capture Operations</button>
+        <button class="nav-item" data-view="archive-inspector"><span>03</span>Archive Inspector</button>
+        <button class="nav-item" data-view="reviews"><span>04</span>Review Inbox</button>
+        <button class="nav-item" data-view="memory"><span>05</span>Memory Explorer</button>
+        <button class="nav-item" data-view="registry"><span>06</span>Sources &amp; Agents</button>
+      </nav>
+      <div class="rail-foot">
+        <span class="pulse" aria-hidden="true"></span>
+        <span><strong>Local only</strong><small>Read-only reporting</small></span>
+      </div>
+    </aside>
+    <main id="main">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Operational visibility / V1</p>
+          <h1 id="view-title">Command Center</h1>
+        </div>
+        <div class="top-actions">
+          <span id="connection" class="connection"><span class="pulse"></span>Connecting</span>
+          <time id="updated">Waiting for status</time>
+          <button id="refresh" class="icon-button" aria-label="Refresh status">↻</button>
+        </div>
+      </header>
+
+      <div id="alert" class="alert hidden" role="status"></div>
+
+      <section id="command" class="view active" aria-labelledby="view-title">
+        <div class="hero-grid">
+          <article class="hero-card">
+            <p class="eyebrow">Human attention</p>
+            <div class="hero-number" id="needs-you">—</div>
+            <h2>Needs You</h2>
+            <p>Reviews, failures, interruptions, and anything that may be stuck.</p>
+          </article>
+          <article class="card posture">
+            <div class="card-head"><div><p class="eyebrow">Safety posture</p><h2>Protected by default</h2></div><span class="seal">LOCAL</span></div>
+            <div id="safety-posture" class="posture-list loading">Loading protection status…</div>
+          </article>
+        </div>
+        <div class="section-heading"><div><p class="eyebrow">Live foundation</p><h2>System health</h2></div><p>Updates arrive automatically while this page is open.</p></div>
+        <div id="health-grid" class="health-grid loading">Checking local services…</div>
+        <div class="two-col">
+          <article class="card">
+            <div class="card-head"><div><p class="eyebrow">Now</p><h2>Latest activity</h2></div></div>
+            <div id="activity" class="activity-list loading">Loading recent activity…</div>
+          </article>
+          <article class="card">
+            <div class="card-head"><div><p class="eyebrow">Memory</p><h2>Evidence at a glance</h2></div><span class="tag evidence">RAW → PROPOSED → APPROVED</span></div>
+            <div id="memory-glance" class="metric-grid loading">Loading memory counts…</div>
+          </article>
+        </div>
+      </section>
+
+      <section id="operations" class="view">
+        <div class="section-heading"><div><p class="eyebrow">Capture Operations V1</p><h2>Lifecycle and evidence state</h2></div><p>Safe metadata only. Pairing-ready work is not treated as a failed capture.</p></div>
+        <div class="filters" role="group" aria-label="Operation filters">
+          <button class="chip active" data-status="all">All</button>
+          <button class="chip" data-status="active">Active</button>
+          <button class="chip" data-status="completed">Complete</button>
+          <button class="chip" data-status="needs_review">Needs review</button>
+          <button class="chip" data-status="failed">Stopped</button>
+        </div>
+        <div class="split">
+          <div id="operation-list" class="stack loading">Loading operations…</div>
+          <article class="card timeline-card">
+            <div class="card-head"><div><p class="eyebrow">Selected operation</p><h2 id="timeline-title">Event timeline</h2></div></div>
+            <div id="timeline" class="timeline empty">Choose an operation to inspect its safe event history.</div>
+          </article>
+        </div>
+      </section>
+
+      <section id="archive-inspector" class="view">
+        <div class="section-heading">
+          <div><p class="eyebrow">Mission Control Archive Inspector V1</p><h2>Understand a finalized capture</h2></div>
+          <span class="tag warning">PRIVATE · READ ONLY</span>
+        </div>
+        <div id="inspector-empty" class="notice"><strong>No private inspection selected.</strong> Generate an approved derived report, then refresh Mission Control.</div>
+        <div id="inspector-content" class="hidden">
+          <article class="card inspector-hero">
+            <div class="inspector-title">
+              <div>
+                <p class="eyebrow" id="inspector-ref">Safe capture</p>
+                <h2 id="inspector-title">Archive inspection</h2>
+                <p id="inspector-date" class="muted"></p>
+              </div>
+              <div class="verdict-box">
+                <span id="inspector-verdict" class="badge needs_review">Usable with review</span>
+                <p id="inspector-verdict-text"></p>
+              </div>
+            </div>
+            <div id="inspector-metrics" class="metric-strip"></div>
+          </article>
+
+          <div class="layer-grid" aria-label="Evidence and knowledge layers">
+            <article class="layer-card raw"><span>01</span><strong>Raw Evidence</strong><p id="layer-raw"></p></article>
+            <article class="layer-card derived"><span>02</span><strong>Derived Summary</strong><p id="layer-derived"></p></article>
+            <article class="layer-card proposed"><span>03</span><strong>Proposed Knowledge</strong><p>None. Nothing was promoted.</p></article>
+            <article class="layer-card approved"><span>04</span><strong>Approved Knowledge</strong><p>None. Human approval remains separate.</p></article>
+          </div>
+
+          <div class="two-col inspector-overview">
+            <article class="card">
+              <div class="card-head"><div><p class="eyebrow">Boundaries</p><h2>First and last messages</h2></div></div>
+              <div id="inspector-boundaries" class="boundary-list"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><div><p class="eyebrow">Structure</p><h2>Preserved content</h2></div></div>
+              <div id="inspector-structure" class="compact-stats"></div>
+            </article>
+          </div>
+
+          <div class="section-heading"><div><p class="eyebrow">Range-linked understanding</p><h2>Topic outline</h2></div><p>Every statement carries exact message-range and source-hash provenance.</p></div>
+          <div id="inspector-topics" class="topic-grid"></div>
+
+          <div class="section-heading"><div><p class="eyebrow">Privacy-sanitized projection</p><h2>Searchable transcript</h2></div><p>Original source hashes remain visible; local paths and credentials do not.</p></div>
+          <form id="inspector-search-form" class="inspector-search">
+            <label class="search-box"><span class="visually-hidden">Search transcript</span><span aria-hidden="true">⌕</span><input id="inspector-search-text" maxlength="200" autocomplete="off" placeholder="Search this capture…"></label>
+            <select id="inspector-role" aria-label="Message role"><option value="">Any role</option><option value="user">User</option><option value="assistant">Assistant</option><option value="tool">Tool</option><option value="system_visible">Visible system</option></select>
+            <label><span>From</span><input id="inspector-range-start" type="number" min="0" value="0"></label>
+            <label><span>To</span><input id="inspector-range-end" type="number" min="0" value="791"></label>
+            <button class="primary" type="submit">Apply filters</button>
+          </form>
+          <div class="transcript-toolbar"><span id="inspector-result-count">0 messages</span><div><button id="inspector-prev" class="secondary" type="button">Previous</button><button id="inspector-next" class="secondary" type="button">Next</button></div></div>
+          <div id="inspector-transcript" class="transcript-list empty">Choose an inspection to load its transcript.</div>
+
+          <div class="section-heading"><div><p class="eyebrow">Completeness and integrity</p><h2>Review evidence</h2></div></div>
+          <div class="three-col">
+            <article class="card inspector-panel"><h3>Branches &amp; boundaries</h3><div id="inspector-completeness"></div></article>
+            <article class="card inspector-panel"><h3>Warnings &amp; uncertainty</h3><div id="inspector-warnings"></div></article>
+            <article class="card inspector-panel"><h3>Hashes &amp; provenance</h3><div id="inspector-provenance"></div></article>
+          </div>
+        </div>
+      </section>
+
+      <section id="reviews" class="view">
+        <div class="section-heading"><div><p class="eyebrow">Human governance</p><h2>Review Inbox</h2></div><span class="tag warning">READ ONLY</span></div>
+        <div class="notice"><strong>No automatic approval.</strong> Mission Control can show review work, but V1 cannot accept, reject, release, or resolve anything.</div>
+        <div id="review-list" class="review-grid loading">Loading review items…</div>
+      </section>
+
+      <section id="memory" class="view">
+        <div class="section-heading"><div><p class="eyebrow">Structured truth &amp; provenance</p><h2>Memory Explorer</h2></div><p>Search stays local and is never placed in the URL.</p></div>
+        <div id="memory-counts" class="metric-strip loading">Loading counts…</div>
+        <form id="search-form" class="search-card">
+          <label class="search-box"><span class="visually-hidden">Search</span><span aria-hidden="true">⌕</span><input id="search-text" maxlength="200" autocomplete="off" placeholder="Search approved knowledge…"></label>
+          <select id="search-tier" aria-label="Knowledge tier"><option value="approved">Approved knowledge</option><option value="raw">Raw evidence (debug)</option></select>
+          <span id="raw-filters" class="hidden">
+            <select id="search-type" aria-label="Record type"><option value="">Messages and blocks</option><option value="message">Messages</option><option value="block">Content blocks</option></select>
+            <select id="search-role" aria-label="Role"><option value="">Any role</option><option value="user">User</option><option value="assistant">Assistant</option><option value="tool">Tool</option><option value="system_visible">Visible system</option></select>
+            <select id="search-verification" aria-label="Verification"><option value="">Any verification</option><option value="complete">Complete</option><option value="needs_review">Needs review</option><option value="partial">Partial</option><option value="failed">Failed</option></select>
+          </span>
+          <button class="primary" type="submit">Search</button>
+        </form>
+        <div class="tier-legend" aria-label="Knowledge tier legend">
+          <span><i class="tier raw"></i><strong>Raw evidence</strong> exact preserved source</span>
+          <span><i class="tier proposed"></i><strong>Proposed knowledge</strong> waiting for a human</span>
+          <span><i class="tier approved"></i><strong>Approved knowledge</strong> human accepted</span>
+        </div>
+        <div id="search-results" class="search-results loading">Loading approved knowledge…</div>
+      </section>
+
+      <section id="registry" class="view">
+        <div class="section-heading"><div><p class="eyebrow">Connection policy</p><h2>Sources, Agents &amp; Destinations</h2></div><p>Registry only. V1 does not connect external systems.</p></div>
+        <div id="registry-grid" class="registry-grid loading">Loading registry…</div>
+        <article class="card ownership">
+          <div class="card-head"><div><p class="eyebrow">Clear responsibilities</p><h2>Ownership map</h2></div></div>
+          <dl>
+            <div><dt>Archive</dt><dd>Immutable originals</dd></div>
+            <div><dt>PostgreSQL / Supabase</dt><dd>Structured truth and provenance</dd></div>
+            <div><dt>Mission Control</dt><dd>Visibility, review, and governance</dd></div>
+            <div><dt>Obsidian</dt><dd>Later approved human-readable projection</dd></div>
+            <div><dt>Hermes</dt><dd>Orchestration</dd></div>
+            <div><dt>Codex</dt><dd>Building, testing, and repair</dd></div>
+          </dl>
+        </article>
+      </section>
+    </main>
+  </div>
+  <noscript>HHS Mission Control requires JavaScript for its local dashboard.</noscript>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

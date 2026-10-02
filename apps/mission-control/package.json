@@ -1,0 +1,12 @@
+{
+  "name": "@hhs/mission-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pg": "8.22.0"
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-mission-control.mjs"
+  }
+}

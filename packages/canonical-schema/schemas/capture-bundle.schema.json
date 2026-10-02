@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helpinghands.systems/schemas/capture-bundle/0.1.0",
+  "title": "Universal Context Capture Bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "capture", "platform", "account", "conversation", "messages", "branches", "attachments", "citations", "artifacts", "tool_events", "evidence", "verification", "platform_metadata"],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "capture": {
+      "type": "object",
+      "required": ["capture_id", "started_at", "completed_at", "source_url", "adapter_version", "status"],
+      "properties": {
+        "capture_id": { "type": "string", "minLength": 1 },
+        "started_at": { "type": "string" },
+        "completed_at": { "type": "string" },
+        "source_url": { "type": "string" },
+        "adapter_version": { "type": "string" },
+        "status": { "enum": ["complete", "partial", "failed", "needs_review"] }
+      },
+      "additionalProperties": false
+    },
+    "platform": {
+      "type": "object",
+      "required": ["id", "observed_host"],
+      "properties": { "id": { "type": "string" }, "observed_host": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "account": {
+      "type": "object",
+      "required": ["opaque_account_reference"],
+      "properties": { "opaque_account_reference": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "conversation": {
+      "type": "object",
+      "required": ["conversation_id", "title", "source_url", "platform_metadata"],
+      "properties": {
+        "conversation_id": { "type": "string" },
+        "platform_conversation_id": { "type": "string" },
+        "title": { "type": "string" },
+        "source_url": { "type": "string" },
+        "platform_metadata": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "messages": { "type": "array", "items": { "$ref": "#/$defs/message" } },
+    "branches": { "type": "array", "items": { "type": "object" } },
+    "attachments": { "type": "array", "items": { "type": "object" } },
+    "citations": { "type": "array", "items": { "type": "object" } },
+    "artifacts": { "type": "array", "items": { "type": "object" } },
+    "tool_events": { "type": "array", "items": { "type": "object" } },
+    "evidence": { "type": "array", "items": { "type": "object" } },
+    "verification": {
+      "type": "object",
+      "required": ["ruleset_version", "status", "checks", "warnings"],
+      "properties": {
+        "ruleset_version": { "type": "string" },
+        "status": { "enum": ["complete", "partial", "failed", "needs_review"] },
+        "checks": { "type": "array", "items": { "type": "object" } },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "platform_metadata": { "type": "object" }
+  },
+  "$defs": {
+    "representation": {
+      "type": "object",
+      "required": ["kind", "value", "sha256", "extraction_method", "evidence_locator"],
+      "properties": {
+        "kind": { "enum": ["inner_text", "text_content", "sanitized_html", "canonical_text"] },
+        "value": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "extraction_method": { "type": "string" },
+        "evidence_locator": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "message": {
+      "type": "object",
+      "required": ["message_id", "sequence", "role", "representations", "content_blocks", "evidence_locators", "observed_at", "platform_metadata"],
+      "properties": {
+        "message_id": { "type": "string" },
+        "platform_message_id": { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "role": { "enum": ["user", "assistant", "tool", "system_visible", "unknown"] },
+        "parent_message_id": { "type": "string" },
+        "branch_id": { "type": "string" },
+        "representations": { "type": "array", "items": { "$ref": "#/$defs/representation" } },
+        "content_blocks": { "type": "array", "items": { "type": "object" } },
+        "evidence_locators": { "type": "array", "items": { "type": "string" } },
+        "observed_at": { "type": "array", "items": { "type": "string" } },
+        "platform_metadata": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

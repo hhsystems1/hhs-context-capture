@@ -1,0 +1,14 @@
+{
+  "name": "@hhs/memory-schema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./invariants": "./src/invariants.ts",
+    "./source-version": "./src/source-version.ts"
+  },
+  "devDependencies": {
+    "ajv": "^8.0.0"
+  }
+}

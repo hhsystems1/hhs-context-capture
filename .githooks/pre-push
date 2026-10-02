@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "HHS PUBLICATION BLOCKED: Git history must be sanitized and independently scanned before any push." >&2
+echo "See PUBLICATION_BLOCKED.md. A new explicit user approval is required." >&2
+exit 1

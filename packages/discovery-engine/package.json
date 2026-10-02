@@ -1,0 +1,11 @@
+{
+  "name": "@hhs/discovery-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapter-contract": "./src/adapter-contract.ts"
+  },
+  "dependencies": { "@hhs/discovery-schema": "*" }
+}

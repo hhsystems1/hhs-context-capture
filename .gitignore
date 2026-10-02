@@ -1,0 +1,30 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Captures must never enter the code repository.
+captures/
+archive/
+HHS-Context-Archive/
+*.capture.json
+.runtime/
+supabase/.branches/
+supabase/.temp/
+
+# Private operational preservation metadata must remain outside Git.
+inventories/
+catalog/
+comparisons/
+operations/
+review-queue.json
+recapture-state.json
+events.jsonl
+
+# Local transfer bundles and Windows-path archive directories.
+*.tgz
+/C:*/

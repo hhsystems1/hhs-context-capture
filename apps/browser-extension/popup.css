@@ -1,0 +1,15 @@
+:root { font: 14px/1.4 system-ui, sans-serif; color: #17211b; background: #f6f8f6; }
+body { margin: 0; width: 360px; }
+main { padding: 18px; }
+h1 { font-size: 18px; margin: 0; }
+.scope { color: #526057; margin: 2px 0 16px; }
+label { display: block; font-weight: 600; margin-bottom: 5px; }
+.row { display: flex; gap: 6px; }
+input { box-sizing: border-box; min-width: 0; flex: 1; padding: 8px; border: 1px solid #aab5ad; border-radius: 5px; }
+button { border: 1px solid #66756b; border-radius: 5px; padding: 8px 12px; background: white; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+.primary { width: 100%; margin-top: 12px; color: white; background: #176b42; border-color: #176b42; font-weight: 700; }
+#inventory, #prepare-recapture, #confirm-recapture { width: 100%; margin-top: 8px; }
+#confirm-recapture { color: white; background: #704b13; border-color: #704b13; }
+#status { min-height: 40px; margin: 12px 0 0; overflow-wrap: anywhere; }
+#status[data-error="true"] { color: #a51d24; }

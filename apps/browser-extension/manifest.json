@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "HHS Universal Context Capture",
+  "version": "0.4.0",
+  "description": "Captures exact accessible rendered AI conversations to the local HHS archive.",
+  "permissions": ["activeTab", "storage", "tabs", "scripting"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "http://127.0.0.1:43117/*",
+    "http://127.0.0.1:54431/*"
+  ],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_popup": "popup.html", "default_title": "HHS context preservation" },
+  "content_scripts": [{
+    "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }]
+}

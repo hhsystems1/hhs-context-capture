@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hhs.local/schemas/memory-foundation-0.1.0.json",
+  "title": "HHS Memory Foundation M1 Bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "workspaces", "source_systems", "source_accounts", "ingestion_runs",
+    "source_records", "capture_versions", "conversations", "messages", "content_blocks",
+    "provenance_edges", "verification_results", "knowledge_candidates", "candidate_evidence",
+    "human_review_events", "approved_knowledge", "entities", "relationships", "contradictions",
+    "supersessions", "use_cases", "decisions", "tasks", "sops", "quarantine_items", "dead_letters"
+  ],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "workspaces": { "$ref": "#/$defs/records" },
+    "source_systems": { "$ref": "#/$defs/records" },
+    "source_accounts": { "$ref": "#/$defs/records" },
+    "ingestion_runs": { "$ref": "#/$defs/records" },
+    "source_records": { "type": "array", "items": { "$ref": "#/$defs/sourceRecord" } },
+    "capture_versions": { "$ref": "#/$defs/records" },
+    "conversations": { "$ref": "#/$defs/records" },
+    "messages": { "type": "array", "items": { "$ref": "#/$defs/message" } },
+    "content_blocks": { "type": "array", "items": { "$ref": "#/$defs/contentBlock" } },
+    "provenance_edges": { "type": "array", "items": { "$ref": "#/$defs/provenanceEdge" } },
+    "verification_results": { "$ref": "#/$defs/records" },
+    "knowledge_candidates": { "type": "array", "items": { "$ref": "#/$defs/candidate" } },
+    "candidate_evidence": { "$ref": "#/$defs/records" },
+    "human_review_events": { "type": "array", "items": { "$ref": "#/$defs/reviewEvent" } },
+    "approved_knowledge": { "type": "array", "items": { "$ref": "#/$defs/approved" } },
+    "entities": { "$ref": "#/$defs/records" },
+    "relationships": { "type": "array", "items": { "$ref": "#/$defs/relationship" } },
+    "contradictions": { "$ref": "#/$defs/records" },
+    "supersessions": { "$ref": "#/$defs/records" },
+    "use_cases": { "$ref": "#/$defs/records" },
+    "decisions": { "$ref": "#/$defs/records" },
+    "tasks": { "$ref": "#/$defs/records" },
+    "sops": { "$ref": "#/$defs/records" },
+    "quarantine_items": { "$ref": "#/$defs/records" },
+    "dead_letters": { "$ref": "#/$defs/records" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "id": { "type": "string", "minLength": 1 },
+    "candidateStatus": { "enum": ["proposed", "in_review", "approved", "rejected", "disputed", "superseded"] },
+    "record": {
+      "type": "object",
+      "required": ["workspace_id", "idempotency_key"],
+      "properties": {
+        "workspace_id": { "$ref": "#/$defs/id" },
+        "idempotency_key": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "records": { "type": "array", "items": { "$ref": "#/$defs/record" } },
+    "representation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["representation_kind", "value", "sha256", "evidence_locator"],
+      "properties": {
+        "representation_kind": { "$ref": "#/$defs/id" },
+        "value": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "evidence_locator": { "type": "string" }
+      }
+    },
+    "sourceRecord": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["source_record_id", "ingestion_run_id", "source_system_id", "source_account_id", "record_kind", "source_sha256"],
+          "properties": {
+            "source_record_id": { "$ref": "#/$defs/id" },
+            "ingestion_run_id": { "$ref": "#/$defs/id" },
+            "source_system_id": { "$ref": "#/$defs/id" },
+            "source_account_id": { "$ref": "#/$defs/id" },
+            "record_kind": { "enum": ["conversation", "message", "content_block", "attachment", "artifact", "other"] },
+            "source_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "message": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["message_id", "conversation_id", "capture_version_id", "sequence", "role", "representations"],
+          "properties": {
+            "message_id": { "$ref": "#/$defs/id" },
+            "conversation_id": { "$ref": "#/$defs/id" },
+            "capture_version_id": { "$ref": "#/$defs/id" },
+            "sequence": { "type": "integer", "minimum": 0 },
+            "role": { "enum": ["user", "assistant", "tool", "system_visible", "unknown"] },
+            "representations": { "type": "array", "items": { "$ref": "#/$defs/representation" } }
+          }
+        }
+      ]
+    },
+    "contentBlock": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["content_block_id", "message_id", "capture_version_id", "sequence", "representations"],
+          "properties": {
+            "content_block_id": { "$ref": "#/$defs/id" },
+            "message_id": { "$ref": "#/$defs/id" },
+            "capture_version_id": { "$ref": "#/$defs/id" },
+            "sequence": { "type": "integer", "minimum": 0 },
+            "representations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/representation" } }
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_id", "source_record_id", "capture_version_id", "conversation_id", "message_id", "content_block_id", "representation_kind", "representation_sha256"],
+      "properties": {
+        "workspace_id": { "$ref": "#/$defs/id" },
+        "source_record_id": { "$ref": "#/$defs/id" },
+        "capture_version_id": { "$ref": "#/$defs/id" },
+        "conversation_id": { "$ref": "#/$defs/id" },
+        "message_id": { "$ref": "#/$defs/id" },
+        "content_block_id": { "$ref": "#/$defs/id" },
+        "representation_kind": { "$ref": "#/$defs/id" },
+        "representation_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "provenanceEdge": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["provenance_edge_id", "target_record_type", "target_record_id", "relation", "evidence", "created_at"],
+          "properties": {
+            "provenance_edge_id": { "$ref": "#/$defs/id" },
+            "target_record_type": { "$ref": "#/$defs/id" },
+            "target_record_id": { "$ref": "#/$defs/id" },
+            "relation": { "enum": ["derived_from", "quotes", "supports", "contradicts"] },
+            "evidence": { "$ref": "#/$defs/evidence" },
+            "created_at": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "candidate": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["knowledge_candidate_id", "kind", "status", "proposed_value", "proposed_value_sha256"],
+          "properties": {
+            "knowledge_candidate_id": { "$ref": "#/$defs/id" },
+            "kind": { "enum": ["claim", "idea", "entity", "relationship", "use_case", "decision", "task", "sop"] },
+            "status": { "$ref": "#/$defs/candidateStatus" },
+            "proposed_value": {},
+            "proposed_value_sha256": { "$ref": "#/$defs/sha256" },
+            "created_at": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "reviewEvent": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["human_review_event_id", "knowledge_candidate_id", "actor_kind", "reviewer_id", "from_status", "to_status", "event_sha256"],
+          "properties": {
+            "human_review_event_id": { "$ref": "#/$defs/id" },
+            "knowledge_candidate_id": { "$ref": "#/$defs/id" },
+            "actor_kind": { "const": "human" },
+            "reviewer_id": { "$ref": "#/$defs/id" },
+            "from_status": { "$ref": "#/$defs/candidateStatus" },
+            "to_status": { "$ref": "#/$defs/candidateStatus" },
+            "rationale": { "type": "string" },
+            "occurred_at": { "type": "string" },
+            "event_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "approved": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["approved_knowledge_id", "knowledge_candidate_id", "approval_event_id", "approved_value", "approved_value_sha256", "provenance_edge_ids"],
+          "properties": {
+            "approved_knowledge_id": { "$ref": "#/$defs/id" },
+            "knowledge_candidate_id": { "$ref": "#/$defs/id" },
+            "approval_event_id": { "$ref": "#/$defs/id" },
+            "approved_value": {},
+            "approved_value_sha256": { "$ref": "#/$defs/sha256" },
+            "provenance_edge_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+            "approved_at": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "relationship": {
+      "allOf": [
+        { "$ref": "#/$defs/record" },
+        {
+          "type": "object",
+          "required": ["relationship_id", "approved_knowledge_id", "subject_id", "object_id", "relationship_kind"],
+          "properties": {
+            "relationship_id": { "$ref": "#/$defs/id" },
+            "approved_knowledge_id": { "$ref": "#/$defs/id" },
+            "subject_id": { "$ref": "#/$defs/id" },
+            "object_id": { "$ref": "#/$defs/id" },
+            "relationship_kind": { "enum": ["contradicts", "supersedes", "refines", "supports", "duplicates", "applies_to_different_context"] }
+          }
+        }
+      ]
+    }
+  }
+}

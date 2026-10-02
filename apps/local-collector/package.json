@@ -1,0 +1,17 @@
+{
+  "name": "@hhs/local-collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hhs/canonical-schema": "*",
+    "@hhs/capture-comparison": "*",
+    "@hhs/capture-versioning": "*",
+    "@hhs/conversation-catalog": "*",
+    "@hhs/inventory-schema": "*",
+    "@hhs/recapture-workflow": "*",
+    "@hhs/review-queue": "*",
+    "@hhs/storage": "*",
+    "ajv": "^8.0.0"
+  }
+}

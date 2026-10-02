@@ -1,0 +1,11 @@
+{
+  "name": "@hhs/capture-versioning",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./archive-reconciler": "./src/archive-reconciler.ts" },
+  "dependencies": {
+    "@hhs/canonical-schema": "*",
+    "@hhs/inventory-schema": "*"
+  }
+}

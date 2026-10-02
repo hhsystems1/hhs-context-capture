@@ -1,0 +1,9 @@
+{
+  "name": "@hhs/conversation-catalog",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@hhs/inventory-schema": "*" },
+  "devDependencies": { "ajv": "^8.0.0" }
+}
