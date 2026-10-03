@@ -1,6 +1,6 @@
-# HHS Mission Control V1
+# HHS Context Console (Mission Control V1)
 
-Mission Control is a local read-only window into HHS capture and memory operations. It runs only on `127.0.0.1`, connects only to the existing local PostgreSQL report-reader login, and creates no second source of truth.
+The **Context Console** is the local read-only window into HHS capture and memory operations. The implementation and commands retain the historical **Mission Control V1** name for compatibility. This is distinct from **HHS Core Mission Control**, which is the business-operating dashboard in HHS Core 2. The Context Console runs only on `127.0.0.1`, connects only to the existing local PostgreSQL report-reader login, and creates no second source of truth.
 
 ## The fifth-grade explanation
 
@@ -8,11 +8,11 @@ Imagine HHS is a careful library:
 
 - The **archive** is the locked room holding original books.
 - **PostgreSQL/Supabase** is the card catalog that says what exists and where its proof came from.
-- **Mission Control** is the librarian's desk. It shows what is working, what arrived, and what needs a person to look at.
+- The **Context Console** is the librarian's desk. It shows what is working, what arrived, and what needs a person to look at.
 
 The desk cannot rewrite a book, approve an idea, or send anything to the internet. It can only read the catalog. Everything stays on this computer.
 
-## What V1 shows
+## What the Context Console shows
 
 - **Command Center:** Docker, Supabase, migrations, collector, extension build, Git, publication protection, recent activity, memory counts, and a single Needs You count.
 - **Capture Operations:** safe operation references, lifecycle states, event timelines, message/archive/verification state, retries, and pairing-ready classification.
@@ -139,7 +139,7 @@ Reserved for isolated Hermes development after a later approval. Mission Control
 |---|---|
 | Immutable archive | Original captured evidence |
 | PostgreSQL/Supabase | Structured truth, operational state, and provenance |
-| Mission Control | Visibility, review, and governance |
+| Context Console (historical Mission Control V1) | Visibility, review, and governance |
 | Obsidian | A later approved human-readable projection |
 | Hermes | Orchestration |
 | Codex | Building, testing, and repair |
@@ -148,7 +148,7 @@ Normal UI database work uses `memory_v1_report_login`, begins a `READ ONLY` tran
 
 ## Troubleshooting and recovery
 
-### Mission Control says offline
+### Context Console says offline
 
 Run:
 
@@ -200,7 +200,7 @@ Prepared pairing means pairing succeeded and no capture started. It is not a fai
 
 ### A capture appears stuck
 
-Inspect `npm run operations:report`, confirm the component is no longer working, wait for the configured timeout, and use the existing explicit reconciliation procedure. Mission Control does not reconcile or retry.
+Inspect `npm run operations:report`, confirm the component is no longer working, wait for the configured timeout, and use the existing explicit reconciliation procedure. The Context Console does not reconcile or retry.
 
 ### Search returns nothing
 
@@ -222,4 +222,4 @@ This stops only processes recorded as managed by `hhs:up` plus local Supabase. I
 - The source registry is declarative; only existing local capabilities report as ready or connected.
 - Real-time updates use a five-second local Server-Sent Events refresh, not database replication.
 - Exact-text search is intentionally capped at 100 results and 200 input characters.
-- Mission Control does not display private filesystem paths or raw database identifiers.
+- The Context Console does not display private filesystem paths or raw database identifiers.

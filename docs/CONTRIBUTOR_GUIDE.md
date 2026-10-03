@@ -1,10 +1,10 @@
-# HHS Context Capture Contributor Guide
+# HHS Context Engine Contributor Guide
 
 This guide is for current and future contributors. It describes the local system without exposing any private identity, path, credential, or capture value. Replace placeholders only in ignored local configuration, never in tracked files.
 
 ## The fifth-grade explanation
 
-HHS Context Capture is like a careful librarian.
+The HHS Context Engine is like a careful librarian with two jobs: preserve what actually happened, and help HHS turn reviewed evidence into durable knowledge without losing the original proof.
 
 When a person says it is okay to save one open AI conversation, the Chrome extension reads what the person can see. It hands the result to a helper program running on the same computer. The helper checks the package, saves a copy that cannot be silently replaced, and writes a safe diary of what happened.
 
@@ -12,11 +12,13 @@ The diary does not copy the conversation. It says things such as “capture star
 
 Another local program can later read an approved archive into PostgreSQL. It first creates proposed knowledge with exact links back to source blocks. A human must approve knowledge; the system does not approve it automatically.
 
-Everything stays local. Publishing is blocked.
+Private captures, credentials, archive data, runtime databases, and proof material stay local. This sanitized code repository may be published; publishing code does not publish private memory data.
 
 ## What the project is
 
-HHS Context Capture preserves exact accessible rendered AI conversations and supporting evidence after a person explicitly authorizes a capture. ChatGPT is the first adapter, but the capture contracts and operations log are platform-neutral.
+The HHS Context Engine is the memory, evidence, provenance, and knowledge backbone for Helping Hands Systems. It preserves exact accessible rendered AI conversations and supporting evidence after a person explicitly authorizes a capture, then supports normalized memory, provenance-preserving knowledge, human review, workspace isolation, approved-knowledge querying, and trusted HHS Core workspace provisioning. ChatGPT is the first adapter, but the capture contracts and memory architecture are platform-neutral.
+
+For the system-level relationship between this repository and HHS Core 2, read [HHS Context Engine Architecture](HHS_CONTEXT_ENGINE_ARCHITECTURE.md).
 
 The project does not claim access to hidden reasoning, server-only data, deleted content, private prompts, inaccessible branches, or original Markdown that the rendered page does not expose.
 
@@ -43,7 +45,7 @@ Chrome popup -> content adapter -> extension worker
                          private receipts and proofs
 ```
 
-The extension is not authoritative. PostgreSQL is authoritative for operational state. The private archive is authoritative for captured source bytes. Git contains code, schemas, migrations, tests, and redacted documentation only.
+The extension is not authoritative. PostgreSQL is authoritative for operational state. The private archive is authoritative for captured source bytes. Git contains sanitized code, schemas, migrations, tests, and redacted documentation only; private runtime data is a separate security boundary.
 
 ## Component responsibilities
 
@@ -163,7 +165,7 @@ Tracked files must not contain:
 - real account, conversation, workspace, capture, or operation identifiers;
 - transcript content, archive payloads, screenshots, DOM, or runtime database state.
 
-Use `.env.example` for redacted placeholders and `.env.memory-v1.local` for ignored local values. The pre-push hook and `PUBLICATION_BLOCKED.md` remain authoritative. Do not add a remote or bypass the hook.
+Use `.env.example` for redacted placeholders and `.env.memory-v1.local` for ignored local values. `PUBLICATION_BLOCKED.md` records the publication status and sanitization evidence for this public snapshot. Never bypass privacy scans or commit private runtime material.
 
 Operational metadata is an allowlist, not a general logging object. Never log arbitrary exceptions.
 
@@ -186,7 +188,7 @@ Do not copy any of these values into an issue, commit, screenshot, chat, or trac
 ## Contributor checklist
 
 - [ ] Read this guide, `SECURITY_AND_PRIVACY.md`, and `PUBLICATION_BLOCKED.md`.
-- [ ] Confirm there are no Git remotes.
+- [ ] Confirm the configured Git remote is the intended sanitized repository before pushing any change.
 - [ ] Confirm the worktree is clean before starting.
 - [ ] Start Docker Desktop and local Supabase.
 - [ ] Confirm ignored local configuration exists.
@@ -196,7 +198,7 @@ Do not copy any of these values into an issue, commit, screenshot, chat, or trac
 - [ ] Inspect `npm run operations:report`.
 - [ ] Run tests, privacy scans, and database lint before checkpointing.
 - [ ] Create a recoverable database backup before migrations.
-- [ ] Never push, publish, deploy, schedule, batch-capture, or add external integrations.
+- [ ] Never push private captures, credentials, runtime databases, archive payloads, or unsanitized proof material. Deployment, scheduling, batch capture, and new external integrations still require their own explicit safety review.
 
 ## Glossary
 
