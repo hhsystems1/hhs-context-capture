@@ -128,3 +128,60 @@ describe("credential surface", () => {
     expect(serviceSource).not.toMatch(/\b(insert|update|delete)\s+(into|from)?\s*memory_v1/i);
   });
 });
+
+describe("workspace-aware trusted Core queries", () => {
+  it("allows only hhs-core to select a provisioned workspace", async () => {
+    const coreToken = "c".repeat(48);
+    const hermesToken = "h".repeat(48);
+    const requestedWorkspace = "workspace_9e2ecc9d7533c6524dd51b9866031b6e";
+    const seenWorkspaces: string[] = [];
+
+    const config = {
+      workspaceId: "workspace_legacy",
+      port: 54431,
+      clients: parseClientTokens(`hhs-core:${coreToken},hermes:${hermesToken}`),
+    };
+
+    activeServer = createQueryService(config, {
+      ...deps,
+      query: async (workspace, question) => {
+        seenWorkspaces.push(workspace);
+        return {
+          question,
+          mode: "deterministic_text_search",
+          trust_scope: "approved_knowledge_only",
+          matches: [fakeMatch],
+        };
+      },
+    });
+
+    await new Promise<void>((resolve) => activeServer!.listen(0, LOOPBACK_HOST, resolve));
+    const address = activeServer.address();
+    if (typeof address !== "object" || !address) throw new Error("no address");
+    const base = `http://127.0.0.1:${address.port}`;
+
+    const core = await fetch(`${base}/memory/workspaces/${requestedWorkspace}/query`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${coreToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ question: "project context" }),
+    });
+
+    expect(core.status).toBe(200);
+    expect(seenWorkspaces).toEqual([requestedWorkspace]);
+
+    const hermes = await fetch(`${base}/memory/workspaces/${requestedWorkspace}/query`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${hermesToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ question: "project context" }),
+    });
+
+    expect(hermes.status).toBe(403);
+    expect(seenWorkspaces).toEqual([requestedWorkspace]);
+  });
+});
