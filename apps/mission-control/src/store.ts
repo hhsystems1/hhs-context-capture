@@ -38,8 +38,10 @@ export const PENDING_REVIEWS_SQL = `select kind,raw_id,status,detail,occurred_at
             jsonb_build_object('reason_code',reason_code,'fatal',fatal),null::timestamptz
             from memory_v1.quarantine_items where workspace_id=$1 and status='open'
           union all select 'knowledge_candidate',k.knowledge_candidate_id,k.status,
-            jsonb_build_object('kind',k.kind,'pipeline_version',k.pipeline_version),k.created_at
+            jsonb_build_object('kind',k.kind,'pipeline_version',k.pipeline_version,'promotion_receipt_id',k.promotion_receipt_id,'promoted_at',p.promoted_at),coalesce(p.promoted_at,k.created_at)
             from memory_v1.trusted_knowledge_candidates k
+            left join memory_v1.promotion_receipts p
+              on (p.workspace_id,p.promotion_receipt_id,p.pipeline_version)=(k.workspace_id,k.promotion_receipt_id,k.pipeline_version)
             where k.workspace_id=$1 and k.status='proposed'
               and not exists (select 1 from memory_v1.human_review_events e
                 where e.workspace_id=k.workspace_id and e.knowledge_candidate_id=k.knowledge_candidate_id)

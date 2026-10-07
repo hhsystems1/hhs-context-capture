@@ -17,6 +17,12 @@ describe("Mission Control safety boundary", () => {
 });
 
 describe("pending review definition", () => {
+  it("keeps the proposed health counter on the promotion-inclusive base table", () => {
+    const source = readFileSync(path.resolve("apps/mission-control/src/store.ts"), "utf8");
+    const proposed = source.match(/\(select count\(\*\) from [^\n]+\) proposed,/)?.[0];
+    expect(proposed).toBe("(select count(*) from memory_v1.knowledge_candidates where workspace_id=$1 and status='proposed') proposed,");
+    expect(proposed).not.toContain("trusted_knowledge_candidates");
+  });
   const candidateBranch = PENDING_REVIEWS_SQL.slice(
     PENDING_REVIEWS_SQL.indexOf("'knowledge_candidate'"),
     PENDING_REVIEWS_SQL.indexOf("'contradiction'")
@@ -36,6 +42,7 @@ describe("pending review definition", () => {
   it("still reads candidates through the trusted view and stays workspace scoped", () => {
     expect(candidateBranch).toContain("memory_v1.trusted_knowledge_candidates");
     expect(candidateBranch).toContain("k.workspace_id=$1");
+    expect(candidateBranch).toContain("'promotion_receipt_id',k.promotion_receipt_id");
   });
 
   it("remains a read-only projection", () => {

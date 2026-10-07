@@ -51,6 +51,7 @@ export interface ReconciliationInputObservation {
   };
   created_at: string;
   evidence_roles: string[];
+  evidence: Array<{ role: string; relation: string; statement_bearing: boolean }>;
   record_sha256: string;
 }
 
@@ -335,13 +336,13 @@ export function validateReconciliationOutput(
       }
     }
 
-    if (
-      authority === "user" &&
-      !citedObservations.some((observation) =>
-        observation.evidence_roles.includes("user")
-      )
-    ) {
-      local.push("user authority requires user-authored evidence");
+    for (const observation of citedObservations) {
+      if (observation.attribution.subject === "user" && !observation.evidence.some((edge) => edge.role === "user")) {
+        local.push(`observation ${observation.observation_id} attribution mismatch: user subject has no user-authored evidence`);
+      }
+    }
+    if (["user", "company"].includes(authority) && !hasSupportingUserEvidence(observationReferences, citedObservations)) {
+      local.push(`${authority} authority requires user-authored evidence: select a supporting observation whose verified user citation meets STATEMENT_EVIDENCE_OVERLAP=${STATEMENT_EVIDENCE_OVERLAP} or contains a quoted span from its statement`);
     }
 
     if (local.length > 0) {
@@ -464,7 +465,7 @@ export async function prepareReconciliationInputFromClient(
     );
   }
 
-  const observations = requested.map((observationId) => {
+  const observations = await Promise.all(requested.map(async (observationId) => {
     const row = byId.get(observationId)!;
     const payload = row.payload;
 
@@ -514,6 +515,22 @@ export async function prepareReconciliationInputFromClient(
       ? row.evidence_roles.map(String).sort()
       : [];
 
+    const edges = await client.query(`select p.relation, m.role, p.representation_sha256,
+        (select rep->>'value' from jsonb_array_elements(b.representations) rep
+          where rep->>'representation_kind'=p.representation_kind and rep->>'sha256'=p.representation_sha256 limit 1) text_value
+      from memory_v1.provenance_edges p
+      join memory_v1.content_blocks b on b.workspace_id=p.workspace_id and b.content_block_id=p.content_block_id
+        and b.message_id=p.message_id and b.source_record_id=p.source_record_id
+        and b.capture_version_id is not distinct from p.capture_version_id and b.source_version_id is not distinct from p.source_version_id
+      join memory_v1.messages m on m.workspace_id=p.workspace_id and m.message_id=p.message_id
+        and m.conversation_id=p.conversation_id
+        and m.capture_version_id is not distinct from p.capture_version_id and m.source_version_id is not distinct from p.source_version_id
+      where p.workspace_id=$1 and p.target_record_id=$2 and p.pipeline_version=$3 and p.target_record_type='observation'
+      order by p.provenance_edge_id`, [workspaceId, observationId, row.pipeline_version]);
+    const evidence = edges.rows.map((edge) => ({ role: String(edge.role), relation: String(edge.relation),
+      statement_bearing: typeof edge.text_value === "string" && sha256(edge.text_value) === edge.representation_sha256
+        && statementOccursInEvidence(statement, edge.text_value) }));
+
     return {
       observation_id: observationId,
       pipeline_version: String(row.pipeline_version),
@@ -525,9 +542,10 @@ export async function prepareReconciliationInputFromClient(
       },
       created_at: dbIso(row.created_at),
       evidence_roles: roles,
+      evidence,
       record_sha256: String(row.record_sha256)
     };
-  });
+  }));
 
   return {
     schema_version: RECONCILIATION_INPUT_SCHEMA,
@@ -751,4 +769,29 @@ function dbIso(value: unknown): string {
   return value instanceof Date
     ? value.toISOString()
     : String(value);
+}
+
+export const STATEMENT_EVIDENCE_OVERLAP = 0.5;
+const EVIDENCE_STOPWORDS = new Set("a an the and or but of to for in on at by with from as is are was were be been being it its this that these those i me my we our you your he she they their user assistant".split(" "));
+
+/** Hash-verified citation content heuristic for paraphrases; not semantic entailment. */
+export function statementOccursInEvidence(statement: string, text: string): boolean {
+  const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  const tokens = (value: string) => new Set((normalize(value).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => !EVIDENCE_STOPWORDS.has(token)));
+  const statementTokens = tokens(statement);
+  if (!statementTokens.size) return false;
+  const evidenceText = normalize(text);
+  // Boundaries avoid treating apostrophes within words as quotation delimiters.
+  for (const quote of statement.matchAll(/(?:^|[\s(])(['"])(.+?)\1(?=$|[\s.,;:!?)])/g)) {
+    if (tokens(quote[2]!).size && evidenceText.includes(normalize(quote[2]!))) return true;
+  }
+  const evidenceTokens = tokens(text);
+  const overlap = [...statementTokens].filter((token) => evidenceTokens.has(token)).length / statementTokens.size;
+  return overlap >= STATEMENT_EVIDENCE_OVERLAP;
+}
+
+export function hasSupportingUserEvidence(references: ReconciliationObservationReference[], observations: ReconciliationInputObservation[]): boolean {
+  return references.some((reference) => ["supports", "refines", "duplicates"].includes(reference.relation)
+    && observations.some((observation) => observation.observation_id === reference.observation_id
+      && observation.evidence.some((edge) => edge.role === "user" && ["quotes", "derived_from", "supports"].includes(edge.relation) && edge.statement_bearing)));
 }
