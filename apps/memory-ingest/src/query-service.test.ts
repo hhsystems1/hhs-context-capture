@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { describe, expect, it, afterEach } from "vitest";
 import {
   LOOPBACK_HOST, assertServiceEnvironment, authenticate, createQueryService,
@@ -51,6 +52,23 @@ async function startTestServer() {
   const address = activeServer!.address();
   if (typeof address !== "object" || !address) throw new Error("no address");
   return { base: `http://127.0.0.1:${address.port}`, address };
+}
+
+/** Exercise the real HTTP handler without needing permission to bind a socket. */
+function requestInProcess(server: ReturnType<typeof createQueryService>, url: string, init: {
+  method?: string; headers?: Record<string, string>; body?: string;
+} = {}): Promise<Response> {
+  return new Promise((resolve) => {
+    const request = Object.assign(Readable.from([Buffer.from(init.body ?? "")]), {
+      method: init.method ?? "GET", url, headers: init.headers ?? {}, socket: { remoteAddress: "127.0.0.1" }
+    });
+    let status = 200;
+    const response = {
+      writeHead: (code: number) => { status = code; },
+      end: (bytes: Buffer) => resolve(new Response(bytes.toString("utf8"), { status }))
+    };
+    server.emit("request", request, response);
+  });
 }
 
 describe("service environment guard", () => {
@@ -130,11 +148,17 @@ describe("credential surface", () => {
 });
 
 describe("workspace-aware trusted Core queries", () => {
-  it("allows only hhs-core to select a provisioned workspace", async () => {
+  it("routes only authenticated hhs-core workspace selections and preserves fixed-workspace calls and promotion lineage", async () => {
     const coreToken = "c".repeat(48);
     const hermesToken = "h".repeat(48);
     const requestedWorkspace = "workspace_9e2ecc9d7533c6524dd51b9866031b6e";
     const seenWorkspaces: string[] = [];
+    const seenDetails: string[] = [];
+    const promotedMatch = { ...fakeMatch, capture_version_id: null, immutable_archive_locator: null,
+      conversation_id: null, source_conversation_id: null, message_id: null, sequence: null, role: null,
+      provenance_edge_id: null, representation_kind: null, representation_sha256: null,
+      promotion_receipt_id: "receipt", source_lineage: [{ source_workspace_id: "source-workspace", reconciliation_id: "reconciliation" }],
+      source_lineage_sha256: "d".repeat(64), promoted_value_sha256: "e".repeat(64) };
 
     const config = {
       workspaceId: "workspace_legacy",
@@ -150,29 +174,30 @@ describe("workspace-aware trusted Core queries", () => {
           question,
           mode: "deterministic_text_search",
           trust_scope: "approved_knowledge_only",
-          matches: [fakeMatch],
+          matches: workspace === requestedWorkspace ? [promotedMatch] : [fakeMatch],
         };
+      },
+      getKnowledge: async (workspace, id) => {
+        seenDetails.push(workspace);
+        return deps.getKnowledge(workspace, id);
       },
     });
 
-    await new Promise<void>((resolve) => activeServer!.listen(0, LOOPBACK_HOST, resolve));
-    const address = activeServer.address();
-    if (typeof address !== "object" || !address) throw new Error("no address");
-    const base = `http://127.0.0.1:${address.port}`;
-
-    const core = await fetch(`${base}/memory/workspaces/${requestedWorkspace}/query`, {
+    const core = await requestInProcess(activeServer, `/memory/workspaces/${requestedWorkspace}/query`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${coreToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ question: "project context" }),
+      body: JSON.stringify({ question: "project context", workspace_id: "workspace_untrusted_body" }),
     });
 
     expect(core.status).toBe(200);
     expect(seenWorkspaces).toEqual([requestedWorkspace]);
+    expect(await core.json()).toMatchObject({ workspace_id: requestedWorkspace,
+      trust_scope: "approved_knowledge_only", matches: [promotedMatch] });
 
-    const hermes = await fetch(`${base}/memory/workspaces/${requestedWorkspace}/query`, {
+    const hermes = await requestInProcess(activeServer, `/memory/workspaces/${requestedWorkspace}/query`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${hermesToken}`,
@@ -183,5 +208,34 @@ describe("workspace-aware trusted Core queries", () => {
 
     expect(hermes.status).toBe(403);
     expect(seenWorkspaces).toEqual([requestedWorkspace]);
+
+    const unauthenticated = await requestInProcess(activeServer, `/memory/workspaces/${requestedWorkspace}/query`, {
+      method: "POST", body: JSON.stringify({ question: "x" })
+    });
+    expect(unauthenticated.status).toBe(401);
+    const malformed = await requestInProcess(activeServer, "/memory/workspaces/workspace_arbitrary/query", {
+      method: "POST", headers: { authorization: `Bearer ${coreToken}` }, body: JSON.stringify({ question: "x" })
+    });
+    expect(malformed.status).toBe(404);
+    expect(seenWorkspaces).toEqual([requestedWorkspace]);
+
+    for (const token of [hermesToken, coreToken]) {
+      const legacy = await requestInProcess(activeServer, "/memory/query", {
+        method: "POST", headers: { authorization: `Bearer ${token}` },
+        body: JSON.stringify({ question: "legacy", workspace_id: requestedWorkspace })
+      });
+      expect(legacy.status).toBe(200);
+      expect((await legacy.json()).matches).toEqual([fakeMatch]);
+    }
+    expect(seenWorkspaces).toEqual([requestedWorkspace, config.workspaceId, config.workspaceId]);
+    const detail = await requestInProcess(activeServer, `/memory/knowledge/approved_knowledge_x?workspace_id=${requestedWorkspace}`, {
+      headers: { authorization: `Bearer ${hermesToken}` }
+    });
+    expect(detail.status).toBe(404);
+    const fixedDetail = await requestInProcess(activeServer, "/memory/knowledge/approved_knowledge_x", {
+      headers: { authorization: `Bearer ${hermesToken}` }
+    });
+    expect(fixedDetail.status).toBe(200);
+    expect(seenDetails).toEqual([config.workspaceId]);
   });
 });
