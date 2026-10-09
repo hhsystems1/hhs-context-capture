@@ -125,7 +125,7 @@ function batchReceipt(directory: string): any {
   return get(directory, path.join(".runtime/reconstruction/batch-receipts", files.sort().at(-1)!));
 }
 function inventory(processed = false): Result { return result(0, { workspace_id: WORKSPACE, conversations: [{
-  source_conversation_id: SOURCE, discovery_status: processed ? "discovery_processed" : "unprocessed" }] }); }
+  source_conversation_id: SOURCE, source_version_id: "version", capture_version_id: null, discovery_status: processed ? "discovery_processed" : "unprocessed" }] }); }
 function persistResult(replay = false): Result { return result(0, { observations_inserted: replay ? 0 : 1,
   observation_links_inserted: 0, provenance_edges_inserted: replay ? 0 : 1, replay }); }
 const BATCH_ARGS = ["--workspace", WORKSPACE];
@@ -481,7 +481,7 @@ describe("Claude runner correctness regressions", () => {
     let persists = 0;
     const spawn: Spawn = (_command, args) => {
       if (args.includes("scripts/reconstruction-inventory.ts")) return result(0, { workspace_id: WORKSPACE,
-        conversations: [SOURCE, second].map((id) => ({ source_conversation_id: id, discovery_status: "unprocessed" })) });
+        conversations: [SOURCE, second].map((id) => ({ source_conversation_id: id, source_version_id: "version", capture_version_id: null, discovery_status: "unprocessed" })) });
       if (args.includes("validate")) return validate(directory, args);
       if (args.includes("persist")) return ++persists === 1 ? persistResult() : result(1);
       throw new Error(`Unexpected generation: ${args}`);
@@ -582,5 +582,42 @@ describe("Finding 9: recovered receipt provenance", () => {
     const spawn: Spawn = (_command, args) => { expect(args).toContain("validate"); return validate(directory, args); };
     await expect(run(directory, "run-oversized-orchestrator.mjs", orchestratorArgs(directory), spawn)).rejects.toThrow(/Validation failed/);
     expect(fs.existsSync(path.join(directory, "chunk-001-model.json"))).toBe(false);
+  });
+});
+
+
+describe("Context Operations runner correlation and source refresh", () => {
+  it("keeps optional operation identity in the existing batch receipt without changing CLI execution", async () => {
+    const directory = root(); priority(directory); standardArtifacts(directory);
+    const operation = `operation_${"a".repeat(32)}`;
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) return inventory();
+      if (args.includes("validate")) return validate(directory, args);
+      if (args.includes("persist")) return persistResult();
+      throw new Error("Unexpected generation");
+    };
+    expect((await run(directory, "run-reconstruction-batch.mjs", [...BATCH_ARGS, "--operation-id", operation], spawn)).code).toBe(0);
+    expect(batchReceipt(directory)).toMatchObject({ operation_id: operation, status: "completed", workspace: WORKSPACE });
+    expect(fs.readdirSync(path.join(directory, ".runtime/reconstruction/batch-receipts"))[0]).toContain(operation);
+    await expect(run(root(), "run-reconstruction-batch.mjs", [...BATCH_ARGS, "--operation-id", "../bad"], spawn)).rejects.toThrow("Invalid --operation-id");
+  });
+  it.each([false, true])("retains prepared artifacts and quarantines changed source identity (oversized=%s)", async oversized => {
+    const directory = root(); priority(directory, oversized);
+    let inputFile = `${BASE}-input.json`;
+    if (oversized) {
+      const runDir = ".runtime/reconstruction/oversized-runs/priority-0001-synthetic-source";
+      inputFile = `${runDir}/parent-input.json`;
+      put(directory, `${runDir}/manifest.json`, { source_conversation_id: SOURCE });
+      put(directory, inputFile, exchange());
+    } else standardArtifacts(directory);
+    const before = fs.readFileSync(path.join(directory, inputFile), "utf8");
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) return result(0, { conversations: [{ source_conversation_id: SOURCE, source_version_id: "refreshed-version", capture_version_id: null, discovery_status: "unprocessed" }] });
+      throw new Error("Source mismatch must prevent generation and persistence");
+    };
+    expect((await run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, spawn)).code).toBe(2);
+    expect(batchReceipt(directory).status).toBe("failed");
+    expect(batchReceipt(directory).quarantined[0].reason).toContain("prepared_source_identity_mismatch");
+    expect(fs.readFileSync(path.join(directory, inputFile), "utf8")).toBe(before);
   });
 });

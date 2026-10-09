@@ -147,11 +147,18 @@ export async function loadReconstructionInventory(
   receipts: DiscoveryReceipt[],
   generatedAt = new Date().toISOString(),
   batchSize = DEFAULT_RECONSTRUCTION_BATCH_SIZE,
-  pool: pg.Pool = createPool("reader")
+  pool: pg.Pool = createPool("reader"),
+  boundedStatusRead = false
 ): Promise<ReconstructionInventorySnapshot> {
   const ownsPool = arguments.length < 5;
   try {
-    const rows = await readOnlyTransaction(pool, workspaceId, (client) => loadCanonicalInventoryRows(client, workspaceId));
+    const rows = await readOnlyTransaction(pool, workspaceId, async (client) => {
+      if (boundedStatusRead) {
+        await client.query("set local statement_timeout = '5000ms'");
+        await client.query("set local lock_timeout = '2000ms'");
+      }
+      return loadCanonicalInventoryRows(client, workspaceId);
+    });
     return buildReconstructionInventory(workspaceId, rows, receipts, generatedAt, batchSize);
   } finally {
     if (ownsPool) await pool.end();
@@ -380,7 +387,7 @@ function nullableString(value: unknown): string | null { return value === null |
 function iso(value: unknown): string { return value instanceof Date ? value.toISOString() : String(value); }
 function isoOrNull(value: unknown): string | null { return value === null || value === undefined ? null : iso(value); }
 
-const CANONICAL_INVENTORY_SQL = `
+export const CANONICAL_INVENTORY_SQL = `
 with clean as (
   select c.source_conversation_id,c.conversation_id,c.title_representation->>'value' title,
     sv.source_family,sv.source_version_id,sv.capture_version_id,sv.verification_status,

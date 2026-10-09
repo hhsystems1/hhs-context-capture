@@ -7,6 +7,8 @@ const WORKSPACE = flag("workspace") ?? process.env.MEMORY_WORKSPACE_ID;
 const LIMIT = Number(flag("limit") ?? "10");
 const CHUNK_CHARACTERS = Number(flag("chunk-characters") ?? "75000");
 const TARGET_CONVERSATION = flag("conversation");
+const OPERATION_ID = flag("operation-id");
+if (process.argv.includes("--operation-id") && (OPERATION_ID === undefined || !/^operation_[0-9a-f]{32}$/.test(OPERATION_ID))) throw new Error("Invalid --operation-id.");
 const SINGLE_RUN_TOKENS = 75000;
 const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
 const PRIORITY_RUNS = ".runtime/reconstruction/priority-runs";
@@ -47,6 +49,7 @@ const receipt = {
   schema_version: "hhs-reconstruction-batch/0.1.0",
   started_at: new Date().toISOString(),
   workspace: WORKSPACE,
+  ...(OPERATION_ID ? { operation_id: OPERATION_ID } : {}),
   requested: LIMIT,
   selected: candidates.length,
   ...(TARGET_CONVERSATION ? { conversation: TARGET_CONVERSATION } : {}),
@@ -96,6 +99,8 @@ function processStandard(candidate) {
   const exchange = path.join(PRIORITY_RUNS, `${base}-input.json`);
   const output = path.join(PRIORITY_RUNS, `${base}-output.json`);
   const raw = path.join(PRIORITY_RUNS, `${base}-openrouter-raw.json`);
+
+  if (fs.existsSync(exchange)) assertPreparedIdentity(candidate, exchange);
 
   let lastValidationError;
 
@@ -240,6 +245,9 @@ function processOversized(candidate) {
     OVERSIZED_RUNS,
     `priority-${rank}-${candidate.source_conversation_id}`
   );
+  if (fs.existsSync(path.join(directory, "manifest.json"))) {
+    assertPreparedIdentity(candidate, path.join(directory, "parent-input.json"));
+  }
   if (!fs.existsSync(path.join(directory, "manifest.json"))) {
     prepareOversized(candidate, directory);
   }
@@ -258,6 +266,19 @@ function processOversized(candidate) {
   validate(exchange, output, model, OVERSIZED_VERSION);
   const persistedResult = persist(exchange, output, model, OVERSIZED_VERSION);
   return summary(candidate, "oversized", persistedResult);
+}
+
+// Fail closed before using or regenerating a prepared exchange after a source refresh.
+// Full evidence/hash equality is still checked by the existing trusted persist path.
+function assertPreparedIdentity(candidate, exchangeFile) {
+  const current = inventory.conversations.find(item => item.source_conversation_id === candidate.source_conversation_id);
+  const prepared = read(exchangeFile).selection;
+  if (!current?.source_version_id || !Array.isArray(prepared) || prepared.length !== 1
+    || prepared[0].source_conversation_id !== current.source_conversation_id
+    || prepared[0].source_version_id !== current.source_version_id
+    || (prepared[0].capture_version_id ?? null) !== (current.capture_version_id ?? null)) {
+    throw new Error("prepared_source_identity_mismatch: retained artifacts require trusted corpus-version review");
+  }
 }
 
 function prepareOversized(candidate, directory) {
@@ -351,7 +372,7 @@ function summary(candidate, mode, result) {
 function receiptPath() {
   return path.join(
     ".runtime/reconstruction/batch-receipts",
-    `batch-${receipt.started_at.replace(/[:.]/g, "-")}.json`
+    `batch-${receipt.started_at.replace(/[:.]/g, "-")}${OPERATION_ID ? `-${OPERATION_ID}` : ""}.json`
   );
 }
 

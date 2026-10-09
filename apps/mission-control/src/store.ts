@@ -98,9 +98,11 @@ export const APPROVED_KNOWLEDGE_LIST_SQL = `select
 
 export class MissionControlStore {
   private readonly pool: pg.Pool;
-  constructor(private readonly workspaceId: string, connectionString: string) {
+  private readonly ownsPool: boolean;
+  constructor(private readonly workspaceId: string, connectionString: string, pool?: pg.Pool) {
     assertLoopbackUrl(connectionString);
-    this.pool = new Pool({
+    this.ownsPool = pool === undefined;
+    this.pool = pool ?? new Pool({
       connectionString,
       max: 4,
       connectionTimeoutMillis: 3000,
@@ -108,7 +110,7 @@ export class MissionControlStore {
     });
   }
 
-  async close(): Promise<void> { await this.pool.end(); }
+  async close(): Promise<void> { if (this.ownsPool) await this.pool.end(); }
 
   async captureOperationBySafeReference(safeCaptureReference: string): Promise<CaptureOperationLink> {
     if (!/^capture-[a-f0-9]{24}$/.test(safeCaptureReference)) throw new Error("Invalid safe capture reference.");
