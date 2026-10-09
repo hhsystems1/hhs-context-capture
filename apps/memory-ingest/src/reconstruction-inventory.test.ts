@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { DbClient } from "./db.js";
 import { sha256 } from "@hhs/memory-schema";
 import {
   DEFAULT_RECONSTRUCTION_BATCH_SIZE,
   EXPECTED_CLEAN_CORPUS_SIZE,
   buildDiscoveryReceipt,
   buildReconstructionInventory,
+  loadCanonicalInventoryRows,
   type CanonicalInventoryRow,
   type DiscoveryReceipt
 } from "./reconstruction-inventory.js";
@@ -35,7 +37,7 @@ function canonicalRows(): CanonicalInventoryRow[] {
       evidence_block_count: number === 995 ? 0 : 2,
       canonical_text_representation_count: number === 995 ? 0 : 2,
       nonempty_canonical_text_count: number === 995 ? 0 : 2,
-      empty_canonical_text_count: 0, persisted_observations_count: 0, persisted_links_count: 0,
+      empty_canonical_text_count: 0, persisted_observations_count: 0, reconciled_observations_count: 0, persisted_links_count: 0,
       persisted_first_processed_at: null, persisted_latest_processed_at: null
     };
   });
@@ -98,7 +100,7 @@ describe("reconstruction inventory control plane", () => {
       awaiting_reconciliation: 5, observations_awaiting_reconciliation: 17, reconciled: 0 });
   });
 
-  it("marks database-persisted observations as reconciled", () => {
+  it("keeps persisted discovery observations awaiting trusted reconciliation", () => {
     const rows = canonicalRows();
     rows[0] = {
       ...rows[0]!,
@@ -110,14 +112,83 @@ describe("reconstruction inventory control plane", () => {
     const snapshot = buildReconstructionInventory(WORKSPACE, rows, [], "2026-09-04T00:00:00.000Z");
     expect(snapshot.conversations[0]).toMatchObject({
       discovery_status: "discovery_processed",
-      reconciliation_status: "reconciled",
+      reconciliation_status: "awaiting_reconciliation",
       processing_receipt: "persisted_observations"
     });
     expect(snapshot.summary).toMatchObject({
       discovery_processed: 1,
-      awaiting_reconciliation: 0,
-      reconciled: 1
+      awaiting_reconciliation: 1,
+      observations_awaiting_reconciliation: 2,
+      reconciled: 0
     });
+  });
+
+  it("requires trusted reconciliation coverage of every persisted observation", () => {
+    for (const covered of [0, 1, 2]) {
+      const rows = canonicalRows();
+      rows[0] = { ...rows[0]!, persisted_observations_count: 2, reconciled_observations_count: covered };
+      const snapshot = buildReconstructionInventory(WORKSPACE, rows, [], "2026-09-04T00:00:00.000Z");
+      expect(snapshot.conversations[0]!.reconciliation_status).toBe(covered === 2 ? "reconciled" : "awaiting_reconciliation");
+      expect(snapshot.summary.reconciled).toBe(covered === 2 ? 1 : 0);
+      expect(snapshot.summary.awaiting_reconciliation).toBe(covered === 2 ? 0 : 1);
+    }
+    const empty = buildReconstructionInventory(WORKSPACE, canonicalRows(), [], "2026-09-04T00:00:00.000Z");
+    expect(empty.conversations[0]!.reconciliation_status).toBe("not_started");
+  });
+
+  it.each([
+    [3, 1, 2],
+    [3, 3, 0],
+    [3, 0, 3]
+  ])("counts only uncovered observations: %i observations, %i reconciled => %i awaiting", (observations, covered, awaiting) => {
+    const rows = canonicalRows();
+    rows[0] = { ...rows[0]!, persisted_observations_count: observations, reconciled_observations_count: covered };
+    const snapshot = buildReconstructionInventory(WORKSPACE, rows, [], "2026-09-04T00:00:00.000Z");
+    expect(snapshot.conversations[0]).toMatchObject({ observations_count: observations, reconciled_observations_count: covered });
+    expect(snapshot.summary.observations_awaiting_reconciliation).toBe(awaiting);
+  });
+
+  it("loads coverage only through same-workspace immutable reconciliation lineage with both pipeline identities", async () => {
+    const row = { ...canonicalRows()[0]!, persisted_observations_count: "2", reconciled_observations_count: "2" };
+    const query = vi.fn(async () => ({ rows: [row] }));
+    const loaded = await loadCanonicalInventoryRows({ query } as unknown as DbClient, WORKSPACE);
+    expect(loaded[0]).toMatchObject({ persisted_observations_count: 2, reconciled_observations_count: 2 });
+    const [sql, parameters] = query.mock.calls[0]! as unknown as [string, unknown[]];
+    expect(parameters[0]).toBe(WORKSPACE);
+    expect(sql).toContain("c.workspace_id=$1");
+    expect(sql).toContain("o.workspace_id=$1 and o.conversation_id=cl.conversation_id");
+    expect(sql).toContain("from memory_v1.reconciliation_observations ro");
+    expect(sql).toContain("join memory_v1.reconciliations r");
+    expect(sql).toContain("r.workspace_id=ro.workspace_id and r.reconciliation_id=ro.reconciliation_id");
+    expect(sql).toContain("r.pipeline_version=ro.pipeline_version");
+    expect(sql).toContain("ro.workspace_id=$1 and ro.workspace_id=o.workspace_id");
+    expect(sql).toContain("ro.observation_id=o.observation_id and ro.observation_pipeline_version=o.pipeline_version");
+    expect(sql).toContain("count(distinct o.observation_id) filter(where exists");
+    expect(sql).not.toMatch(/\b(insert|update|delete)\b/i);
+  });
+
+  it.each([
+    ["rejected", 0, "awaiting_reconciliation"],
+    ["current", 1, "reconciled"]
+  ] as const)("excludes rejected reconciliation coverage while retaining non-rejected coverage: %s", async (status, covered, expected) => {
+    // Mock only the DB aggregate; assert the rejection filter in the actual SQL
+    // so removing it cannot leave this read-model regression passing.
+    const reconciliation = { payload: { temporal_status: status } };
+    const row = { ...canonicalRows()[0]!, persisted_observations_count: 1,
+      reconciled_observations_count: reconciliation.payload.temporal_status === "rejected" ? 0 : 1 };
+    const query = vi.fn(async (sql: string) => {
+      expect(sql).toMatch(/ro\.observation_pipeline_version=o\.pipeline_version\s+and r\.payload->>'temporal_status' is distinct from 'rejected'/);
+      // Coverage retains all existing relations, including contradiction/context.
+      expect(sql).not.toMatch(/\bro\.relation\s*(?:=|in\b)/i);
+      return { rows: [row] };
+    });
+    const loaded = await loadCanonicalInventoryRows({ query } as unknown as DbClient, WORKSPACE);
+    const rows = canonicalRows();
+    rows[0] = loaded[0]!;
+    const snapshot = buildReconstructionInventory(WORKSPACE, rows, [], "2026-09-04T00:00:00.000Z");
+    expect(snapshot.conversations[0]).toMatchObject({ discovery_status: "discovery_processed", reconciliation_status: expected });
+    expect(snapshot.summary.reconciled).toBe(covered);
+    expect(snapshot.summary.awaiting_reconciliation).toBe(1 - covered);
   });
 
   it("surfaces zero evidence without excluding or fabricating completeness", () => {

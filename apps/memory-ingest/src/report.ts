@@ -14,7 +14,7 @@ export async function readOnlyReport(workspaceId: string): Promise<Record<string
       )) as resolved_edge_count
       from memory_v1.trusted_provenance_edges p where workspace_id=$1 group by workspace_id,pipeline_version`, [workspaceId]);
       const statuses = await client.query("select workspace_id,pipeline_version,status,count(*) as count from memory_v1.trusted_knowledge_candidates where workspace_id=$1 group by workspace_id,pipeline_version,status order by pipeline_version,status", [workspaceId]);
-      return { generated_at: new Date().toISOString(), mode: "read_only", trust_scope: "attested_generations_only", imports: report.rows, provenance: provenance.rows, candidate_statuses: statuses.rows };
+      return { generated_at: new Date().toISOString(), mode: "read_only", trust_scope: "attested_generations_or_promotion_receipts", imports: report.rows, provenance: provenance.rows, candidate_statuses: statuses.rows };
     });
   } finally { await pool.end(); }
 }

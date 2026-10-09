@@ -1,4 +1,5 @@
-import { createPool, readOnlyTransaction } from "./db.js";
+import { loadCandidatePromotionReceipt } from "./review.js";
+import { createPool, readOnlyTransaction, type DbClient } from "./db.js";
 
 export interface ApprovedKnowledgeMatch {
   approved_knowledge_id: string;
@@ -8,20 +9,25 @@ export interface ApprovedKnowledgeMatch {
   reviewer_id: string;
   rationale: string;
   review_status: string;
-  capture_version_id: string;
-  immutable_archive_locator: string;
-  conversation_id: string;
-  source_conversation_id: string;
-  message_id: string;
-  sequence: number;
-  role: string;
-  provenance_edge_id: string;
-  representation_kind: string;
-  representation_sha256: string;
+  capture_version_id: string | null;
+  immutable_archive_locator: string | null;
+  conversation_id: string | null;
+  source_conversation_id: string | null;
+  message_id: string | null;
+  sequence: number | null;
+  role: string | null;
+  provenance_edge_id: string | null;
+  representation_kind: string | null;
+  representation_sha256: string | null;
   text_value: string;
+  promotion_receipt_id?: string | null;
+  source_lineage?: Array<Record<string, unknown>> | null;
+  source_lineage_sha256?: string | null;
+  promoted_value_sha256?: string | null;
 }
 
 export const APPROVED_KNOWLEDGE_QUERY_SQL = `
+select * from (
 select distinct
   ak.approved_knowledge_id, ak.knowledge_candidate_id, ak.pipeline_version, ak.approved_at,
   hre.reviewer_id, hre.rationale, hre.to_status as review_status,
@@ -29,7 +35,9 @@ select distinct
   conv.conversation_id, conv.source_conversation_id,
   m.message_id, m.sequence, m.role,
   pe.provenance_edge_id, pe.representation_kind, pe.representation_sha256,
-  rep->>'value' as text_value
+  rep->>'value' as text_value,
+  null::text as promotion_receipt_id, null::jsonb as source_lineage,
+  null::text as source_lineage_sha256, null::text as promoted_value_sha256
 from memory_v1.approved_knowledge ak
 join memory_v1.human_review_events hre
   on hre.workspace_id=ak.workspace_id and hre.human_review_event_id=ak.approval_event_id
@@ -50,13 +58,31 @@ where rep->>'representation_kind' = pe.representation_kind
   and rep->>'sha256' = pe.representation_sha256
   and ak.workspace_id = $1
   and to_tsvector('english', rep->>'value') @@ plainto_tsquery('english', $2)
-order by ak.approved_at desc, m.sequence asc, pe.provenance_edge_id asc
+union all
+select ak.approved_knowledge_id, ak.knowledge_candidate_id, ak.pipeline_version, ak.approved_at,
+       hre.reviewer_id, hre.rationale, hre.to_status as review_status,
+       null::text, null::text, null::text, null::text, null::text, null::integer, null::text,
+       null::text, null::text, null::text,
+       ak.approved_value->>'statement' as text_value,
+       p.promotion_receipt_id, p.source_lineage, p.source_lineage_sha256, p.promoted_value_sha256
+from memory_v1.approved_knowledge ak
+join memory_v1.human_review_events hre
+  on hre.workspace_id=ak.workspace_id and hre.human_review_event_id=ak.approval_event_id
+join memory_v1.knowledge_candidates k
+  on (k.workspace_id,k.knowledge_candidate_id,k.pipeline_version)=(ak.workspace_id,ak.knowledge_candidate_id,ak.pipeline_version)
+join memory_v1.promotion_receipts p
+  on (p.workspace_id,p.promotion_receipt_id,p.pipeline_version)=(k.workspace_id,k.promotion_receipt_id,k.pipeline_version)
+where ak.workspace_id = $1 and hre.to_status='approved'
+  and to_tsvector('english', ak.approved_value->>'statement') @@ plainto_tsquery('english', $2)
+) matches
+order by approved_at desc, sequence asc, provenance_edge_id asc, approved_knowledge_id asc
 limit $3`;
 
 export interface ApprovedKnowledgeDetail {
   approved_knowledge: Record<string, unknown>;
   review: Record<string, unknown>;
   evidence: Array<Record<string, unknown>>;
+  promotion_receipt?: Record<string, unknown>;
 }
 
 const APPROVED_KNOWLEDGE_DETAIL_SQL = `
@@ -93,13 +119,7 @@ export async function getApprovedKnowledge(workspaceId: string, approvedKnowledg
   const pool = createPool("reader");
   try {
     return await readOnlyTransaction(pool, workspaceId, async (client) => {
-      const record = await client.query(APPROVED_KNOWLEDGE_DETAIL_SQL, [workspaceId, approvedKnowledgeId]);
-      if (!record.rowCount) throw new Error(`Approved knowledge not found: ${approvedKnowledgeId}`);
-      const review = await client.query(
-        "select human_review_event_id, reviewer_id, from_status, to_status, rationale, occurred_at from memory_v1.human_review_events where workspace_id=$1 and human_review_event_id=$2",
-        [workspaceId, String(record.rows[0].approval_event_id)]);
-      const evidence = await client.query(APPROVED_KNOWLEDGE_EVIDENCE_SQL, [workspaceId, approvedKnowledgeId]);
-      return { approved_knowledge: record.rows[0], review: review.rows[0] ?? {}, evidence: evidence.rows };
+      return getApprovedKnowledgeFromClient(client, workspaceId, approvedKnowledgeId);
     });
   } finally { await pool.end(); }
 }
@@ -120,4 +140,16 @@ export async function queryApprovedKnowledge(workspaceId: string, question: stri
       };
     });
   } finally { await pool.end(); }
+}
+
+export async function getApprovedKnowledgeFromClient(client: DbClient, workspaceId: string, approvedKnowledgeId: string): Promise<ApprovedKnowledgeDetail> {
+  const record = await client.query(APPROVED_KNOWLEDGE_DETAIL_SQL, [workspaceId, approvedKnowledgeId]);
+  if (!record.rowCount) throw new Error(`Approved knowledge not found: ${approvedKnowledgeId}`);
+  const review = await client.query(
+    "select human_review_event_id, reviewer_id, from_status, to_status, rationale, occurred_at from memory_v1.human_review_events where workspace_id=$1 and human_review_event_id=$2",
+    [workspaceId, String(record.rows[0].approval_event_id)]);
+  const evidence = await client.query(APPROVED_KNOWLEDGE_EVIDENCE_SQL, [workspaceId, approvedKnowledgeId]);
+  const candidate = await client.query("select * from memory_v1.knowledge_candidates where workspace_id=$1 and knowledge_candidate_id=$2", [workspaceId, record.rows[0].knowledge_candidate_id]);
+  const receipt = await loadCandidatePromotionReceipt(client, workspaceId, candidate.rows[0]);
+  return { approved_knowledge: record.rows[0], review: review.rows[0] ?? {}, evidence: evidence.rows, ...(receipt ? { promotion_receipt: receipt } : {}) };
 }

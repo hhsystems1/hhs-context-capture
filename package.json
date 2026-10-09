@@ -50,8 +50,12 @@
     "reconstruction:oversized:chunk": "node scripts/run-oversized-chunk-nemotron.mjs",
     "reconstruction:oversized:link": "node scripts/run-oversized-linker-nemotron.mjs",
     "reconstruction:oversized:run": "node --env-file=.env.memory-v1.local scripts/run-oversized-orchestrator.mjs",
+    "memory:context:operations:service": "tsx apps/memory-ingest/src/context-operations-service.ts",
     "reconstruction:run": "node --env-file=.env.memory-v1.local scripts/run-reconstruction-batch.mjs",
-    "reconstruction:audit": "tsx --env-file=.env.memory-v1.local scripts/reconstruction-quality-audit.ts"
+    "reconstruction:audit": "tsx --env-file=.env.memory-v1.local scripts/reconstruction-quality-audit.ts",
+    "memory:reconcile": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts reconcile",
+    "memory:promote": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts promote",
+    "memory:review:evidence": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts review-evidence"
   },
   "engines": {
     "node": ">=22"

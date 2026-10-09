@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { deterministicId } from "@hhs/memory-schema";
-import { immutableRow } from "./review.js";
+import { immutableRow, recordDecisionFromClient } from "./review.js";
+import type { DbClient } from "./db.js";
 
 const reviewSource = await readFile(path.resolve("apps/memory-ingest/src/review.ts"), "utf8");
 const migrationSource = await readFile(path.resolve("supabase/migrations/20260809000000_memory_v11_review_role.sql"), "utf8");
@@ -19,6 +20,17 @@ describe("review role migration", () => {
 });
 
 describe("review decision records", () => {
+  it("still refuses approval of legacy candidates without local evidence", async () => {
+    const calls: string[] = [];
+    const client = { query: async (sql: string) => {
+      calls.push(sql);
+      return sql.includes("select knowledge_candidate_id")
+        ? { rowCount: 1, rows: [{ knowledge_candidate_id: "legacy", pipeline_version: "legacy/1", status: "proposed", promotion_receipt_id: null }] }
+        : { rowCount: 0, rows: [] };
+    } } as unknown as DbClient;
+    await expect(recordDecisionFromClient(client, { workspaceId: "workspace", candidateId: "legacy", reviewerId: "human", rationale: "Checked" }, "approved")).rejects.toThrow(/no evidence/);
+    expect(calls.some((sql) => sql.startsWith("insert into memory_v1.approved_knowledge"))).toBe(false);
+  });
   it("derives deterministic identities from the candidate alone so a second decision collides", () => {
     const eventA = deterministicId("human_review_event", "workspace_w", ["candidate_1"]);
     const eventB = deterministicId("human_review_event", "workspace_w", ["candidate_1"]);

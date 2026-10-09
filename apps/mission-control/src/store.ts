@@ -38,8 +38,10 @@ export const PENDING_REVIEWS_SQL = `select kind,raw_id,status,detail,occurred_at
             jsonb_build_object('reason_code',reason_code,'fatal',fatal),null::timestamptz
             from memory_v1.quarantine_items where workspace_id=$1 and status='open'
           union all select 'knowledge_candidate',k.knowledge_candidate_id,k.status,
-            jsonb_build_object('kind',k.kind,'pipeline_version',k.pipeline_version),k.created_at
+            jsonb_build_object('kind',k.kind,'pipeline_version',k.pipeline_version,'promotion_receipt_id',k.promotion_receipt_id,'promoted_at',p.promoted_at),coalesce(p.promoted_at,k.created_at)
             from memory_v1.trusted_knowledge_candidates k
+            left join memory_v1.promotion_receipts p
+              on (p.workspace_id,p.promotion_receipt_id,p.pipeline_version)=(k.workspace_id,k.promotion_receipt_id,k.pipeline_version)
             where k.workspace_id=$1 and k.status='proposed'
               and not exists (select 1 from memory_v1.human_review_events e
                 where e.workspace_id=k.workspace_id and e.knowledge_candidate_id=k.knowledge_candidate_id)
@@ -96,12 +98,19 @@ export const APPROVED_KNOWLEDGE_LIST_SQL = `select
 
 export class MissionControlStore {
   private readonly pool: pg.Pool;
-  constructor(private readonly workspaceId: string, connectionString: string) {
+  private readonly ownsPool: boolean;
+  constructor(private readonly workspaceId: string, connectionString: string, pool?: pg.Pool) {
     assertLoopbackUrl(connectionString);
-    this.pool = new Pool({ connectionString, max: 4, application_name: "hhs-mission-control-reader" });
+    this.ownsPool = pool === undefined;
+    this.pool = pool ?? new Pool({
+      connectionString,
+      max: 4,
+      connectionTimeoutMillis: 3000,
+      application_name: "hhs-mission-control-reader"
+    });
   }
 
-  async close(): Promise<void> { await this.pool.end(); }
+  async close(): Promise<void> { if (this.ownsPool) await this.pool.end(); }
 
   async captureOperationBySafeReference(safeCaptureReference: string): Promise<CaptureOperationLink> {
     if (!/^capture-[a-f0-9]{24}$/.test(safeCaptureReference)) throw new Error("Invalid safe capture reference.");
@@ -124,6 +133,61 @@ export class MissionControlStore {
         archive_manifest_sha256: String(row.archive_manifest_sha256),
         message_count: row.message_count === null ? null : Number(row.message_count),
         operation_ref: safeRef("operation", String(row.operation_id))
+      };
+    });
+  }
+
+  async statusSummary(): Promise<Record<string, unknown>> {
+    return this.read(async (client) => {
+      await client.query("set local statement_timeout = '5000ms'");
+      await client.query("set local lock_timeout = '2000ms'");
+      const operations = await client.query(`
+        select operation_id,status,last_successful_stage,stuck,created_at
+        from capture_ops.operation_status_report
+        where workspace_id=$1
+        order by created_at desc,operation_id asc
+        limit 1
+      `, [this.workspaceId]);
+
+      const counts = await client.query(`
+        select
+          (select count(*) from memory_v1.messages where workspace_id=$1) messages,
+          (select count(*) from memory_v1.content_blocks where workspace_id=$1) blocks,
+          (select count(*) from memory_v1.knowledge_candidates
+            where workspace_id=$1 and status='proposed') proposed,
+          (select count(*) from memory_v1.approved_knowledge
+            where workspace_id=$1) approved
+      `, [this.workspaceId]);
+
+      const attention = await client.query(`
+        select
+          (select count(*) from capture_ops.operation_status_report
+            where workspace_id=$1
+              and (status in ('needs_review','failed','interrupted') or stuck)) operation_issues,
+          (select count(*) from memory_v1.quarantine_items
+            where workspace_id=$1 and status='open') quarantine,
+          (select count(*) from memory_v1.contradictions
+            where workspace_id=$1 and status<>'resolved') contradictions
+      `, [this.workspaceId]);
+
+      const operationRows = operations.rows.map((row) => ({
+        ...omitIds(row),
+        operation_ref: safeRef("operation", String(row.operation_id))
+      }));
+
+      const attentionRow = numericRow(attention.rows[0] ?? {});
+      const needsYou =
+        Number(attentionRow.operation_issues ?? 0)
+        + Number(attentionRow.quarantine ?? 0)
+        + Number(attentionRow.contradictions ?? 0);
+
+      return {
+        mode: "read_only",
+        generated_at: new Date().toISOString(),
+        operations: operationRows,
+        memory: numericRow(counts.rows[0] ?? {}),
+        needs_you: needsYou,
+        review_queue_state: "deferred_from_fast_status"
       };
     });
   }

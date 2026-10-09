@@ -85,6 +85,29 @@ export function createQueryService(config: QueryServiceConfig, deps: QueryServic
       const client = authenticate(config.clients, request.headers.authorization);
       if (!client) return json(response, 401, { error: "invalid_or_missing_token" });
 
+      const scopedQueryMatch = /^\/memory\/workspaces\/(workspace_[0-9a-f]{32})\/query$/.exec(request.url ?? "");
+      if (request.method === "POST" && scopedQueryMatch?.[1]) {
+        if (client.name !== "hhs-core") {
+          return json(response, 403, { error: "workspace_selection_forbidden" });
+        }
+
+        const workspaceId = scopedQueryMatch[1];
+        const body = await readBody(request);
+        const question = typeof body.question === "string" ? body.question.trim() : "";
+        if (!question) return json(response, 400, { error: "question_required" });
+
+        const limit = Number.isInteger(body.limit) ? Number(body.limit) : 20;
+        const result = await deps.query(workspaceId, question, limit);
+
+        audit(client.name, "POST /memory/workspaces/:workspace_id/query", {
+          workspace_id: workspaceId,
+          question_length: question.length,
+          matches: result.matches.length
+        });
+
+        return json(response, 200, { client: client.name, workspace_id: workspaceId, ...result });
+      }
+
       if (request.method === "POST" && request.url === "/memory/query") {
         const body = await readBody(request);
         const question = typeof body.question === "string" ? body.question.trim() : "";
