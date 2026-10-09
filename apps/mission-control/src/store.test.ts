@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { APPROVED_KNOWLEDGE_LIST_SQL, PENDING_REVIEWS_SQL, approvedStatement, safeRef } from "./store.js";
+import { describe, expect, it, vi } from "vitest";
+import pg from "pg";
+import { APPROVED_KNOWLEDGE_LIST_SQL, PENDING_REVIEWS_SQL, MissionControlStore, approvedStatement, safeRef } from "./store.js";
 import { APPROVED_KNOWLEDGE_QUERY_SQL } from "../../memory-ingest/src/query.js";
 
 describe("Mission Control safety boundary", () => {
@@ -13,6 +14,77 @@ describe("Mission Control safety boundary", () => {
 
   it("keeps distinct kinds visibly separate", () => {
     expect(safeRef("message", "synthetic-id")).not.toBe(safeRef("capture", "synthetic-id"));
+  });
+});
+
+describe("bounded read-only fast status", () => {
+  it("Finding 6: uses the report role and selected workspace, deterministic ordering, bounded queries, and explicit review deferral", async () => {
+    const query = vi.fn(async (sql: string, parameters?: unknown[]) => {
+      if (sql === "select current_user") return { rows: [{ current_user: "memory_v1_report_login" }] };
+      if (sql.includes("limit 1")) {
+        expect(parameters).toEqual(["synthetic-workspace"]);
+        expect(sql).toContain("order by created_at desc,operation_id asc");
+        return { rows: [{ operation_id: "private-operation", status: "interrupted", last_successful_stage: "archive" }] };
+      }
+      if (sql.includes("operation_issues")) return { rows: [{ operation_issues: "2", quarantine: "3", contradictions: "4" }] };
+      if (sql.includes("messages")) return { rows: [{ messages: "5", blocks: "6", proposed: "7", approved: "8" }] };
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const connect = vi.spyOn(pg.Pool.prototype, "connect").mockResolvedValue({ query, release } as any);
+    const store = new MissionControlStore("synthetic-workspace", "postgresql://memory_v1_report_login:synthetic@127.0.0.1:55022/postgres");
+    try {
+      const report = await store.statusSummary();
+      expect(report).toMatchObject({ mode: "read_only", needs_you: 9, review_queue_state: "deferred_from_fast_status",
+        memory: { messages: 5, blocks: 6, proposed: 7, approved: 8 },
+        operations: [{ status: "interrupted", operation_ref: safeRef("operation", "private-operation") }] });
+      expect(JSON.stringify(report)).not.toContain("private-operation");
+      expect(query.mock.calls.slice(0, 5)).toEqual([
+        ["begin read only"], ["select set_config('memory_v1.workspace_id',$1,true)", ["synthetic-workspace"]],
+        ["select current_user"], ["set local statement_timeout = '5000ms'"], ["set local lock_timeout = '2000ms'"]
+      ]);
+      expect(query).toHaveBeenLastCalledWith("commit");
+      expect(query.mock.calls.some(([sql]) => sql === PENDING_REVIEWS_SQL)).toBe(false);
+      for (const [sql, parameters] of query.mock.calls.filter(([sql]) => sql.includes("from "))) {
+        expect(parameters).toEqual(["synthetic-workspace"]);
+        expect(sql).toContain("workspace_id=$1");
+      }
+      expect(release).toHaveBeenCalledOnce();
+      const source = readFileSync("apps/mission-control/src/store.ts", "utf8");
+      expect(source).toContain("connectionTimeoutMillis: 3000");
+      expect(source).toContain("memory_v1.trusted_knowledge_candidates where workspace_id=$1) candidates");
+      const cli = readFileSync("scripts/hhs.ts", "utf8");
+      expect(cli).toContain("await store.statusSummary()");
+      expect(cli).toContain('!report ? "unavailable"');
+    } finally { connect.mockRestore(); await store.close(); }
+  });
+
+  it.each(["snapshot", "search"] as const)("Finding 6: %s does not inherit fast-status query timeouts", async (method) => {
+    const query = vi.fn(async (sql: string) => ({ rows: sql === "select current_user"
+      ? [{ current_user: "memory_v1_report_login" }] : [] }));
+    const release = vi.fn();
+    const connect = vi.spyOn(pg.Pool.prototype, "connect").mockResolvedValue({ query, release } as any);
+    const store = new MissionControlStore("synthetic-workspace", "postgresql://memory_v1_report_login:synthetic@127.0.0.1:55022/postgres");
+    try {
+      if (method === "snapshot") await store.snapshot(); else await store.search({ text: "synthetic" });
+      expect(query.mock.calls.some(([sql]) => /statement_timeout|lock_timeout/.test(sql))).toBe(false);
+      expect(query.mock.calls.some(([sql]) => sql.includes("from "))).toBe(true);
+      expect(query).toHaveBeenLastCalledWith("commit");
+      expect(release).toHaveBeenCalledOnce();
+    } finally { connect.mockRestore(); await store.close(); }
+  });
+
+  it("rejects a write-capable role without loading any status data", async () => {
+    const query = vi.fn(async (sql: string) => ({ rows: sql === "select current_user" ? [{ current_user: "memory_v1_ingest_login" }] : [] }));
+    const release = vi.fn();
+    const connect = vi.spyOn(pg.Pool.prototype, "connect").mockResolvedValue({ query, release } as any);
+    const store = new MissionControlStore("synthetic-workspace", "postgresql://memory_v1_ingest_login:synthetic@127.0.0.1:55022/postgres");
+    try {
+      await expect(store.statusSummary()).rejects.toThrow(/report-reader/);
+      expect(query).toHaveBeenLastCalledWith("rollback");
+      expect(query.mock.calls.some(([sql]) => sql.includes("from "))).toBe(false);
+      expect(release).toHaveBeenCalledOnce();
+    } finally { connect.mockRestore(); await store.close(); }
   });
 });
 

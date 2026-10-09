@@ -24,11 +24,12 @@ const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 
 const pending = manifest.chunks.find((chunk) => {
   const number = String(chunk.chunk_number).padStart(3, "0");
-  return !fs.existsSync(path.join(runDirectory, "chunk-" + number + "-output.json"));
+  return !fs.existsSync(path.join(runDirectory, "chunk-" + number + "-output.json"))
+    && !fs.existsSync(path.join(runDirectory, "chunk-" + number + "-model.json"));
 });
 
 if (!pending) {
-  console.log("ALL CHUNKS VALIDATED");
+  console.log("NO CHUNKS REQUIRE GENERATION; resume/revalidate cached artifacts through the oversized orchestrator.");
   process.exit(0);
 }
 
@@ -67,6 +68,8 @@ const systemPrompt = [
   "Preserve historical states, changes, corrections, rejected approaches, unresolved questions, and attribution.",
   "Never convert an assistant proposal into a user decision.",
   "A user decision, requirement, preference, instruction, rejection, approval, or commitment requires user-authored evidence.",
+  "When describing assistant planning, assistant inference, or assistant interpretation, do not phrase it as a user decision, requirement, preference, instruction, rejection, approval, or commitment unless cited user-authored evidence directly supports that claim.",
+  "If assistant-authored text refers to user preferences but no user-authored evidence supports the preference, describe it as assistant-inferred context or omit the unsupported preference clause.",
   "Use only evidence_ref values present in this child exchange.",
   "Return only valid JSON with no Markdown or surrounding prose.",
   "The object must contain exactly:",
@@ -78,6 +81,7 @@ const systemPrompt = [
   }),
   "Each observation requires observation_ref, source_conversation_id, observation_kind, statement, payload, attribution, confidence, and evidence.",
   "Every observation must repeat ALL required fields. Never inherit fields from a preceding observation.",
+  "Each element of observations[] must be one complete standalone observation object. Never split one observation across two adjacent JSON objects.",
   "The attribution object must contain both subject and claim_type.",
   "confidence must be a JSON number from 0 through 1.",
   "evidence must be a non-empty array of objects shaped exactly as { evidence_ref: valid_reference }.",
@@ -281,13 +285,11 @@ if (validation.status !== 0) {
   process.exit(9);
 }
 
-fs.copyFileSync(
-  attemptOutputPath,
-  canonicalOutputPath,
-  fs.constants.COPYFILE_EXCL
-);
+const canonicalModelPath = path.join(runDirectory, "chunk-" + chunkNumber + "-model.json");
+if (fs.existsSync(canonicalModelPath)) throw new Error("Validated chunk receipt already exists; resume through the oversized orchestrator.");
+const temporaryModel = `${canonicalModelPath}.tmp-${process.pid}`;
 fs.writeFileSync(
-  path.join(runDirectory, "chunk-" + chunkNumber + "-model.json"),
+  temporaryModel,
   JSON.stringify({
     provider: PROVIDER,
     model: modelResult.model,
@@ -298,6 +300,11 @@ fs.writeFileSync(
   }, null, 2) + "\n",
   { flag: "wx" }
 );
+fs.renameSync(temporaryModel, canonicalModelPath);
+// Publish the canonical output last, after its validated attempt receipt exists.
+const temporaryOutput = `${canonicalOutputPath}.tmp-${process.pid}`;
+fs.copyFileSync(attemptOutputPath, temporaryOutput, fs.constants.COPYFILE_EXCL);
+fs.renameSync(temporaryOutput, canonicalOutputPath);
 
 console.log("CHUNK VALIDATED:", pending.chunk_number + "/" + pending.chunk_count);
 console.log("observations:", output.observations?.length ?? 0);
