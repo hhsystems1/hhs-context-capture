@@ -148,6 +148,45 @@ describe("existing standard reconstruction runner retry/resume", () => {
     expect(calls).toEqual(["validate", "persist"]);
   });
 
+  it("never selects a priority conversation outside the active workspace inventory", async () => {
+    const directory = root();
+    priority(directory);
+
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) {
+        return result(0, { workspace_id: WORKSPACE, conversations: [] });
+      }
+      throw new Error(`Unexpected processing outside active workspace inventory: ${args}`);
+    };
+
+    expect((await run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, spawn)).code).toBe(0);
+    expect(batchReceipt(directory)).toMatchObject({
+      status: "completed",
+      selected: 0,
+      completed: [],
+      quarantined: []
+    });
+  });
+
+  it("completes an empty workspace without requiring the historical priority index", async () => {
+    const directory = root();
+
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) {
+        return result(0, { workspace_id: WORKSPACE, conversations: [] });
+      }
+      throw new Error(`Unexpected processing for empty workspace: ${args}`);
+    };
+
+    expect((await run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, spawn)).code).toBe(0);
+    expect(batchReceipt(directory)).toMatchObject({
+      status: "completed",
+      selected: 0,
+      completed: [],
+      quarantined: []
+    });
+  });
+
   it("archives incomplete/generation-failed attempts and resumes with bounded fresh generation", async () => {
     const directory = root(); priority(directory); put(directory, `${BASE}-input.json`, exchange());
     let generations = 0;

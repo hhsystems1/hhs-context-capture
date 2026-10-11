@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   DEFAULT_RECONSTRUCTION_BATCH_SIZE,
+  assertExpectedCleanCorpusSize,
   buildDiscoveryReceipt,
   formatReconstructionReport,
   loadReconstructionInventory,
@@ -11,16 +12,24 @@ import {
 import type { DiscoveryExchange, DiscoveryOutput } from "../apps/memory-ingest/src/understanding-discovery.js";
 
 const USAGE = "Usage: reconstruction-inventory.ts <json|report> --workspace ID [--batch-size 10] "
-  + "[--receipt-exchange FILE --receipt-output FILE ...] [--generated-at ISO] [--output NEW_FILE]";
+  + "[--expected-corpus-size N] [--receipt-exchange FILE --receipt-output FILE ...] [--generated-at ISO] [--output NEW_FILE]";
 
 const command = process.argv[2];
 if (command !== "json" && command !== "report") throw new Error(USAGE);
 const workspaceId = requiredFlag("workspace");
 const batchSize = Number(flag("batch-size") ?? String(DEFAULT_RECONSTRUCTION_BATCH_SIZE));
 const generatedAt = flag("generated-at") ?? new Date().toISOString();
+const expectedCorpusSizeFlag = flag("expected-corpus-size");
+const expectedCorpusSize = expectedCorpusSizeFlag === undefined ? undefined : Number(expectedCorpusSizeFlag);
+if (expectedCorpusSize !== undefined && (!Number.isInteger(expectedCorpusSize) || expectedCorpusSize < 0)) {
+  throw new Error("--expected-corpus-size must be a non-negative integer.");
+}
 
 const receipts = await loadSuppliedReceipts(receiptPairs());
 const snapshot = await loadReconstructionInventory(workspaceId, receipts, generatedAt, batchSize);
+if (expectedCorpusSize !== undefined) {
+  assertExpectedCleanCorpusSize(snapshot.summary.total_clean_conversations, expectedCorpusSize);
+}
 
 if (command === "json") {
   const serialized = `${JSON.stringify(snapshot, null, 2)}\n`;

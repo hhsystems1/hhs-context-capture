@@ -19,6 +19,15 @@ export const RECONSTRUCTION_INVENTORY_SCHEMA = "hhs-reconstruction-inventory/0.1
 export const DEFAULT_RECONSTRUCTION_BATCH_SIZE = 10;
 export const EXPECTED_CLEAN_CORPUS_SIZE = 995;
 
+export function assertExpectedCleanCorpusSize(observed: number, expected: number): void {
+  if (!Number.isInteger(expected) || expected < 0) {
+    throw new Error("Expected corpus size must be a non-negative integer.");
+  }
+  if (observed !== expected) {
+    throw new Error(`Canonical clean corpus count mismatch: expected ${expected}, observed ${observed}.`);
+  }
+}
+
 export type EvidenceStatus = "healthy" | "evidence_incomplete";
 export type DiscoveryStatus = "unprocessed" | "pilot_discovery_processed" | "discovery_processed";
 export type ReconciliationStatus = "not_started" | "awaiting_reconciliation" | "reconciled";
@@ -230,9 +239,6 @@ export function buildReconstructionInventory(
   if (!Number.isInteger(batchSize) || batchSize < 1) throw new Error("Batch size must be a positive integer.");
   const sourceIds = rows.map((row) => row.source_conversation_id);
   if (new Set(sourceIds).size !== rows.length) throw new Error("Canonical corpus contains duplicate source_conversation_id values.");
-  if (rows.length !== EXPECTED_CLEAN_CORPUS_SIZE) {
-    throw new Error(`Canonical clean corpus count mismatch: expected ${EXPECTED_CLEAN_CORPUS_SIZE}, observed ${rows.length}.`);
-  }
   const rowIds = new Set(sourceIds);
   for (const receipt of receipts) {
     const missing = receipt.source_conversation_ids.filter((id) => !rowIds.has(id));

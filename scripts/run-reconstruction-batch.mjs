@@ -22,15 +22,24 @@ if (!WORKSPACE) throw new Error("--workspace or MEMORY_WORKSPACE_ID is required.
 if (!Number.isInteger(LIMIT) || LIMIT < 1) throw new Error("--limit must be a positive integer.");
 if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not loaded.");
 
-const priority = read(PRIORITY_PATH);
 const inventory = inventoryJson();
+const priority = inventory.conversations.length === 0
+  ? { conversations: [] }
+  : read(PRIORITY_PATH);
+const inventorySourceIds = new Set(
+  inventory.conversations.map((item) => item.source_conversation_id)
+);
 const persisted = new Set(
   inventory.conversations
     .filter((item) => item.discovery_status === "discovery_processed")
     .map((item) => item.source_conversation_id)
 );
 const eligible = priority.conversations
-  .filter((item) => !item.evidence_issue && !persisted.has(item.source_conversation_id))
+  .filter((item) =>
+    inventorySourceIds.has(item.source_conversation_id)
+    && !item.evidence_issue
+    && !persisted.has(item.source_conversation_id)
+  )
   .sort((a, b) => a.unprocessed_queue_rank - b.unprocessed_queue_rank);
 
 const candidates = TARGET_CONVERSATION

@@ -4,6 +4,7 @@ import { sha256 } from "@hhs/memory-schema";
 import {
   DEFAULT_RECONSTRUCTION_BATCH_SIZE,
   EXPECTED_CLEAN_CORPUS_SIZE,
+  assertExpectedCleanCorpusSize,
   buildDiscoveryReceipt,
   buildReconstructionInventory,
   loadCanonicalInventoryRows,
@@ -74,6 +75,21 @@ describe("reconstruction inventory control plane", () => {
     expect(snapshot.summary.total_clean_conversations).toBe(995);
     expect(new Set(snapshot.conversations.map((row) => row.source_conversation_id)).size).toBe(995);
     expect(snapshot.conversations.some((row) => row.source_conversation_id === HELD_UUID)).toBe(false);
+  });
+
+  it("allows workspace-relative corpus sizes while preserving explicit proof-size validation", () => {
+    const rows = canonicalRows().slice(0, 2);
+    const snapshot = buildReconstructionInventory(WORKSPACE, rows, [], "2026-08-31T00:00:00.000Z");
+
+    expect(snapshot.summary.total_clean_conversations).toBe(2);
+    expect(() => assertExpectedCleanCorpusSize(
+      snapshot.summary.total_clean_conversations,
+      EXPECTED_CLEAN_CORPUS_SIZE
+    )).toThrow(/expected 995, observed 2/);
+    expect(() => assertExpectedCleanCorpusSize(
+      EXPECTED_CLEAN_CORPUS_SIZE,
+      EXPECTED_CLEAN_CORPUS_SIZE
+    )).not.toThrow();
   });
 
   it("orders and batches deterministically regardless of query row order", () => {
