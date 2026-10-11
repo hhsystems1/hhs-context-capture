@@ -23,9 +23,26 @@ if (!Number.isInteger(LIMIT) || LIMIT < 1) throw new Error("--limit must be a po
 if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not loaded.");
 
 const inventory = inventoryJson();
-const priority = inventory.conversations.length === 0
+const pendingInventory = inventory.conversations.filter(
+  (item) => item.discovery_status !== "discovery_processed" && !item.evidence_issue
+);
+const priority = pendingInventory.length === 0
   ? { conversations: [] }
   : read(PRIORITY_PATH);
+
+const prioritySourceIds = new Set(
+  priority.conversations.map((item) => item.source_conversation_id)
+);
+const missingPrioritySourceIds = pendingInventory
+  .map((item) => item.source_conversation_id)
+  .filter((sourceId) => !prioritySourceIds.has(sourceId));
+
+if (missingPrioritySourceIds.length > 0) {
+  throw new Error(
+    `Missing priority metadata for active workspace source(s): ${missingPrioritySourceIds.join(", ")}`
+  );
+}
+
 const inventorySourceIds = new Set(
   inventory.conversations.map((item) => item.source_conversation_id)
 );

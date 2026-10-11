@@ -187,6 +187,30 @@ describe("existing standard reconstruction runner retry/resume", () => {
     });
   });
 
+  it("refuses to silently complete when an unprocessed workspace source lacks priority metadata", async () => {
+    const directory = root();
+    priority(directory);
+    const workspaceOnlySource = "workspace-only-source";
+
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) {
+        return result(0, {
+          workspace_id: WORKSPACE,
+          conversations: [{
+            source_conversation_id: workspaceOnlySource,
+            discovery_status: "unprocessed",
+            evidence_issue: false
+          }]
+        });
+      }
+      throw new Error(`Unexpected processing before priority coverage is proven: ${args}`);
+    };
+
+    await expect(
+      run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, spawn)
+    ).rejects.toThrow(/missing priority metadata.*workspace-only-source/i);
+  });
+
   it("archives incomplete/generation-failed attempts and resumes with bounded fresh generation", async () => {
     const directory = root(); priority(directory); put(directory, `${BASE}-input.json`, exchange());
     let generations = 0;
