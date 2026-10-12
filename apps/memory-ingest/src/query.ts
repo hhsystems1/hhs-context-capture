@@ -20,6 +20,8 @@ export interface ApprovedKnowledgeMatch {
   representation_kind: string | null;
   representation_sha256: string | null;
   text_value: string;
+  authority?: string | null;
+  temporal_status?: string | null;
   promotion_receipt_id?: string | null;
   source_lineage?: Array<Record<string, unknown>> | null;
   source_lineage_sha256?: string | null;
@@ -37,7 +39,8 @@ select distinct
   pe.provenance_edge_id, pe.representation_kind, pe.representation_sha256,
   rep->>'value' as text_value,
   null::text as promotion_receipt_id, null::jsonb as source_lineage,
-  null::text as source_lineage_sha256, null::text as promoted_value_sha256
+  null::text as source_lineage_sha256, null::text as promoted_value_sha256,
+  ak.approved_value->>'authority' as authority, ak.approved_value->>'temporal_status' as temporal_status
 from memory_v1.approved_knowledge ak
 join memory_v1.human_review_events hre
   on hre.workspace_id=ak.workspace_id and hre.human_review_event_id=ak.approval_event_id
@@ -64,7 +67,8 @@ select ak.approved_knowledge_id, ak.knowledge_candidate_id, ak.pipeline_version,
        null::text, null::text, null::text, null::text, null::text, null::integer, null::text,
        null::text, null::text, null::text,
        ak.approved_value->>'statement' as text_value,
-       p.promotion_receipt_id, p.source_lineage, p.source_lineage_sha256, p.promoted_value_sha256
+       p.promotion_receipt_id, p.source_lineage, p.source_lineage_sha256, p.promoted_value_sha256,
+       ak.approved_value->>'authority', ak.approved_value->>'temporal_status'
 from memory_v1.approved_knowledge ak
 join memory_v1.human_review_events hre
   on hre.workspace_id=ak.workspace_id and hre.human_review_event_id=ak.approval_event_id

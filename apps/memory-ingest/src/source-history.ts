@@ -1,6 +1,6 @@
 import { sha256 } from "@hhs/memory-schema";
 import { createPool, readOnlyTransaction, type DbClient } from "./db.js";
-import { prepareReconciliationInputFromClient } from "./reconciliation.js";
+import { prepareReconciliationInputFromClient, hasSupportingUserEvidence } from "./reconciliation.js";
 
 // Read models over existing immutable observations/provenance. No new queue,
 // ontology, evidence store, reconciliation or approval authority.
@@ -66,6 +66,7 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
     observation_id: observation.observation_id, pipeline_version: observation.pipeline_version,
     observation_kind: observation.observation_kind, statement: observation.statement,
     attribution: observation.attribution, evidence_roles: observation.evidence_roles,
+    user_evidence_supported: hasSupportingUserEvidence([{ observation_id: observation.observation_id, relation: "supports" }], [observation]),
     created_at: observation.created_at, record_sha256: observation.record_sha256,
     status: String(rows[index]!.status),
     confidence: typeof rows[index]!.payload.confidence === "number" ? rows[index]!.payload.confidence : null

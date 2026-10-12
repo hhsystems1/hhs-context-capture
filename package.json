@@ -55,7 +55,9 @@
     "reconstruction:audit": "tsx --env-file=.env.memory-v1.local scripts/reconstruction-quality-audit.ts",
     "memory:reconcile": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts reconcile",
     "memory:promote": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts promote",
-    "memory:review:evidence": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts review-evidence"
+    "memory:review:evidence": "tsx --env-file=.env.memory-v1.local apps/memory-ingest/src/cli.ts review-evidence",
+    "memory:context:integration:service": "tsx --env-file=.env.context-integration.local apps/memory-ingest/src/brain-integration-service.ts",
+    "memory:context:review:service": "tsx --env-file=.env.context-review.local apps/memory-ingest/src/brain-review-service.ts"
   },
   "engines": {
     "node": ">=22"
