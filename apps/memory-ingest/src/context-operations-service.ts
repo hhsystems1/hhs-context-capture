@@ -12,8 +12,10 @@ import { loadReconstructionInventory } from "./reconstruction-inventory.js";
 export const LOOPBACK_HOST = "127.0.0.1";
 const ROOT = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const OPERATION = /^operation_[0-9a-f]{32}$/;
+const SOURCE_WORKSPACE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+interface ProcessingSource { sourceRef: string; workspaceId: string; label: string; clients: string[] }
 const hash = (value: string) => createHash("sha256").update(value).digest();
-export interface OperationsConfig { port: number; clients: { name: string; digest: Buffer }[] }
+export interface OperationsConfig { port: number; clients: { name: string; digest: Buffer }[]; sourceCollections?: ProcessingSource[] }
 export interface LaunchInput { limit: number; conversation?: string }
 export interface Operation { operation_id: string; workspace: string; started_at: string; finished_at?: string; termination?: "exited" | "spawn_failed"; exit_code?: number | null }
 export interface OperationsDeps {
@@ -44,7 +46,22 @@ export function loadOperationsConfig(env: Record<string, string | undefined>): O
     return { name, digest: hash(token) };
   });
   if (!clients.length || new Set(clients.map(c => c.name)).size !== clients.length || new Set(clients.map(c => c.digest.toString("hex"))).size !== clients.length) throw new Error("Context Operations requires unique named tokens.");
-  return { port, clients };
+  const entries: unknown = JSON.parse(env.MEMORY_CONTEXT_SOURCE_COLLECTIONS ?? "[]");
+  if (!Array.isArray(entries) || entries.length > 20) throw new Error("Invalid processing source configuration.");
+  const sourceCollections = entries.map((entry: unknown): ProcessingSource => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Invalid processing source configuration.");
+    const row = entry as Record<string, unknown>;
+    if (Object.keys(row).some(key => !["sourceRef", "workspaceId", "label", "clients"].includes(key))
+      || typeof row.sourceRef !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(row.sourceRef)
+      || typeof row.workspaceId !== "string" || !SOURCE_WORKSPACE.test(row.workspaceId)
+      || typeof row.label !== "string" || !row.label.trim() || row.label.length > 160
+      || !Array.isArray(row.clients) || !row.clients.length
+      || row.clients.some(name => typeof name !== "string" || !clients.some(client => client.name === name))
+      || new Set(row.clients).size !== row.clients.length) throw new Error("Invalid processing source configuration.");
+    return { sourceRef: row.sourceRef, workspaceId: row.workspaceId, label: row.label, clients: row.clients as string[] };
+  });
+  if (new Set(sourceCollections.map(source => source.sourceRef)).size !== sourceCollections.length) throw new Error("Duplicate processing source reference.");
+  return { port, clients, sourceCollections };
 }
 export function parseLaunchInput(value: unknown): LaunchInput {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new OperationsError(400, "invalid_body");
@@ -102,18 +119,27 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       ...(operation ? { operation_id: operation.operation_id, started_at: operation.started_at, ...(operation.finished_at ? { process_finished_at: operation.finished_at } : {}), ...(operation.termination ? { process_termination: operation.termination, process_exit_code: operation.exit_code ?? null } : {}) } : {}), memory, reconstruction };
   }
   return http.createServer(async (request, response) => {
-    const json = (code: number, body: unknown) => { response.writeHead(code, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" }); response.end(JSON.stringify(body)); };
+    let source: ProcessingSource | undefined;
+    const json = (code: number, body: unknown) => { response.writeHead(code, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" }); response.end(JSON.stringify(source && body && typeof body === "object" ? { ...body, source_ref: source.sourceRef, source_label: source.label } : body)); };
     let workspace: string | undefined;
     try {
       const address = request.socket.remoteAddress;
       const port = (response.socket?.localPort ?? config.port);
       if (!["127.0.0.1", "::ffff:127.0.0.1"].includes(address ?? "") || request.headers.host !== `127.0.0.1:${port}` || request.headers.origin !== undefined) return json(403, { error: "loopback_only" });
       const auth = /^Bearer ([^\s]+)$/i.exec(request.headers.authorization ?? "");
-      if (!auth || !config.clients.some(c => timingSafeEqual(c.digest, hash(auth[1]!)))) return json(401, { error: "invalid_or_missing_token" });
+      const caller = auth ? config.clients.find(c => timingSafeEqual(c.digest, hash(auth[1]!))) : undefined;
+      if (!caller) return json(401, { error: "invalid_or_missing_token" });
       const route = /^\/memory\/workspaces\/(workspace_[0-9a-f]{32})\/reconstruction\/(status|start|resume)$/.exec(request.url ?? "");
-      if (!route || (route[2] === "status" ? request.method !== "GET" : request.method !== "POST")) return json(404, { error: "unknown_route" });
-      workspace = route[1]!;
-      if (route[2] === "status") {
+      const sourceRoute = /^\/memory\/sources\/([a-z0-9][a-z0-9_-]{0,63})\/reconstruction\/(status|start|resume)$/.exec(request.url ?? "");
+      const intent = (route ?? sourceRoute)?.[2];
+      if (!intent || (intent === "status" ? request.method !== "GET" : request.method !== "POST")) return json(404, { error: "unknown_route" });
+      if (sourceRoute) {
+        const configured = config.sourceCollections?.find(entry => entry.sourceRef === sourceRoute[1]);
+        if (!configured || !configured.clients.includes(caller.name)) return json(404, { error: "unknown_route" });
+        source = configured;
+        workspace = source.workspaceId;
+      } else workspace = route![1]!;
+      if (intent === "status") {
         if (request.headers["transfer-encoding"] || Number(request.headers["content-length"] ?? 0) !== 0) throw new OperationsError(400, "invalid_body");
         return json(200, await status(workspace));
       }
@@ -152,7 +178,7 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
         // Unexpected termination with a correlated receipt retains durable exclusion.
         child.once("close", code => finish("exited", code));
       } catch { finish("spawn_failed", null); throw new OperationsError(503, "launch_unavailable"); }
-      return json(202, { workspace_id: workspace, operation_id: operation.operation_id, intent: route[2], state: operation.termination ? "failed" : live.has(workspace) ? "running" : "unknown" });
+      return json(202, { workspace_id: workspace, operation_id: operation.operation_id, intent, state: operation.termination ? "failed" : live.has(workspace) ? "running" : "unknown" });
     } catch (error) {
       if (error instanceof OperationsError) return json(error.status, { error: error.code });
       return json(503, { ...(workspace ? { workspace_id: workspace } : {}), state: "unavailable", available: false, error: "operations_unavailable" });
@@ -183,7 +209,7 @@ export function localExecutionDeps(root: string): Pick<OperationsDeps, "receipts
       });
       try {
         const owner = JSON.parse(fs.readFileSync(lock, "utf8"));
-        if (!OPERATION.test(String(owner.operation_id)) || !/^workspace_[0-9a-f]{32}$/.test(String(owner.workspace))) throw new Error("Invalid execution lock");
+        if (!OPERATION.test(String(owner.operation_id)) || !SOURCE_WORKSPACE.test(String(owner.workspace))) throw new Error("Invalid execution lock");
         if (owner.workspace === workspace && !records.some(r => r.operation_id === owner.operation_id)) throw new Error("Missing liveness receipt");
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       return records;

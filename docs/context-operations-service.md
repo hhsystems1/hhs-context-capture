@@ -2,10 +2,13 @@
 
 Core resolves `brain_binding -> memory_workspace_id` and calls this trusted local service. Browser requests are rejected. Mission Control remains a read-only operator console; provisioning and query retain their own credential boundaries.
 
+For a Personal brain with an existing historical-source grant, Core resolves the source alias after authentication and active binding resolution. It reads reconstruction coverage from that source and approved-memory counts from the Personal destination. Start/Resume targets the source alias rather than the empty destination. Organization and project bindings retain their original workspace path. Browser actions require a same-origin POST and cannot supply a source alias or workspace override.
+
 Run `npm run memory:context:operations:service` in a dedicated trusted environment. No env file is loaded by the service entrypoint. Configuration:
 
 - `MEMORY_CONTEXT_OPERATIONS_TOKENS`: comma-separated `<client>:<32+ character token>` entries with unique names and tokens. Only hashes are retained in service configuration.
 - `MEMORY_CONTEXT_OPERATIONS_PORT`: default `54433`.
+- Optional `MEMORY_CONTEXT_SOURCE_COLLECTIONS`: a JSON array of strict `{ sourceRef, workspaceId, label, clients }` mappings, at most 20. Aliases use `[a-z0-9][a-z0-9_-]{0,63}`; workspace references use `[A-Za-z0-9][A-Za-z0-9_-]{0,127}`. `clients` is a nonempty unique allowlist of existing named clients. Unknown aliases and callers without a grant receive 404 before any read or launch. This is source metadata, not query/review credentials.
 - Existing `MEMORY_REPORT_DATABASE_URL` using `memory_v1_report_login` and `MEMORY_INGEST_DATABASE_URL` using `memory_v1_ingest_login`, both loopback PostgreSQL credentials. Admin, reviewer, query-service and provisioning-service credentials are refused.
 - The existing runner still requires its existing trusted local provider/configuration setup, including its existing child CLI env-file behavior. This slice does not provision or redesign those credentials. Operations bearer tokens are removed from the spawned child's environment.
 
@@ -16,12 +19,19 @@ The server binds `127.0.0.1` only. Requests require the exact `Host: 127.0.0.1:<
 | GET | `/memory/workspaces/:workspace/reconstruction/status` | No request body or query string |
 | POST | `/memory/workspaces/:workspace/reconstruction/start` | JSON object below |
 | POST | `/memory/workspaces/:workspace/reconstruction/resume` | Same JSON object |
+| GET | `/memory/sources/:sourceRef/reconstruction/status` | No body or query string; configured client grant required |
+| POST | `/memory/sources/:sourceRef/reconstruction/start` | Same bounded JSON object; configured client grant required |
+| POST | `/memory/sources/:sourceRef/reconstruction/resume` | Same bounded JSON object; configured client grant required |
 
 Workspace IDs must exactly match `workspace_[0-9a-f]{32}`. POST requires `Content-Type: application/json`; the maximum body size is 4096 bytes. Only `limit` (integer 1–10, default 10) and `conversation` (optional source conversation ID matching `[A-Za-z0-9][A-Za-z0-9_-]{0,127}`) are accepted. All other keys are rejected. The runner checks actual candidate eligibility.
+
+Legacy historical workspace references are accepted only through an operator-configured source alias, never by broadening the raw workspace route. Authorized source responses include `source_ref` and `source_label`; Core verifies the alias and strips internal workspace identity before returning status or acceptance. Source and destination runs share the same durable global execution exclusion.
 
 Both POST routes use `spawn(process.execPath, argv, { shell: false, ... })` to invoke **only** `scripts/run-reconstruction-batch.mjs --workspace <workspace> --limit <limit> --operation-id <operation_id> [--conversation <id>]`. Start and Resume differ only in the returned intent. Neither resets artifacts or introduces execution/reconstruction logic. Acceptance is HTTP 202 with `workspace_id`, `operation_id`, `intent`, and `state` (`unknown` until spawn is confirmed). HTTP 409 reports `operation_active` with the in-process operation ID, or `execution_active_or_unresolved` for durable exclusion/unresolved prior running state.
 
 Status reuses `MissionControlStore.statusSummary()` for memory counts and `loadReconstructionInventory` for reconstruction coverage. Both share one long-lived report-reader pool owned by the service and closed on shutdown or startup failure. Inventory status transactions apply the same 5-second statement and 2-second lock timeouts as Mission Control; Start/Resume preflight uses this same bounded path. No pilot artifact is implicitly accepted as persisted processing. Batch receipt completion is separate from corpus/reconciliation coverage and approved-memory authority.
+
+The block-membership inventory query uses two equality joins and a deduplicating union to preserve the original source-version OR capture-version membership without scanning every block against every conversation. A scoped read-only comparison on the 995-chat corpus returned the identical deterministic full-inventory SHA-256 before and after this change; observed runtime fell from 10,518 ms to 916 ms. The five-second status limit, report role, RLS and corpus rules are unchanged.
 
 Allowlisted status fields:
 

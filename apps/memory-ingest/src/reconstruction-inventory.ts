@@ -415,13 +415,23 @@ with clean as (
   from clean cl left join memory_v1.messages m on m.workspace_id=$1 and m.conversation_id=cl.conversation_id
     and (m.source_version_id=cl.source_version_id or m.capture_version_id=cl.capture_version_id)
   group by cl.source_version_id
+), block_memberships as (
+  -- Keep the original source-version OR capture-version membership, deduplicated
+  -- when both identities match. Two equality joins avoid a corpus-wide pair scan.
+  select cl.source_version_id,b.content_block_id
+  from clean cl join memory_v1.content_blocks b
+    on b.workspace_id=$1 and b.source_version_id=cl.source_version_id
+  union
+  select cl.source_version_id,b.content_block_id
+  from clean cl join memory_v1.content_blocks b
+    on b.workspace_id=$1 and b.capture_version_id=cl.capture_version_id
 ), block_stats as (
   select cl.source_version_id,count(distinct b.content_block_id)::int evidence_block_count,
     count(*) filter(where rep->>'representation_kind'='canonical_text')::int canonical_text_representation_count,
     count(*) filter(where rep->>'representation_kind'='canonical_text' and length(rep->>'value')>0)::int nonempty_canonical_text_count,
     count(*) filter(where rep->>'representation_kind'='canonical_text' and length(rep->>'value')=0)::int empty_canonical_text_count
-  from clean cl left join memory_v1.content_blocks b on b.workspace_id=$1
-    and (b.source_version_id=cl.source_version_id or b.capture_version_id=cl.capture_version_id)
+  from clean cl left join block_memberships bm on bm.source_version_id=cl.source_version_id
+  left join memory_v1.content_blocks b on b.workspace_id=$1 and b.content_block_id=bm.content_block_id
   left join lateral jsonb_array_elements(b.representations) rep on true
   group by cl.source_version_id
 ), observation_stats as (

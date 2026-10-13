@@ -16,19 +16,52 @@ const config = loadOperationsConfig(env);
 const summary = { memory: { messages: 7, blocks: 8, proposed: 2, approved: 1, secret: TOKEN }, reconstruction: Object.fromEntries(["total_clean_conversations", "discovery_processed", "unprocessed", "awaiting_reconciliation", "observations_awaiting_reconciliation", "reconciled", "evidence_issues", "zero_evidence", "needs_review", "other_evidence_issues", "batches_total", "batches_complete", "batches_partial", "remaining_conversations", "next_batch"].map(key => [key, key === "next_batch" ? null : 1])) };
 const roots: string[] = [];
 afterEach(() => { roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })); vi.restoreAllMocks(); });
-function setup() {
+function setup(serviceConfig = config) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "context-operations-test-")); roots.push(root);
   const child = new EventEmitter() as ChildProcess;
   const deps: OperationsDeps = { ...localExecutionDeps(root), status: vi.fn(async () => summary), launch: vi.fn(() => { queueMicrotask(() => child.emit("spawn")); return child; }) };
-  return { root, child, deps, server: createContextOperationsService(config, deps) };
+  return { root, child, deps, server: createContextOperationsService(serviceConfig, deps) };
 }
-async function request(server: ReturnType<typeof createContextOperationsService>, intent = "status", init: { workspace?: string; method?: string; headers?: Record<string, string>; body?: string; peer?: string; suffix?: string } = {}) {
-  const incoming = Object.assign(Readable.from([Buffer.from(init.body ?? (intent === "status" ? "" : "{}"))]), { method: init.method ?? (intent === "status" ? "GET" : "POST"), url: `/memory/workspaces/${init.workspace ?? W}/reconstruction/${intent}${init.suffix ?? ""}`, headers: { host: "127.0.0.1:54433", authorization: `Bearer ${TOKEN}`, "content-type": "application/json", ...init.headers }, socket: { remoteAddress: init.peer ?? "127.0.0.1" } });
+async function request(server: ReturnType<typeof createContextOperationsService>, intent = "status", init: { workspace?: string; source?: string; method?: string; headers?: Record<string, string>; body?: string; peer?: string; suffix?: string } = {}) {
+  const incoming = Object.assign(Readable.from([Buffer.from(init.body ?? (intent === "status" ? "" : "{}"))]), { method: init.method ?? (intent === "status" ? "GET" : "POST"), url: `/memory/${init.source ? `sources/${init.source}` : `workspaces/${init.workspace ?? W}`}/reconstruction/${intent}${init.suffix ?? ""}`, headers: { host: "127.0.0.1:54433", authorization: `Bearer ${TOKEN}`, "content-type": "application/json", ...init.headers }, socket: { remoteAddress: init.peer ?? "127.0.0.1" } });
   return new Promise<{ code: number; body: any }>(resolve => {
     let code = 0;
     server.emit("request", incoming, { writeHead: (value: number) => { code = value; }, end: (bytes: string) => resolve({ code, body: JSON.parse(bytes) }) });
   });
 }
+describe("authorized historical processing aliases", () => {
+  const source = { sourceRef: "test-history", workspaceId: "historical-source-fixture", label: "Historical collection", clients: ["hhs-core"] };
+  const sourceConfig = loadOperationsConfig({ ...env, MEMORY_CONTEXT_SOURCE_COLLECTIONS: JSON.stringify([source]) });
+  it("validates source mappings and named-client grants strictly", () => {
+    for (const invalid of [{ sourceRef: "../private" }, { workspaceId: "../private" }, { clients: [] }, { clients: ["unknown"] }, { clients: ["hhs-core", "hhs-core"] }, { arbitrary: true }, { label: "" }]) {
+      expect(() => loadOperationsConfig({ ...env, MEMORY_CONTEXT_SOURCE_COLLECTIONS: JSON.stringify([{ ...source, ...invalid }]) })).toThrow();
+    }
+    expect(() => loadOperationsConfig({ ...env, MEMORY_CONTEXT_SOURCE_COLLECTIONS: JSON.stringify([source, source]) })).toThrow();
+  });
+  it("unknown aliases, raw historical workspace paths and ungranted callers cannot read or launch", async () => {
+    const otherToken = "other-test-client-token-".repeat(3);
+    const { server, deps } = setup(loadOperationsConfig({ ...env, MEMORY_CONTEXT_OPERATIONS_TOKENS: `hhs-core:${TOKEN},other-client:${otherToken}`, MEMORY_CONTEXT_SOURCE_COLLECTIONS: JSON.stringify([source]) }));
+    expect((await request(server, "status", { source: "not-granted" })).code).toBe(404);
+    expect((await request(server, "start", { workspace: source.workspaceId })).code).toBe(404);
+    expect((await request(server, "status", { source: source.sourceRef, headers: { authorization: `Bearer ${otherToken}` } })).code).toBe(404);
+    expect(deps.status).not.toHaveBeenCalled(); expect(deps.launch).not.toHaveBeenCalled();
+  });
+  it.each(["start", "resume"])("%s uses the existing runner and global exclusion for the server-resolved source", async intent => {
+    const { server, root, deps, child } = setup(sourceConfig);
+    const accepted = await request(server, intent, { source: source.sourceRef, body: '{"limit":2}' });
+    expect(accepted.code).toBe(202);
+    expect(accepted.body).toMatchObject({ workspace_id: source.workspaceId, source_ref: source.sourceRef, source_label: source.label, intent });
+    expect(deps.launch).toHaveBeenCalledWith(process.execPath, ["scripts/run-reconstruction-batch.mjs", "--workspace", source.workspaceId, "--limit", "2", "--operation-id", accepted.body.operation_id], { cwd: process.cwd(), shell: false, stdio: "ignore" });
+    expect((await request(server, "start")).code).toBe(409);
+    expect((await request(createContextOperationsService(sourceConfig, deps), "resume", { source: source.sourceRef })).code).toBe(409);
+    expect(deps.launch).toHaveBeenCalledTimes(1);
+    putReceipt(root, accepted.body.operation_id, "completed", { workspace: source.workspaceId });
+    child.emit("close", 0);
+    const final = await request(server, "status", { source: source.sourceRef });
+    expect(final.body).toMatchObject({ state: "completed", completed_count: 1, source_ref: source.sourceRef });
+    expect(JSON.stringify(final)).not.toContain(TOKEN);
+  });
+});
 function putReceipt(root: string, op: string | undefined, state: string, extra = {}) {
   const directory = path.join(root, ".runtime/reconstruction/batch-receipts"); fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, `batch-${op ?? "cli"}.json`), JSON.stringify({ schema_version: "hhs-reconstruction-batch/0.1.0", workspace: W, operation_id: op, started_at: "2026-01-01T00:00:00.000Z", status: state, requested: 10, selected: 2, completed: [{}], quarantined: state === "completed" ? [] : [{ reason: "prepared_source_identity_mismatch secret" }], provider: TOKEN, ...extra }));
