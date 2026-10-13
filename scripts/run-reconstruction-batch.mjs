@@ -14,6 +14,13 @@ const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
 const PRIORITY_RUNS = ".runtime/reconstruction/priority-runs";
 const OVERSIZED_RUNS = ".runtime/reconstruction/oversized-runs";
 const PROVIDER = "openrouter";
+
+function priorityRank(item) {
+  const rank = item.unprocessed_queue_rank ?? item.overall_priority_rank;
+  if (!Number.isInteger(rank) || rank < 1) throw new Error(`Missing valid priority rank for ${item.source_conversation_id}`);
+  return rank;
+}
+
 const STANDARD_VERSION = "hhs-priority-nemotron-runner/0.1.0";
 const OVERSIZED_VERSION = "hhs-oversized-linker/0.1.0";
 const STANDARD_MAX_ATTEMPTS = 3;
@@ -57,7 +64,7 @@ const eligible = priority.conversations
     && !item.evidence_issue
     && !persisted.has(item.source_conversation_id)
   )
-  .sort((a, b) => a.unprocessed_queue_rank - b.unprocessed_queue_rank);
+  .sort((a, b) => priorityRank(a) - priorityRank(b));
 
 const candidates = TARGET_CONVERSATION
   ? eligible
@@ -86,7 +93,7 @@ const receipt = {
 writeReceipt(receipt);
 
 for (const candidate of candidates) {
-  console.log(`\n=== ${candidate.unprocessed_queue_rank}: ${candidate.title} ===`);
+  console.log(`\n=== ${priorityRank(candidate)}: ${candidate.title} ===`);
   try {
     const result = candidate.estimated_input_tokens > SINGLE_RUN_TOKENS
       ? processOversized(candidate)
@@ -120,7 +127,7 @@ if (receipt.quarantined.length > 0) {
 }
 
 function processStandard(candidate) {
-  const rank = String(candidate.unprocessed_queue_rank).padStart(4, "0");
+  const rank = String(priorityRank(candidate)).padStart(4, "0");
   const base = `priority-${rank}-${candidate.source_conversation_id}`;
   const exchange = path.join(PRIORITY_RUNS, `${base}-input.json`);
   const output = path.join(PRIORITY_RUNS, `${base}-output.json`);
@@ -266,7 +273,7 @@ function archiveStandardAttempt(base, files, attempt, reason) {
 
 
 function processOversized(candidate) {
-  const rank = String(candidate.unprocessed_queue_rank).padStart(4, "0");
+  const rank = String(priorityRank(candidate)).padStart(4, "0");
   const directory = path.join(
     OVERSIZED_RUNS,
     `priority-${rank}-${candidate.source_conversation_id}`
@@ -386,7 +393,7 @@ function summary(candidate, mode, result) {
   return {
     source_conversation_id: candidate.source_conversation_id,
     title: candidate.title,
-    priority_rank: candidate.unprocessed_queue_rank,
+    priority_rank: priorityRank(candidate),
     mode,
     observations_inserted: result.observations_inserted,
     observation_links_inserted: result.observation_links_inserted,

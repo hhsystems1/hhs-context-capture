@@ -10,6 +10,13 @@ const RUNS_DIR = ".runtime/reconstruction/priority-runs";
 
 const WORKSPACE = flag("workspace");
 const PROVIDER = "openrouter";
+
+function priorityRank(item) {
+  const rank = item.unprocessed_queue_rank ?? item.overall_priority_rank;
+  if (!Number.isInteger(rank) || rank < 1) throw new Error(`Missing valid priority rank for ${item.source_conversation_id}`);
+  return rank;
+}
+
 const MAX_TOKENS_FOR_NOW = 75000;
 const requestedConversationId = flag("conversation");
 
@@ -57,7 +64,7 @@ const persistedConversationIds = new Set(
 
 const candidates = priority.conversations
   .filter((c) => !persistedConversationIds.has(c.source_conversation_id) && !c.evidence_issue)
-  .sort((a, b) => a.unprocessed_queue_rank - b.unprocessed_queue_rank);
+  .sort((a, b) => priorityRank(a) - priorityRank(b));
 
 if (!candidates.length) {
   console.log("NO ELIGIBLE UNPROCESSED CONVERSATIONS");
@@ -88,7 +95,7 @@ if (deferredOversized.length > 0) {
   console.log("=== DEFERRED OVERSIZED CONVERSATIONS ===");
   for (const candidate of deferredOversized) {
     console.log(
-      `rank ${candidate.unprocessed_queue_rank}: ${candidate.title} · ${candidate.estimated_input_tokens} estimated tokens`
+      `rank ${priorityRank(candidate)}: ${candidate.title} · ${candidate.estimated_input_tokens} estimated tokens`
     );
   }
   console.log("These remain unprocessed by this single-run worker; use the existing reconstruction batch runner for chunked discovery.");
@@ -96,7 +103,7 @@ if (deferredOversized.length > 0) {
 }
 
 console.log("=== NEXT PRIORITY CONVERSATION ===");
-console.log("rank:", next.unprocessed_queue_rank);
+console.log("rank:", priorityRank(next));
 console.log("tier:", next.priority_tier);
 console.log("title:", next.title);
 console.log("conversation:", next.source_conversation_id);
@@ -110,7 +117,7 @@ if (process.argv.includes("--select-only")) {
 
 await mkdir(RUNS_DIR, { recursive: true });
 
-const safeRank = String(next.unprocessed_queue_rank).padStart(4, "0");
+const safeRank = String(priorityRank(next)).padStart(4, "0");
 const base = `priority-${safeRank}-${next.source_conversation_id}`;
 
 const exchangePath = path.join(RUNS_DIR, `${base}-input.json`);
@@ -547,6 +554,8 @@ const validation = spawnSync(
     "--env-file=.env.memory-v1.local",
     "scripts/understanding-discovery.ts",
     "validate",
+    "--workspace",
+    WORKSPACE,
     "--exchange",
     exchangePath,
     "--output",
