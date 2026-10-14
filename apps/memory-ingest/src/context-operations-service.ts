@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { MissionControlStore } from "../../mission-control/src/store.js";
 import { assertLocalDatabaseUrl } from "./config.js";
 import { loadReconstructionInventory } from "./reconstruction-inventory.js";
+import { quarantineDetails } from "./reconstruction-diagnostics.js";
 
 export const LOOPBACK_HOST = "127.0.0.1";
 const ROOT = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -21,6 +22,7 @@ export interface Operation { operation_id: string; workspace: string; started_at
 export interface OperationsDeps {
   status(workspace: string): Promise<{ memory: unknown; reconstruction: unknown }>;
   receipts(workspace: string): Record<string, unknown>[];
+  diagnostics?(workspace: string, quarantined: unknown[]): unknown[];
   operations(workspace: string): Operation[];
   save(operation: Operation): void;
   acquire(operation: Operation): void;
@@ -112,6 +114,7 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       if (!Array.isArray(receipt.completed) || !Array.isArray(receipt.quarantined)) throw new Error("Invalid batch receipt");
       fields.completed_count = receipt.completed.length;
       fields.quarantined_count = receipt.quarantined.length;
+      if (deps.diagnostics && receipt.quarantined.length) fields.quarantine_details = deps.diagnostics(workspace, receipt.quarantined);
       fields.prepared_artifact_review_required = receipt.quarantined.some(item => item && typeof item === "object" && typeof item.reason === "string" && (item.reason.includes("prepared_source_identity_mismatch") || item.reason.includes("Discovery exchange does not match current trusted database evidence")));
       for (const key of ["started_at", "finished_at"]) if (typeof receipt[key] === "string" && Number.isFinite(Date.parse(receipt[key]))) fields[key] = receipt[key];
     }
@@ -249,6 +252,7 @@ export async function startFromEnvironment(): Promise<http.Server> {
   const reader = createOperationsStatusReader(process.env.MEMORY_REPORT_DATABASE_URL!);
   const server = createContextOperationsService(config, {
     ...localExecutionDeps(ROOT), status: reader.status,
+    diagnostics: (workspace, quarantined) => quarantineDetails(ROOT, workspace, quarantined),
     launch: (executable, args, options) => {
       const env = { ...process.env };
       delete env.MEMORY_CONTEXT_OPERATIONS_TOKENS;

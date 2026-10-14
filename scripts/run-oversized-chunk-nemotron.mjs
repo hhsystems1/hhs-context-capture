@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { providerRequestSignal } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -330,6 +331,7 @@ async function callModel(model, system, user) {
       const response = await fetch(
         "https://openrouter.ai/api/v1/chat/completions",
         {
+          signal: providerRequestSignal(),
           method: "POST",
           headers: {
             Authorization: "Bearer " + process.env.OPENROUTER_API_KEY,

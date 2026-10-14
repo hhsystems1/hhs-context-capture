@@ -21,6 +21,7 @@ const SOURCE = "synthetic-source";
 const WORKSPACE = "synthetic-workspace";
 const MODEL = "synthetic-model";
 const roots: string[] = [];
+const { providerRequestSignal } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function root(): string { const value = fs.mkdtempSync(path.join(os.tmpdir(), "hhs-runner-unit-")); roots.push(value); return value; }
 function put(directory: string, file: string, value: unknown): void {
@@ -100,6 +101,7 @@ async function run(directory: string, script: string, args: string[], spawnSync:
   try {
     await vm.runInNewContext(`(async () => { ${source} })()`, {
       fs: localFs, path, spawnSync, jsonrepair, process: fakeProcess, Buffer, fetch,
+      providerRequestSignal: () => providerRequestSignal(fakeProcess.env),
       mkdir: (file: string, options: any) => mkdir(resolve(file), options),
       readFile: (file: string, options: any) => readFile(resolve(file), options),
       writeFile: (file: string, value: any, options: any) => writeFile(resolve(file), value, options),

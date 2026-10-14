@@ -3,6 +3,7 @@ import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { jsonrepair } from "jsonrepair";
+import { providerRequestSignal } from "./reconstruction-provider.mjs";
 
 const ROOT = process.cwd();
 const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
@@ -342,6 +343,7 @@ async function callModel(model) {
 
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        signal: providerRequestSignal(),
         method: "POST",
         headers: {
           Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,

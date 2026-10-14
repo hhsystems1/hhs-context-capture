@@ -164,3 +164,19 @@ npm run hhs:down
 ```
 
 Private captures, credentials, runtime databases, and local archive data are separate from this sanitized public code repository and must never be committed.
+
+### RivRyn historical capture intake
+
+Run the collector from this integrated checkout, with the existing private `.env.collector.local` configuration:
+
+```bash
+node --env-file=.env.collector.local --import tsx apps/local-collector/src/server.ts
+```
+
+The collector also loads that file directly when present, so an older launcher cannot replace the registered historical destination with an inherited workspace or privileged database role. Its configuration contains only the approved archive, loopback port, historical workspace/pipeline/source alias, isolated ingest/report database URLs, and the server-only operator token. Core uses the matching private `HHS_COLLECTOR_OPERATOR_URL` and `HHS_COLLECTOR_OPERATOR_TOKEN`. Keep these ignored files private; do not copy an admin, review or model credential into the collector configuration.
+
+In local RivRyn, select **Personal → Context → Sources → Show pairing code**, then pair the existing **HHS Universal Context Capture** Chrome extension. A collector restart creates a new pairing code and session token. The dashboard reports pairing observed during the current collector process, verified capture delivery, and whether the latest delivered source has been analyzed. The installed extension remains a separate Chrome component.
+
+Successful verified ChatGPT captures reuse the existing immutable archive and durable handoff outbox, ingest into the authorized historical collection, publish the existing discovery source-version record, and append scheduling metadata without changing existing priority ranks. **Analyze latest ingested capture** uses the existing targeted reconstruction action. Capture, analysis, reconciliation and human approval remain separate stages.
+
+The first real Chrome pairing/capture acceptance is still required. Updating an already-ingested conversation is also a separate proof: legacy immutable foundation rows can reject a changed recapture, and latest-version selection is not established by the first-capture path. Automatic sequential capture of the browser's entire recent-chat list is unfinished.
