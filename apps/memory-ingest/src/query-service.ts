@@ -5,6 +5,7 @@ import { assertLocalDatabaseUrl } from "./config.js";
 import { getApprovedKnowledge, queryApprovedKnowledge, type ApprovedKnowledgeDetail, type ApprovedKnowledgeMatch } from "./query.js";
 import { ComparisonPayloadError, compareDiscoveredConversations, parseComparisonPayload, type ComparisonRequest } from "./discovery-comparison.js";
 import type { KnownConversationRecord } from "@hhs/capture-planning";
+import { readSourceHistory, SourceHistoryNotFound, type HistoryInput } from "./source-history.js";
 
 // Local read-only Memory Query Service.
 // Loopback-only. Holds exactly one database credential: the report-reader role.
@@ -21,6 +22,7 @@ export interface QueryServiceConfig {
   workspaceId: string;
   port: number;
   clients: QueryServiceClient[];
+  sourceCollections?: Array<{ sourceRef: string; workspaceId: string; label: string }>;
 }
 
 export interface QueryServiceDeps {
@@ -31,6 +33,7 @@ export interface QueryServiceDeps {
    * not configured, so an older host cannot silently answer comparison requests.
    */
   compareDiscovery?(request: ComparisonRequest): Promise<KnownConversationRecord[]>;
+  sourceHistory?(workspaceId: string, input: HistoryInput): Promise<Record<string, unknown>>;
 }
 
 export function assertServiceEnvironment(env: Record<string, string | undefined>): void {
@@ -49,7 +52,25 @@ export function loadServiceConfig(env: Record<string, string | undefined>): Quer
   if (!workspaceId) throw new Error("MEMORY_WORKSPACE_ID is required.");
   const port = Number(env.MEMORY_QUERY_SERVICE_PORT || 54431);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("MEMORY_QUERY_SERVICE_PORT must be an unprivileged TCP port.");
-  return { workspaceId, port, clients: parseClientTokens(env.MEMORY_QUERY_SERVICE_TOKENS ?? "") };
+  return { workspaceId, port, clients: parseClientTokens(env.MEMORY_QUERY_SERVICE_TOKENS ?? ""),
+    sourceCollections: parseSourceCollections(env.MEMORY_QUERY_SOURCE_COLLECTIONS) };
+}
+
+export function parseSourceCollections(raw: string | undefined): NonNullable<QueryServiceConfig["sourceCollections"]> {
+  if (!raw?.trim()) return [];
+  const entries: unknown = JSON.parse(raw);
+  if (!Array.isArray(entries) || entries.length > 20) throw new Error("Invalid source collections configuration.");
+  const sources = entries.map((item: unknown) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Invalid source collection.");
+    const row = item as Record<string, unknown>;
+    if (Object.keys(row).some(key => !["sourceRef", "workspaceId", "label"].includes(key)) ||
+      typeof row.sourceRef !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(row.sourceRef) ||
+      typeof row.workspaceId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(row.workspaceId) ||
+      typeof row.label !== "string" || !row.label.trim() || row.label.length > 160) throw new Error("Invalid source collection.");
+    return { sourceRef: row.sourceRef, workspaceId: row.workspaceId, label: row.label };
+  });
+  if (new Set(sources.map(source => source.sourceRef)).size !== sources.length) throw new Error("Duplicate source reference.");
+  return sources;
 }
 
 export function parseClientTokens(raw: string): QueryServiceClient[] {
@@ -84,6 +105,53 @@ export function createQueryService(config: QueryServiceConfig, deps: QueryServic
 
       const client = authenticate(config.clients, request.headers.authorization);
       if (!client) return json(response, 401, { error: "invalid_or_missing_token" });
+
+      const sourceUrl = new URL(request.url ?? "", "http://127.0.0.1");
+      const historyMatch = /^\/memory\/sources\/([a-z0-9][a-z0-9_-]{0,63})\/history$/.exec(sourceUrl.pathname);
+      if (historyMatch) {
+        if (client.name !== "hhs-core" || request.headers.origin !== undefined) return json(response, 403, { error: "source_access_forbidden" });
+        if (request.method !== "GET") return json(response, 405, { error: "read_only" });
+        const source = config.sourceCollections?.find(item => item.sourceRef === historyMatch[1]);
+        if (!source) return json(response, 404, { error: "source_not_configured" });
+        const params = sourceUrl.searchParams;
+        if (Array.from(params.keys()).some(key => !["conversation", "observation", "cursor"].includes(key)) ||
+          new Set(params.keys()).size !== Array.from(params.keys()).length ||
+          Array.from(params.values()).some(value => !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) ||
+          (params.has("observation") && !params.has("conversation"))) return json(response, 400, { error: "invalid_source_request" });
+        if (!deps.sourceHistory) return json(response, 501, { error: "source_history_not_configured" });
+        try {
+          const result = await deps.sourceHistory(source.workspaceId, Object.fromEntries(params));
+          const body = { ...result, source: { ref: source.sourceRef, label: source.label }, trust_scope: "unapproved_source_evidence" };
+          if (Buffer.byteLength(JSON.stringify(body), "utf8") > 1024 * 1024) throw new Error("Source response limit exceeded.");
+          return json(response, 200, body);
+        } catch (error) {
+          return json(response, error instanceof SourceHistoryNotFound ? 404 : 503,
+            { error: error instanceof SourceHistoryNotFound ? "source_record_not_found" : "source_history_unavailable" });
+        }
+      }
+
+      const scopedQueryMatch = /^\/memory\/workspaces\/(workspace_[0-9a-f]{32})\/query$/.exec(request.url ?? "");
+      if (request.method === "POST" && scopedQueryMatch?.[1]) {
+        if (client.name !== "hhs-core") {
+          return json(response, 403, { error: "workspace_selection_forbidden" });
+        }
+
+        const workspaceId = scopedQueryMatch[1];
+        const body = await readBody(request);
+        const question = typeof body.question === "string" ? body.question.trim() : "";
+        if (!question) return json(response, 400, { error: "question_required" });
+
+        const limit = Number.isInteger(body.limit) ? Number(body.limit) : 20;
+        const result = await deps.query(workspaceId, question, limit);
+
+        audit(client.name, "POST /memory/workspaces/:workspace_id/query", {
+          workspace_id: workspaceId,
+          question_length: question.length,
+          matches: result.matches.length
+        });
+
+        return json(response, 200, { client: client.name, workspace_id: workspaceId, ...result });
+      }
 
       if (request.method === "POST" && request.url === "/memory/query") {
         const body = await readBody(request);
@@ -144,7 +212,8 @@ export async function startFromEnvironment(): Promise<http.Server> {
   const server = createQueryService(config, {
     query: (workspace, question, limit) => queryApprovedKnowledge(workspace, question, limit),
     getKnowledge: getApprovedKnowledge,
-    compareDiscovery: (comparison) => compareDiscoveredConversations(comparison)
+    compareDiscovery: (comparison) => compareDiscoveredConversations(comparison),
+    sourceHistory: readSourceHistory
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

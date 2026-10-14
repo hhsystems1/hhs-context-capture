@@ -3,15 +3,28 @@ import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { jsonrepair } from "jsonrepair";
+import { providerRequestSignal } from "./reconstruction-provider.mjs";
 
 const ROOT = process.cwd();
 const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
 const RUNS_DIR = ".runtime/reconstruction/priority-runs";
 
-const WORKSPACE = "proof-workspace-5plus2-db";
+const WORKSPACE = flag("workspace");
 const PROVIDER = "openrouter";
+
+function priorityRank(item) {
+  const rank = item.unprocessed_queue_rank ?? item.overall_priority_rank;
+  if (!Number.isInteger(rank) || rank < 1) throw new Error(`Missing valid priority rank for ${item.source_conversation_id}`);
+  return rank;
+}
+
 const MAX_TOKENS_FOR_NOW = 75000;
 const requestedConversationId = flag("conversation");
+
+if (!WORKSPACE) {
+  console.error("STOP: --workspace is required.");
+  process.exit(1);
+}
 
 if (!process.env.OPENROUTER_API_KEY) {
   console.error("STOP: OPENROUTER_API_KEY is not loaded.");
@@ -52,7 +65,7 @@ const persistedConversationIds = new Set(
 
 const candidates = priority.conversations
   .filter((c) => !persistedConversationIds.has(c.source_conversation_id) && !c.evidence_issue)
-  .sort((a, b) => a.unprocessed_queue_rank - b.unprocessed_queue_rank);
+  .sort((a, b) => priorityRank(a) - priorityRank(b));
 
 if (!candidates.length) {
   console.log("NO ELIGIBLE UNPROCESSED CONVERSATIONS");
@@ -83,15 +96,15 @@ if (deferredOversized.length > 0) {
   console.log("=== DEFERRED OVERSIZED CONVERSATIONS ===");
   for (const candidate of deferredOversized) {
     console.log(
-      `rank ${candidate.unprocessed_queue_rank}: ${candidate.title} · ${candidate.estimated_input_tokens} estimated tokens`
+      `rank ${priorityRank(candidate)}: ${candidate.title} · ${candidate.estimated_input_tokens} estimated tokens`
     );
   }
-  console.log("These remain unprocessed until chunked discovery is implemented.");
+  console.log("These remain unprocessed by this single-run worker; use the existing reconstruction batch runner for chunked discovery.");
   console.log("");
 }
 
 console.log("=== NEXT PRIORITY CONVERSATION ===");
-console.log("rank:", next.unprocessed_queue_rank);
+console.log("rank:", priorityRank(next));
 console.log("tier:", next.priority_tier);
 console.log("title:", next.title);
 console.log("conversation:", next.source_conversation_id);
@@ -105,7 +118,7 @@ if (process.argv.includes("--select-only")) {
 
 await mkdir(RUNS_DIR, { recursive: true });
 
-const safeRank = String(next.unprocessed_queue_rank).padStart(4, "0");
+const safeRank = String(priorityRank(next)).padStart(4, "0");
 const base = `priority-${safeRank}-${next.source_conversation_id}`;
 
 const exchangePath = path.join(RUNS_DIR, `${base}-input.json`);
@@ -196,7 +209,7 @@ OBSERVATION SHAPE:
   "statement": "clear evidence-supported statement",
   "payload": {},
   "attribution": {
-    "subject": "user | assistant | tool | system | other | unresolved",
+    "subject": "user | assistant | other | unresolved",
     "claim_type": "free-text claim type"
   },
   "confidence": 0.0,
@@ -211,12 +224,19 @@ Allowed attribution.subject values are ONLY:
 
 user
 assistant
-tool
-system
 other
 unresolved
 
-Never use "both".
+Never use "both", "tool", or "system".
+
+For tool-produced, retrieved-document, or system-derived evidence,
+use subject "other" and preserve the source distinction in claim_type
+and/or payload, for example:
+
+{ "subject": "other", "claim_type": "document_content" }
+{ "subject": "other", "claim_type": "tool_result" }
+{ "subject": "other", "claim_type": "system_event" }
+
 For mixed authorship use "other" and explain the distinction in statement/payload.
 
 LINK SHAPE:
@@ -323,6 +343,7 @@ async function callModel(model) {
 
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        signal: providerRequestSignal(),
         method: "POST",
         headers: {
           Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
@@ -468,7 +489,7 @@ output.schema_version = "hhs-understanding-output/0.2.0";
 output.exchange_id = exchange.exchange_id;
 
 /*
-  Normalize the one mechanical enum issue already observed in testing.
+  Normalize mechanical attribution enum/shape issues before trusted validation.
 */
 for (const observation of output.observations ?? []) {
   if (
@@ -485,8 +506,22 @@ for (const observation of output.observations ?? []) {
       typeof citation === "string" ? { evidence_ref: citation } : citation
     );
   }
-  if (observation?.attribution?.subject === "both") {
+  const subject = observation?.attribution?.subject;
+
+  if (subject === "both" || subject === "tool" || subject === "system") {
     observation.attribution.subject = "other";
+  }
+
+  if (
+    observation.attribution
+    && (
+      typeof observation.attribution.claim_type !== "string"
+      || !observation.attribution.claim_type.trim()
+    )
+    && typeof observation.observation_kind === "string"
+    && observation.observation_kind.trim()
+  ) {
+    observation.attribution.claim_type = observation.observation_kind.trim();
   }
 }
 
@@ -521,6 +556,8 @@ const validation = spawnSync(
     "--env-file=.env.memory-v1.local",
     "scripts/understanding-discovery.ts",
     "validate",
+    "--workspace",
+    WORKSPACE,
     "--exchange",
     exchangePath,
     "--output",

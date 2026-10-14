@@ -21,12 +21,28 @@ import { sha256 } from "@hhs/memory-schema";
 import { operationStoreFromEnvironment } from "./operations.js";
 import { archiveFailureMetadata } from "./archive-diagnostics.js";
 import { KnowledgePipelineHandoffOutbox } from "./knowledge-pipeline-handoff.js";
+import { localCaptureDelivery } from "./local-capture-ingest.js";
+import { createPool, readOnlyTransaction } from "../../memory-ingest/src/db.js";
+import { readFileSync } from "node:fs";
+import { parseEnv } from "node:util";
+import { collectorEnvironment } from "./collector-environment.js";
+
+try {
+  const configured = parseEnv(readFileSync(fileURLToPath(new URL("../../../.env.collector.local", import.meta.url)), "utf8"));
+  const resolved = collectorEnvironment(process.env, configured);
+  for (const key of Object.keys(process.env)) if (!(key in resolved)) delete process.env[key];
+  Object.assign(process.env, resolved);
+} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 
 const HOST = "127.0.0.1";
 const PORT = localPort(process.env.HHS_COLLECTOR_PORT);
 const MAX_BODY_BYTES = 75 * 1024 * 1024;
 const archiveRoot = approvedArchiveRoot();
 const operationStore = operationStoreFromEnvironment(archiveRoot);
+const localIngest = process.env.HHS_PIPELINE_LOCAL_INGEST === "1";
+const sourceRef = process.env.HHS_PIPELINE_SOURCE_REF;
+const operatorToken = process.env.HHS_COLLECTOR_OPERATOR_TOKEN;
+if (localIngest && (!sourceRef || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(sourceRef) || !process.env.MEMORY_WORKSPACE_ID || !process.env.MEMORY_PIPELINE_VERSION || !operatorToken || operatorToken.length < 32)) throw new Error("Local capture intake requires an explicit source, pipeline, workspace and operator credential.");
 const knowledgeHandoffs = new KnowledgePipelineHandoffOutbox({
   archiveRoot,
   ...(process.env.HHS_PIPELINE_HANDOFF_URL ? { endpoint: process.env.HHS_PIPELINE_HANDOFF_URL } : {}),
@@ -34,9 +50,13 @@ const knowledgeHandoffs = new KnowledgePipelineHandoffOutbox({
   workspaceId: process.env.MEMORY_WORKSPACE_ID || "default",
   requestedPipeline: process.env.MEMORY_PIPELINE_VERSION || "memory-v1",
   maxDeliveryAttempts: positiveInteger(process.env.HHS_PIPELINE_HANDOFF_MAX_ATTEMPTS, 20),
+  ...(localIngest ? { deliverImpl: localCaptureDelivery({ archiveRoot,
+    workspaceId: process.env.MEMORY_WORKSPACE_ID!, pipelineVersion: process.env.MEMORY_PIPELINE_VERSION!,
+    priorityFile: path.resolve(".runtime/reconstruction/business-priority-index-v1.json") }) } : {}),
 });
 const pairCode = randomBytes(4).toString("hex");
 const sessionToken = randomBytes(32).toString("hex");
+let paired = false;
 const Ajv2020 = Ajv2020Module.default;
 const captureSchema = await loadSchema("../../../packages/canonical-schema/schemas/capture-bundle.schema.json");
 const inventorySchema = await loadSchema("../../../packages/inventory-schema/schemas/inventory-run.schema.json");
@@ -48,11 +68,26 @@ const server = createServer(async (request, response) => {
     applyCors(request, response);
     if (request.method === "OPTIONS") return void response.writeHead(204).end();
     if (request.method === "GET" && request.url === "/health") return json(response, 200, { status: "ready", archiveConfigured: true, operationLogging: "capture-operations-v1" });
+    if (request.method === "GET" && request.url === "/intake") {
+      if (!operatorToken || !safeEqual(bearer(request), operatorToken) || request.headers.origin !== undefined ||
+        request.headers.host !== `${HOST}:${PORT}` || !["127.0.0.1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "")) return json(response, 403, { error: "operator_access_required" });
+      const intake = await knowledgeHandoffs.status();
+      let analyzed: boolean | undefined;
+      if (localIngest && intake.source_version_id) {
+        const pool = createPool("reader");
+        try { analyzed = await readOnlyTransaction(pool, process.env.MEMORY_WORKSPACE_ID!, async client =>
+          Boolean((await client.query("select exists(select 1 from memory_v1.observations where workspace_id=$1 and source_version_id=$2) analyzed", [process.env.MEMORY_WORKSPACE_ID!, intake.source_version_id])).rows[0]?.analyzed)); }
+        finally { await pool.end(); }
+      }
+      return json(response, 200, { source_ref: sourceRef ?? null, paired,
+        ...(!paired ? { pairing_code: pairCode } : {}), ...intake, ...(analyzed === undefined ? {} : { analyzed }) });
+    }
     if (request.method === "POST" && request.url === "/pair") {
       const body = JSON.parse(await readBody(request)) as PairingOperationRequest;
       const accepted = safeEqual(header(request, "x-hhs-pair-code"), pairCode);
       await recordPairingOperation(body, accepted);
       if (!accepted) return json(response, 403, { error: safeErrorSummaries.pairing_failed });
+      paired = true;
       return json(response, 200, { token: sessionToken });
     }
     if (request.method === "POST" && request.url === "/operations") {

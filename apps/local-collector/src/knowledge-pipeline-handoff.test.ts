@@ -17,6 +17,20 @@ async function root(): Promise<string> {
 }
 
 describe("verified capture knowledge pipeline handoff", () => {
+  it("reuses the durable outbox for local ingest, serializes delivery and ignores other scopes", async () => {
+    const archiveRoot = await root();
+    const deliverImpl = vi.fn(async () => ({ handoff_id: "local", ingest_job_id: "run", source_conversation_id: "recent", source_version_id: "version" }));
+    const outbox = new KnowledgePipelineHandoffOutbox({ archiveRoot, workspaceId: "scope", requestedPipeline: "pipeline", deliverImpl });
+    const input = { captureId: "recent-capture", manifestSha256: "a".repeat(64), archiveReference: archiveRoot, verificationStatus: "complete" };
+    await outbox.enqueue(input);
+    await Promise.all([outbox.flush(), outbox.enqueue(input)]);
+    expect(deliverImpl).toHaveBeenCalledTimes(1);
+    expect(await outbox.status()).toMatchObject({ configured: true, delivered: 1, pending: 0, source_conversation_id: "recent" });
+    const other = new KnowledgePipelineHandoffOutbox({ archiveRoot, workspaceId: "other", requestedPipeline: "pipeline", deliverImpl });
+    await other.flush();
+    expect((await other.status()).delivered).toBe(0);
+    expect(deliverImpl).toHaveBeenCalledTimes(1);
+  });
   it("writes one durable handoff and replays without duplicate delivery", async () => {
     const archiveRoot = await root();
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({

@@ -23,14 +23,15 @@ Discovery state comes from one of two receipts:
 
 Receipt type 2 covers both the original bounded pilot and each processed batch.
 Their conversations are marked `pilot_discovery_processed` and
-`awaiting_reconciliation`, never approved, reconciled, or current truth. The
-artifacts do not contain a trustworthy processing-completion timestamp, so those
-timestamps remain `null`.
+`awaiting_reconciliation` unless persisted observation coverage independently
+proves reconciliation as described below. Discovery artifacts alone never certify
+reconciliation, approval, or current truth. The artifacts do not contain a
+trustworthy processing-completion timestamp, so those timestamps remain `null`.
 
 ### Receipt rules
 
 A receipt is a validated artifact pair layered over canonical `memory_v1`
-evidence. There is no receipt table and no second queue authority.
+evidence. There is no discovery receipt table and no second queue authority.
 
 - **Membership comes from the validated exchange**, never from a file name, a
   batch number, or a supplied count. `buildDiscoveryReceipt` re-runs the trusted
@@ -54,8 +55,22 @@ evidence. There is no receipt table and no second queue authority.
 - `not_started`: no discovery output exists to reconcile.
 - `awaiting_reconciliation`: discovery output exists but no separate
   reconciliation authority has certified it.
-- `reconciled`: reserved for a future explicit reconciliation receipt; V1 never
-  infers it from observation lifecycle status.
+- `reconciled`: at least one persisted observation exists and every persisted
+  observation in the conversation has a same-workspace
+  `memory_v1.reconciliation_observations` link to an existing immutable
+  `memory_v1.reconciliations` record whose `payload.temporal_status` is not
+  `rejected`. Rejected outcomes do not count toward coverage. The status filter
+  excludes only `rejected`; it does not require `current`. All existing link
+  relations (`supports`, `contradicts`, `refines`, `supersedes`, `duplicates`,
+  `context`) retain their coverage behavior. Both the observation and
+  reconciliation pipeline identities must match. Partial coverage remains
+  `awaiting_reconciliation`; adding uncovered observations returns the conversation
+  to that state. This derives coverage from trusted reconciliation persistence,
+  never from observation existence, lifecycle status, promotion, or approval. It
+  represents trusted reconciliation **coverage**, not human acceptance,
+  a conversation completion event, or reconciliation of unpersisted artifact
+  proposals. Discovery persistence alone does not count. Reconciliation
+  remains distinct from promotion and human review.
 - `healthy`: verified complete with at least one non-empty canonical text block.
 - `evidence_incomplete`: zero blocks, no usable canonical text, or a non-complete
   verification status. Empty representations are counted but do not alone make
@@ -84,9 +99,9 @@ silently select a different workspace.
 Receipts are supplied explicitly as repeatable `--receipt-exchange` /
 `--receipt-output` pairs, matched positionally in the order given. No receipt is
 assumed: with none supplied the CLI logs `RECONSTRUCTION_RECEIPTS_LOADED=0` and
-reports the corpus as entirely unprocessed. Each loaded receipt logs its
-exchange ID, conversation count, and originating files to stderr, so identity is
-always visible as having come from validated content rather than a path.
+derives discovery state from persisted observations alone. Each loaded receipt
+logs its exchange ID, conversation count, and originating files to stderr, so
+identity is always visible as having come from validated content rather than a path.
 
 ```bash
 npx tsx --env-file=.env.memory-v1.local scripts/reconstruction-inventory.ts report \
@@ -113,6 +128,8 @@ npx tsx --env-file=.env.memory-v1.local scripts/reconstruction-inventory.ts json
 
 Mission Control, Sidekick, Operator, and governed Stephen/Brendon-side workers
 should call this shared read model (or a future read-only service around it),
-not maintain private queue copies. Before any real batch is processed, a
-separately authorized append-only reconciliation receipt mechanism can extend
-the same overlay without changing conversation/evidence authority.
+not maintain private queue copies. Reconciliation coverage is read from the
+existing immutable reconciliation records and their observation links under the
+report-reader workspace scope; this inventory adds no queue, receipt table, or
+write authority. Batch completion continues to mean discovery processing, not
+reconciliation, promotion, or approval.
