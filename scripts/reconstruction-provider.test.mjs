@@ -3,6 +3,49 @@ import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCatego
 import { setTimeout, clearTimeout } from "node:timers";
 
 describe("bounded reconstruction requests", () => {
+  const stream = lines => {
+    const bytes = new globalThis.TextEncoder().encode(lines.join('\r\n') + '\r\n');
+    return new globalThis.Response(new globalThis.ReadableStream({ start(controller) {
+      // Fragment UTF-8 and JSON boundaries as a real network connection may.
+      for (let index = 0; index < bytes.length; index++) controller.enqueue(bytes.slice(index, index + 1));
+      controller.close();
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  };
+  const call = response => requestDiscoveryModel('synthetic-free', 'system', 'data', { env: {}, fetch: async () => response });
+  it("buffers a complete streamed answer without retaining model reasoning", async () => {
+    const result = await call(stream([
+      ': keepalive',
+      'data: ' + JSON.stringify({ id: 'synthetic-id', model: 'synthetic-free', choices: [{ delta: { reasoning: 'private reasoning', content: 'café 🙂' } }] }),
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: ' done' }, finish_reason: 'stop' }], usage: { cost: 0 } }),
+      'data: [DONE]'
+    ]));
+    expect(result).toMatchObject({ ok: true, content: 'café 🙂 done', data: { choices: [{ finish_reason: 'stop' }] } });
+    expect(JSON.stringify(result)).not.toContain('private reasoning');
+  });
+  it("rejects a provider error after partial streamed output", async () => {
+    const result = await call(stream([
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: '{"observations":[]}' } }] }),
+      'data: ' + JSON.stringify({ error: { code: 503, message: 'private echoed source' } })
+    ]));
+    expect(result).toMatchObject({ ok: false, error: { provider_error_code: 503 } });
+    expect(JSON.stringify(result)).not.toMatch(/private echoed source|observations/);
+  });
+  it("rejects a stream that disconnects without a terminal marker", async () => {
+    expect(await call(stream(['data: ' + JSON.stringify({ choices: [{ delta: { content: 'partial' } }] })])))
+      .toMatchObject({ ok: false, error: { category: 'incomplete_response' } });
+  });
+  it("preserves truncation for the caller guard and rejects hidden nonzero costs", async () => {
+    const truncated = await call(stream(['data: ' + JSON.stringify({ choices: [{ delta: { content: '{}' }, finish_reason: 'length' }] }), 'data: [DONE]']));
+    expect(truncated).toMatchObject({ ok: true, data: { choices: [{ finish_reason: 'length' }] } });
+    expect(await call(stream([
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: '{}' }, finish_reason: 'stop' }], usage: { cost: 1 } }),
+      'data: ' + JSON.stringify({ usage: { cost: 0 } }), 'data: [DONE]'
+    ]))).toMatchObject({ ok: false, error: { category: 'provider_policy' } });
+  });
+  it("rejects an error on a non-streaming completion choice", async () => {
+    const result = await call({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{}' }, finish_reason: 'error', error: { code: 502 } }] }) });
+    expect(result).toMatchObject({ ok: false, error: { provider_error_code: 502 } });
+  });
   it("retains a safe embedded provider error code when the HTTP transport reports success", async () => {
     const attempts = [];
     const result = await requestDiscoveryModel('synthetic-free', 'system', 'data', { env: { OPENROUTER_API_KEY: 'synthetic-key' },

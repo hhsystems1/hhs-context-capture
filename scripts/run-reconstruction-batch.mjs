@@ -104,6 +104,7 @@ writeReceipt(receipt);
 for (const candidate of candidates) {
   console.log(`\n=== ${priorityRank(candidate)}: ${candidate.title} ===`);
   const priorDeadline = process.env.HHS_RECONSTRUCTION_DEADLINE_AT;
+  const sourceStartedAt = Date.now();
   try {
     // Include the measured per-block prompt overhead, not only source prose.
     // The shared deadline also propagates through chunk/linker subprocesses.
@@ -117,7 +118,7 @@ for (const candidate of candidates) {
     if (fs.existsSync(base + "-input.json")) assertPreparedIdentity(candidate, base + "-input.json");
     const estimatedCharacters = candidate.estimated_input_tokens * 4 + (current?.evidence_block_count ?? 0) * 160;
     const result = !replayable && (preparedChunks || !Number.isFinite(estimatedCharacters) || estimatedCharacters > SINGLE_RUN_CHARACTERS)
-      ? processOversized(candidate)
+      ? processOversized(candidate, sourceStartedAt, inheritedDeadline)
       : processStandard(candidate);
     receipt.completed.push(result);
   } catch (error) {
@@ -296,7 +297,7 @@ function archiveStandardAttempt(base, files, attempt, reason) {
 }
 
 
-function processOversized(candidate) {
+function processOversized(candidate, sourceStartedAt, inheritedDeadline) {
   const rank = String(priorityRank(candidate)).padStart(4, "0");
   const directory = path.join(
     OVERSIZED_RUNS,
@@ -308,6 +309,18 @@ function processOversized(candidate) {
   if (!fs.existsSync(path.join(directory, "manifest.json"))) {
     prepareOversized(candidate, directory);
   }
+  const pendingChunks = read(path.join(directory, "manifest.json")).chunks.filter(chunk => {
+    const number = String(chunk.chunk_number).padStart(3, "0");
+    return !fs.existsSync(path.join(directory, `chunk-${number}-output.json`))
+      || !fs.existsSync(path.join(directory, `chunk-${number}-model.json`));
+  }).length;
+  // Measured valid free-model chunks can take over two minutes. Budget one
+  // bounded request per pending chunk plus the linker, up to one hour total.
+  // Cached chunks remain revalidated, and an explicit caller deadline still wins.
+  const chunkRequestBudget = Number(process.env.HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS ?? 180000);
+  const oversizedBudget = Math.max(SOURCE_BUDGET_MS, Math.min(60 * 60 * 1000, (pendingChunks + 1) * chunkRequestBudget + 60000));
+  if (!Number.isSafeInteger(oversizedBudget)) throw new Error("Invalid oversized source budget");
+  process.env.HHS_RECONSTRUCTION_DEADLINE_AT = String(Math.min(sourceStartedAt + oversizedBudget, inheritedDeadline));
   if (!fs.existsSync(path.join(directory, "parent-output.json")) || !fs.existsSync(path.join(directory, "parent-model.json"))) {
     checked(process.execPath, [
       "scripts/run-oversized-orchestrator.mjs",

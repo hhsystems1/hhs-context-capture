@@ -187,6 +187,24 @@ describe("existing standard reconstruction runner retry/resume", () => {
     expect(Number(deadlines[0])).toBeGreaterThan(Date.now());
     expect(Number(deadlines[0])).toBeLessThanOrEqual(Date.now() + 480000);
   });
+  it("budgets a multi-chunk source for its remaining requests while preserving completed chunks", async () => {
+    const directory = root(); priority(directory, true);
+    const runDir = '.runtime/reconstruction/oversized-runs/priority-0001-synthetic-source';
+    put(directory, `${runDir}/parent-input.json`, exchange());
+    put(directory, `${runDir}/manifest.json`, { chunks: Array.from({ length: 13 }, (_, index) => ({ chunk_number: index + 1 })) });
+    put(directory, `${runDir}/chunk-001-output.json`, output());
+    put(directory, `${runDir}/chunk-001-model.json`, receipt());
+    let deadline = 0;
+    const spawn: Spawn = (_command, args, options) => {
+      if (args.includes('scripts/reconstruction-inventory.ts')) return inventory();
+      if (args.includes('scripts/run-oversized-orchestrator.mjs')) { deadline = Number(options.env.HHS_RECONSTRUCTION_DEADLINE_AT); return result(7); }
+      throw new Error('Failed generation must not persist');
+    };
+    expect((await run(directory, 'run-reconstruction-batch.mjs', BATCH_ARGS, spawn)).code).toBe(2);
+    expect(deadline).toBeGreaterThan(Date.now() + 30 * 60 * 1000);
+    expect(deadline).toBeLessThanOrEqual(Date.now() + 40 * 60 * 1000);
+    expect(get(directory, `${runDir}/chunk-001-model.json`)).toEqual(receipt());
+  });
   it.each(["Error: standard validation failed after 3 attempts: unknown evidence reference", "Error: /usr/bin/node exited with status 10"])("normal continuation preserves terminal content failures (%s)", async (reason) => {
     const directory = root(); priority(directory); standardArtifacts(directory);
     const heldPath = ".runtime/reconstruction/batch-receipts/batch-2026-01-01.json";
