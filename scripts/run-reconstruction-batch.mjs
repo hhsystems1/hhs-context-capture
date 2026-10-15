@@ -9,7 +9,8 @@ const CHUNK_CHARACTERS = Number(flag("chunk-characters") ?? "75000");
 const TARGET_CONVERSATION = flag("conversation");
 const OPERATION_ID = flag("operation-id");
 if (process.argv.includes("--operation-id") && (OPERATION_ID === undefined || !/^operation_[0-9a-f]{32}$/.test(OPERATION_ID))) throw new Error("Invalid --operation-id.");
-const SINGLE_RUN_TOKENS = 75000;
+const SINGLE_RUN_CHARACTERS = 60000;
+const SOURCE_BUDGET_MS = 8 * 60 * 1000;
 const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
 const PRIORITY_RUNS = ".runtime/reconstruction/priority-runs";
 const OVERSIZED_RUNS = ".runtime/reconstruction/oversized-runs";
@@ -23,7 +24,7 @@ function priorityRank(item) {
 
 const STANDARD_VERSION = "hhs-priority-nemotron-runner/0.1.0";
 const OVERSIZED_VERSION = "hhs-oversized-linker/0.1.0";
-const STANDARD_MAX_ATTEMPTS = 3;
+const STANDARD_MAX_ATTEMPTS = 2;
 
 if (!WORKSPACE) throw new Error("--workspace or MEMORY_WORKSPACE_ID is required.");
 if (!Number.isInteger(LIMIT) || LIMIT < 1) throw new Error("--limit must be a positive integer.");
@@ -102,8 +103,20 @@ writeReceipt(receipt);
 
 for (const candidate of candidates) {
   console.log(`\n=== ${priorityRank(candidate)}: ${candidate.title} ===`);
+  const priorDeadline = process.env.HHS_RECONSTRUCTION_DEADLINE_AT;
   try {
-    const result = candidate.estimated_input_tokens > SINGLE_RUN_TOKENS
+    // Include the measured per-block prompt overhead, not only source prose.
+    // The shared deadline also propagates through chunk/linker subprocesses.
+    const inheritedDeadline = priorDeadline === undefined ? Infinity : Number(priorDeadline);
+    if (priorDeadline !== undefined && !Number.isSafeInteger(inheritedDeadline)) throw new Error("Invalid inherited source deadline");
+    process.env.HHS_RECONSTRUCTION_DEADLINE_AT = String(Math.min(Date.now() + SOURCE_BUDGET_MS, inheritedDeadline));
+    const current = inventory.conversations.find(row => row.source_conversation_id === candidate.source_conversation_id);
+    const base = path.join(PRIORITY_RUNS, `priority-${String(priorityRank(candidate)).padStart(4, "0")}-${candidate.source_conversation_id}`);
+    const replayable = ["-input.json", "-output.json", "-openrouter-raw.json"].every(suffix => fs.existsSync(base + suffix));
+    const preparedChunks = fs.existsSync(path.join(OVERSIZED_RUNS, path.basename(base), "manifest.json"));
+    if (fs.existsSync(base + "-input.json")) assertPreparedIdentity(candidate, base + "-input.json");
+    const estimatedCharacters = candidate.estimated_input_tokens * 4 + (current?.evidence_block_count ?? 0) * 160;
+    const result = !replayable && (preparedChunks || !Number.isFinite(estimatedCharacters) || estimatedCharacters > SINGLE_RUN_CHARACTERS)
       ? processOversized(candidate)
       : processStandard(candidate);
     receipt.completed.push(result);
@@ -115,6 +128,9 @@ for (const candidate of candidates) {
     };
     receipt.quarantined.push(item);
     console.error("QUARANTINED:", item.reason);
+  } finally {
+    if (priorDeadline === undefined) delete process.env.HHS_RECONSTRUCTION_DEADLINE_AT;
+    else process.env.HHS_RECONSTRUCTION_DEADLINE_AT = priorDeadline;
   }
   writeReceipt(receipt);
 }

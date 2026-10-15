@@ -21,7 +21,7 @@ const SOURCE = "synthetic-source";
 const WORKSPACE = "synthetic-workspace";
 const MODEL = "synthetic-model";
 const roots: string[] = [];
-const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
+const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function root(): string { const value = fs.mkdtempSync(path.join(os.tmpdir(), "hhs-runner-unit-")); roots.push(value); return value; }
 function put(directory: string, file: string, value: unknown): void {
@@ -107,7 +107,7 @@ async function run(directory: string, script: string, args: string[], spawnSync:
     await vm.runInNewContext(`(async () => { ${source} })()`, {
       fs: localFs, path, spawnSync, jsonrepair, process: fakeProcess, Buffer, fetch,
       providerRequestSignal: () => providerRequestSignal(fakeProcess.env),
-      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory,
+      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel,
       mkdir: (file: string, options: any) => mkdir(resolve(file), options),
       readFile: (file: string, options: any) => readFile(resolve(file), options),
       writeFile: (file: string, value: any, options: any) => writeFile(resolve(file), value, options),
@@ -139,6 +139,54 @@ function persistResult(replay = false): Result { return result(0, { observations
 const BATCH_ARGS = ["--workspace", WORKSPACE];
 
 describe("existing standard reconstruction runner retry/resume", () => {
+  it("routes metadata-heavy low-estimate sources through the existing resumable chunk path", async () => {
+    const directory = root(); priority(directory);
+    const runDir = '.runtime/reconstruction/oversized-runs/priority-0001-synthetic-source';
+    let chunkRuns = 0;
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes('scripts/reconstruction-inventory.ts')) {
+        const value = JSON.parse(inventory().stdout); value.conversations[0].evidence_block_count = 1342; return result(0, value);
+      }
+      if (args.includes('export-chunks')) return result(0, { parent_exchange: exchange(), chunks: [{
+        chunk_number: 1, chunk_count: 1, exchange: exchange(), evidence_characters: 500, exceeds_target: false }] });
+      if (args.includes('scripts/run-oversized-orchestrator.mjs')) {
+        chunkRuns++; put(directory, runDir + '/parent-output.json', output());
+        put(directory, runDir + '/parent-model.json', receipt()); return result();
+      }
+      if (args.includes('validate')) return validate(directory, args);
+      if (args.includes('persist')) return persistResult();
+      throw new Error('Must not send this source as one standard model request');
+    };
+    expect((await run(directory, 'run-reconstruction-batch.mjs', BATCH_ARGS, spawn)).code).toBe(0);
+    expect(chunkRuns).toBe(1); expect(batchReceipt(directory).completed[0].mode).toBe('oversized');
+  });
+  it("replays existing complete validated artifacts even when the new size policy would chunk the source", async () => {
+    const directory = root(); priority(directory); standardArtifacts(directory);
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes('scripts/reconstruction-inventory.ts')) {
+        const value = JSON.parse(inventory().stdout); value.conversations[0].evidence_block_count = 1342; return result(0, value);
+      }
+      if (args.includes('validate')) return validate(directory, args);
+      if (args.includes('persist')) return persistResult(true);
+      throw new Error('A safe persisted-artifact replay must not call a model or export new chunks');
+    };
+    expect((await run(directory, 'run-reconstruction-batch.mjs', BATCH_ARGS, spawn)).code).toBe(0);
+    expect(batchReceipt(directory).completed[0]).toMatchObject({ mode: 'standard', replay: true });
+  });
+  it("keeps one shared source deadline and at most two outer generation attempts", async () => {
+    const directory = root(); priority(directory); const deadlines: string[] = [];
+    const spawn: Spawn = (_command, args, options) => {
+      if (args.includes('scripts/reconstruction-inventory.ts')) return inventory();
+      if (args.includes('scripts/run-next-priority-nemotron.mjs')) {
+        deadlines.push(options.env.HHS_RECONSTRUCTION_DEADLINE_AT); return result(7);
+      }
+      throw new Error('Failed generation must not persist');
+    };
+    expect((await run(directory, 'run-reconstruction-batch.mjs', BATCH_ARGS, spawn)).code).toBe(2);
+    expect(deadlines).toHaveLength(2); expect(new Set(deadlines).size).toBe(1);
+    expect(Number(deadlines[0])).toBeGreaterThan(Date.now());
+    expect(Number(deadlines[0])).toBeLessThanOrEqual(Date.now() + 480000);
+  });
   it.each(["Error: standard validation failed after 3 attempts: unknown evidence reference", "Error: /usr/bin/node exited with status 10"])("normal continuation preserves terminal content failures (%s)", async (reason) => {
     const directory = root(); priority(directory); standardArtifacts(directory);
     const heldPath = ".runtime/reconstruction/batch-receipts/batch-2026-01-01.json";
@@ -333,7 +381,7 @@ describe("existing standard reconstruction runner retry/resume", () => {
       throw new Error(`Unexpected persistence: ${args}`);
     };
     expect((await run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, spawn)).code).toBe(2);
-    expect(attempts).toBe(3);
+    expect(attempts).toBe(2);
     expect(batchReceipt(directory)).toMatchObject({ status: "failed", completed: [] });
   });
   it("resumes interrupted oversized preparation from the existing parent exchange without overwriting history", async () => {

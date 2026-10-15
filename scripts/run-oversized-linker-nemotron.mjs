@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { providerRequestSignal } from "./reconstruction-provider.mjs";
+import { requestDiscoveryModel } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -246,70 +246,7 @@ console.log("links:", finalOutput.links.length);
 console.log("DATABASE WRITES: NONE");
 
 async function callModel(model, system, user) {
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    console.log("Trying " + model + " - attempt " + attempt + "/3");
-    try {
-      const response = await fetch(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-          signal: providerRequestSignal(),
-          method: "POST",
-          headers: {
-            Authorization: "Bearer " + process.env.OPENROUTER_API_KEY,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: "system", content: system },
-              { role: "user", content: user }
-            ],
-            temperature: 0.1
-          })
-        }
-      );
-      const data = await response.json();
-      const error = data?.error;
-      const responseContent =
-        data?.choices?.[0]?.message?.content;
-
-      if (response.ok && !error && responseContent) {
-        return {
-          ok: true,
-          model,
-          data,
-          content: responseContent
-        };
-      }
-
-      const message = error?.message ?? ("HTTP " + response.status);
-      console.log("Model failed: " + message);
-      if (
-        attempt === 3
-        || !(
-          response.status === 429
-          || response.status === 502
-          || response.status === 503
-          || /overload|temporar|rate.?limit/i.test(message)
-        )
-      ) {
-        return { ok: false, model, error: data };
-      }
-    } catch (error) {
-      console.log("Request error: " + error.message);
-      if (attempt === 3) {
-        return {
-          ok: false,
-          model,
-          error: { message: error.message }
-        };
-      }
-    }
-
-    const waitMs = attempt * 5000;
-    console.log("Waiting " + waitMs / 1000 + "s before retry...");
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-  }
+  return requestDiscoveryModel(model, system, user, { env: process.env, fetch, maxTokens: 16384 });
 }
 
 function flag(name) {

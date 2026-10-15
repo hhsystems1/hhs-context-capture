@@ -1,8 +1,24 @@
 import { describe, it, expect } from "vitest";
-import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal } from "./reconstruction-provider.mjs";
+import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel } from "./reconstruction-provider.mjs";
 import { setTimeout, clearTimeout } from "node:timers";
 
 describe("bounded reconstruction requests", () => {
+  it("does not multiply a failed provider request into another internal retry loop", async () => {
+    let calls = 0;
+    const result = await requestDiscoveryModel('synthetic-free', 'system', 'data', { env: { OPENROUTER_API_KEY: 'synthetic-key' },
+      fetch: async () => { calls++; return { ok: false, status: 429, json: async () => ({ error: { message: 'private echoed input' } }) }; } });
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({ ok: false, error: { category: 'rate_limited', http_status: 429 } });
+    expect(JSON.stringify(result)).not.toContain('private echoed input');
+  });
+  it("shares a source deadline across retries and chunks without starting expired requests", async () => {
+    let calls = 0;
+    const result = await requestDiscoveryModel('synthetic-free', 'system', 'data', { env: {
+      OPENROUTER_API_KEY: 'synthetic-key', HHS_RECONSTRUCTION_DEADLINE_AT: String(Date.now() - 1) },
+      fetch: async () => { calls++; throw new Error('must not request'); } });
+    expect(calls).toBe(0);
+    expect(result).toMatchObject({ ok: false, error: { category: 'source_deadline' } });
+  });
   it("preserves every exact evidence text/reference and authorship while keeping trust metadata local", () => {
     const input = { schema_version: "input/1", pipeline_version: "pipeline/1", exchange_id: "exchange-1",
       evidence_sha256: "trusted-exchange-hash", selection: [{ source_conversation_id: "source-1", title: "Sample",

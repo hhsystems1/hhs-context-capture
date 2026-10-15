@@ -3,7 +3,7 @@ import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { jsonrepair } from "jsonrepair";
-import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal } from "./reconstruction-provider.mjs";
+import { modelDiscoveryExchange, restoreModelEvidenceRefs, requestDiscoveryModel } from "./reconstruction-provider.mjs";
 
 const ROOT = process.cwd();
 const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
@@ -336,7 +336,6 @@ const preferredModels = [
   "nvidia/nemotron-3-ultra-550b-a55b:free"
 ];
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const providerAttempts = [];
 function recordProviderAttempt(model, attempt, outcome) {
   providerAttempts.push({ model, attempt, at: new Date().toISOString(), ...outcome });
@@ -347,95 +346,11 @@ function recordProviderAttempt(model, attempt, outcome) {
 }
 
 async function callModel(model) {
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    console.log(`Trying ${model} - attempt ${attempt}/3`);
-
-    try {
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        signal: providerRequestSignal(),
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 32768,
-          reasoning: { enabled: false },
-          messages: [
-            { role: "system", content: systemPrompt },
-            {
-              role: "user",
-              content:
-                "Deeply digest this complete bounded HHS conversation evidence and return the required discovery JSON:\n\n" +
-                JSON.stringify(modelDiscoveryExchange(exchange))
-            }
-          ],
-          temperature: 0.2
-        })
-      });
-
-      const data = await response.json();
-      const embeddedError = data?.error;
-
-      if (!response.ok || embeddedError) {
-        const message = embeddedError?.message ?? `HTTP ${response.status}`;
-        recordProviderAttempt(model, attempt, { http_status: response.status,
-          ...(Number.isInteger(embeddedError?.code) ? { provider_error_code: embeddedError.code } : {}),
-          category: providerFailureCategory(embeddedError?.code ?? response.status, JSON.stringify(embeddedError ?? { message })) });
-        console.log(`Model failed: ${message}`);
-
-        const retryable =
-          response.status === 429 ||
-          response.status === 502 ||
-          response.status === 503 ||
-          /overload|temporar|rate.?limit/i.test(message);
-
-        if (!retryable) {
-          return { ok: false, model, error: data };
-        }
-
-        if (attempt < 3) {
-          const waitMs = attempt * 5000;
-          console.log(`Waiting ${waitMs / 1000}s before retry...`);
-          await sleep(waitMs);
-          continue;
-        }
-
-        return { ok: false, model, error: data };
-      }
-
-      const content = data?.choices?.[0]?.message?.content;
-
-      if (!content) {
-        recordProviderAttempt(model, attempt, { http_status: response.status, category: "empty_content" });
-        return {
-          ok: false,
-          model,
-          error: { message: "Successful API response contained no model content." }
-        };
-      }
-
-      recordProviderAttempt(model, attempt, { http_status: response.status, category: "content_received" });
-      return { ok: true, model, data, content };
-    } catch (error) {
-      recordProviderAttempt(model, attempt, { category: error.name === "TimeoutError" || error.name === "AbortError" ? "request_timeout" : "request_failed" });
-      console.log(`Request error: ${error.message}`);
-
-      if (attempt < 3) {
-        const waitMs = attempt * 5000;
-        console.log(`Waiting ${waitMs / 1000}s before retry...`);
-        await sleep(waitMs);
-        continue;
-      }
-
-      return {
-        ok: false,
-        model,
-        error: { message: error.message }
-      };
-    }
-  }
+  return requestDiscoveryModel(model, systemPrompt,
+    "Deeply digest this complete bounded HHS conversation evidence and return the required discovery JSON:\n\n" + JSON.stringify(modelDiscoveryExchange(exchange)), {
+      env: process.env, fetch,
+      onAttempt: outcome => recordProviderAttempt(model, 1, outcome)
+    });
 }
 
 let modelResult = null;
