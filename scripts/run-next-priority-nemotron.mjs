@@ -332,8 +332,8 @@ console.log("\n=== NEMOTRON DEEP DIGESTION ===");
 
 
 const preferredModels = [
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "nvidia/nemotron-3-super-120b-a12b:free"
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free"
 ];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

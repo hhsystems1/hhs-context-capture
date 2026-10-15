@@ -8,8 +8,8 @@ const ROOT = process.cwd();
 const PROVIDER = "openrouter";
 const RUNNER_VERSION = "hhs-oversized-linker/0.1.0";
 const MODELS = [
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "nvidia/nemotron-3-super-120b-a12b:free"
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free"
 ];
 
 const runDirectory = flag("run-dir");
