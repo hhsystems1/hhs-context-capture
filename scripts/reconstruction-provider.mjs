@@ -17,8 +17,10 @@ export function providerRequestSignal(env = process.env) {
 export async function requestDiscoveryModel(model, system, user, options = {}) {
   const env = options.env ?? process.env;
   const onAttempt = options.onAttempt ?? (() => {});
-  const fail = (category, status) => {
-    const result = { category, ...(Number.isInteger(status) ? { http_status: status } : {}) };
+  const fail = (category, status, providerCode) => {
+    const numericCode = Number(providerCode);
+    const result = { category, ...(Number.isInteger(status) ? { http_status: status } : {}),
+      ...(Number.isInteger(numericCode) && numericCode >= 400 && numericCode <= 599 ? { provider_error_code: numericCode } : {}) };
     onAttempt(result);
     return { ok: false, model, error: result };
   };
@@ -33,7 +35,7 @@ export async function requestDiscoveryModel(model, system, user, options = {}) {
         ] })
     });
     const data = await response.json();
-    if (!response.ok || data?.error) return fail(providerFailureCategory(data?.error?.code ?? response.status, JSON.stringify(data?.error)), response.status);
+    if (!response.ok || data?.error) return fail(providerFailureCategory(data?.error?.code ?? response.status, JSON.stringify(data?.error)), response.status, data?.error?.code);
     if (data.usage?.cost > 0) return fail('provider_policy', response.status);
     const content = data?.choices?.[0]?.message?.content;
     if (typeof content !== 'string' || !content.trim()) return fail('empty_content', response.status);
@@ -92,6 +94,7 @@ export function restoreModelEvidenceRefs(candidate, exchange) {
 
 // Safe diagnostics only: never retain echoed provider messages/prompt text/keys.
 export function providerFailureCategory(status, message) {
+  status = Number(status);
   if (/context.{0,30}(length|limit)|too many tokens|reduce.{0,30}(length|tokens)/i.test(String(message))) return 'context_limit';
   if (status === 429) return 'rate_limited';
   if (status === 401 || status === 403) return 'provider_auth';

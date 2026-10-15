@@ -3,6 +3,18 @@ import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCatego
 import { setTimeout, clearTimeout } from "node:timers";
 
 describe("bounded reconstruction requests", () => {
+  it("retains a safe embedded provider error code when the HTTP transport reports success", async () => {
+    const attempts = [];
+    const result = await requestDiscoveryModel('synthetic-free', 'system', 'data', { env: { OPENROUTER_API_KEY: 'synthetic-key' },
+      onAttempt: attempt => attempts.push(attempt),
+      fetch: async () => ({ ok: true, status: 200, json: async () => ({ error: { code: '429', message: 'private echoed input' } }) }) });
+    expect(result).toMatchObject({ ok: false, error: { category: 'rate_limited', http_status: 200, provider_error_code: 429 } });
+    expect(attempts).toEqual([result.error]);
+    expect(JSON.stringify(result)).not.toContain('private echoed input');
+    const unsafe = await requestDiscoveryModel('synthetic-free', 'system', 'data', { env: {},
+      fetch: async () => ({ ok: true, status: 200, json: async () => ({ error: { code: 'private secret', message: 'private echoed input' } }) }) });
+    expect(unsafe.error).toEqual({ category: 'provider_error', http_status: 200 });
+  });
   it("does not multiply a failed provider request into another internal retry loop", async () => {
     let calls = 0;
     const result = await requestDiscoveryModel('synthetic-free', 'system', 'data', { env: { OPENROUTER_API_KEY: 'synthetic-key' },
