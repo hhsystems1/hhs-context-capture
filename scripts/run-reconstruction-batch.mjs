@@ -58,11 +58,15 @@ const persisted = new Set(
     .filter((item) => item.discovery_status === "discovery_processed")
     .map((item) => item.source_conversation_id)
 );
+const held = quarantinedSources();
 const eligible = priority.conversations
   .filter((item) =>
     inventorySourceIds.has(item.source_conversation_id)
     && !item.evidence_issue
     && !persisted.has(item.source_conversation_id)
+    // A normal continuation advances past preserved failures. A deliberate
+    // targeted retry remains available after the operator reviews/repairs one.
+    && (TARGET_CONVERSATION || !held.has(item.source_conversation_id))
   )
   .sort((a, b) => priorityRank(a) - priorityRank(b));
 
@@ -85,6 +89,10 @@ const receipt = {
   ...(OPERATION_ID ? { operation_id: OPERATION_ID } : {}),
   requested: LIMIT,
   selected: candidates.length,
+  skipped_quarantined_count: TARGET_CONVERSATION ? 0 : priority.conversations.filter(item =>
+    inventorySourceIds.has(item.source_conversation_id) && !item.evidence_issue
+    && !persisted.has(item.source_conversation_id) && held.has(item.source_conversation_id)
+  ).length,
   ...(TARGET_CONVERSATION ? { conversation: TARGET_CONVERSATION } : {}),
   status: "running",
   completed: [],
@@ -387,6 +395,32 @@ function inventoryJson() {
     "scripts/reconstruction-inventory.ts", "json",
     "--workspace", WORKSPACE
   ]).stdout);
+}
+
+function quarantinedSources() {
+  const directory = path.join(ROOT, ".runtime/reconstruction/batch-receipts");
+  if (!fs.existsSync(directory)) return new Set();
+  const sources = new Set();
+  for (const name of fs.readdirSync(directory).filter(name => name.endsWith(".json"))) {
+    const prior = read(path.join(directory, name));
+    if (prior.workspace !== WORKSPACE || !prior.finished_at || prior.status === "running") continue;
+    if (prior.schema_version !== "hhs-reconstruction-batch/0.1.0" || !Number.isFinite(Date.parse(prior.finished_at))
+      || !["completed", "partial", "failed"].includes(prior.status) || !Array.isArray(prior.quarantined)) {
+      throw new Error(`Invalid preserved quarantine receipt: ${name}`);
+    }
+    for (const item of prior.quarantined) {
+      if (!item || typeof item.source_conversation_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(item.source_conversation_id)
+        || typeof item.reason !== "string" || !item.reason.trim()) throw new Error(`Invalid preserved quarantine entry: ${name}`);
+      // Content/identity failures need review. Preserve the existing automatic
+      // artifact replay for transient generation or database-persistence errors.
+      // The existing priority entrypoint also reports trusted-validation failure
+      // through exit 10; older terminal receipts preserve that numeric outcome.
+      if (/standard validation failed after \d+ attempts|exited with status 10$|prepared_source_identity_mismatch|Discovery exchange does not match current trusted database evidence/.test(item.reason)) {
+        sources.add(item.source_conversation_id);
+      }
+    }
+  }
+  return sources;
 }
 
 function summary(candidate, mode, result) {

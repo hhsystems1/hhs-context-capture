@@ -133,6 +133,57 @@ function persistResult(replay = false): Result { return result(0, { observations
 const BATCH_ARGS = ["--workspace", WORKSPACE];
 
 describe("existing standard reconstruction runner retry/resume", () => {
+  it.each(["Error: standard validation failed after 3 attempts: unknown evidence reference", "Error: /usr/bin/node exited with status 10"])("normal continuation preserves terminal content failures (%s)", async (reason) => {
+    const directory = root(); priority(directory); standardArtifacts(directory);
+    const heldPath = ".runtime/reconstruction/batch-receipts/batch-2026-01-01.json";
+    const held = { schema_version: "hhs-reconstruction-batch/0.1.0", workspace: WORKSPACE,
+      status: "failed", finished_at: "2026-01-01T00:00:00.000Z", completed: [],
+      quarantined: [{ source_conversation_id: SOURCE, title: "Synthetic", reason }] };
+    put(directory, heldPath, held);
+    const preserved = fs.readFileSync(path.join(directory, `${BASE}-output.json`), "utf8");
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) return inventory();
+      throw new Error("A held source must not regenerate, validate or persist automatically");
+    };
+    await run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, spawn);
+    expect(batchReceipt(directory)).toMatchObject({ status: "completed", selected: 0, skipped_quarantined_count: 1 });
+    expect(get(directory, heldPath)).toEqual(held);
+    expect(fs.readFileSync(path.join(directory, `${BASE}-output.json`), "utf8")).toBe(preserved);
+  });
+
+  it("explicit targeted retry, other-workspace and unfinished receipts do not silently hold an eligible source", async () => {
+    for (const mode of ["targeted", "other-workspace", "unfinished"]) {
+      const directory = root(); priority(directory); standardArtifacts(directory);
+      put(directory, ".runtime/reconstruction/batch-receipts/batch-2026-01-01.json", {
+        schema_version: "hhs-reconstruction-batch/0.1.0", workspace: mode === "other-workspace" ? "other-workspace" : WORKSPACE,
+        status: mode === "unfinished" ? "running" : "failed", ...(mode === "unfinished" ? {} : { finished_at: "2026-01-01T00:00:00.000Z" }),
+        completed: [], quarantined: [{ source_conversation_id: SOURCE, reason: "Error: standard validation failed after 3 attempts: invalid source reference" }]
+      });
+      let writes = 0;
+      const spawn: Spawn = (_command, args) => {
+        if (args.includes("scripts/reconstruction-inventory.ts")) return inventory();
+        if (args.includes("validate")) return validate(directory, args);
+        if (args.includes("persist")) { writes++; return persistResult(); }
+        throw new Error("Unexpected generation");
+      };
+      await run(directory, "run-reconstruction-batch.mjs", mode === "targeted" ? [...BATCH_ARGS, "--conversation", SOURCE] : BATCH_ARGS, spawn);
+      expect(writes).toBe(1);
+      expect(batchReceipt(directory)).toMatchObject({ selected: 1, completed: [{ replay: false }] });
+    }
+  });
+
+  it("malformed same-workspace terminal quarantine receipts stop selection before processing", async () => {
+    const directory = root(); priority(directory);
+    put(directory, ".runtime/reconstruction/batch-receipts/batch-2026-01-01.json", {
+      schema_version: "hhs-reconstruction-batch/0.1.0", workspace: WORKSPACE, status: "failed",
+      finished_at: "2026-01-01T00:00:00.000Z", quarantined: [{ source_conversation_id: "../other", reason: "invalid reference" }]
+    });
+    await expect(run(directory, "run-reconstruction-batch.mjs", BATCH_ARGS, (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) return inventory();
+      throw new Error("Unexpected processing");
+    })).rejects.toThrow(/invalid preserved quarantine entry/i);
+  });
+
   it("reuses completed artifacts and live discovery inventory without duplicating completed work", async () => {
     const directory = root(); priority(directory); standardArtifacts(directory);
     let processed = false;
