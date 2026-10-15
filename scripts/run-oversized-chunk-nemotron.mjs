@@ -330,7 +330,7 @@ function nextAttemptNumber(directory, number) {
 }
 
 async function callModel(model, system, user) {
-  return requestDiscoveryModel(model, system, user, { env: process.env, fetch, maxTokens: 32768 });
+  return requestDiscoveryModel(model, system, user, { env: process.env, fetch, maxTokens: 8192 });
 }
 
 function flag(name) {
