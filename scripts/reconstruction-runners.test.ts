@@ -615,6 +615,18 @@ describe("runner attribution normalization remains under trusted validation", ()
       expect(fs.existsSync(path.join(directory, script.includes('chunk') ? 'chunk-001-output.json' : `${BASE}-output.json`))).toBe(false);
     }
   });
+  it("retains linker truncation diagnostics and never validates or saves a truncated graph", async () => {
+    const directory = root();
+    put(directory, 'parent-input.json', exchange());
+    put(directory, 'parent-deterministic-merged-output.json', output());
+    const spawn = vi.fn(() => { throw new Error('Truncated graph must not validate or persist'); });
+    const fetch = async () => ({ ok: true, status: 200, json: async () => ({ model: MODEL,
+      choices: [{ finish_reason: 'length', message: { content: '{"links":[]}' } }] }) });
+    expect((await run(directory, 'run-oversized-linker-nemotron.mjs', ['--run-dir', directory], spawn, fetch)).code).toBe(8);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(directory, 'parent-output.json'))).toBe(false);
+    expect(get(directory, 'parent-link-attempt-001-error.json')).toEqual({ category: 'output_truncated' });
+  });
   it("requires an explicit workspace instead of selecting the persistent proof workspace", async () => {
     const directory = root();
     const spawn = vi.fn(() => { throw new Error("Unexpected subprocess"); });

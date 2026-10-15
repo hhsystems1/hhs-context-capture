@@ -66,6 +66,8 @@ const systemPrompt = [
   "Do not rewrite, remove, combine, or invent observations.",
   "Your only task is to identify meaningful relationships among the existing observation_ref values.",
   "Prioritize relationships across different chunk prefixes, while also including important within-chunk relationships.",
+  "Return at most 48 high-value relationships. Existing within-chunk relationships are already retained separately; this is a sparse set of additional connections, not every possible pair.",
+  "Keep each payload to one short relationship explanation of at most 120 characters. Do not repeat observation statements or evidence.",
   "Preserve chronology, corrections, rejection, approval, dependency, implementation, production, supersession, and refinement relationships.",
   "Do not claim that an assistant proposal was approved unless an existing user-authored observation establishes approval.",
   "Return only valid JSON with exactly one top-level key named links.",
@@ -105,6 +107,7 @@ fs.writeFileSync(
 console.log("MODEL USED:", result.model);
 console.log("raw response saved:", rawPath);
 if (result.data.choices?.[0]?.finish_reason === 'length') {
+  fs.writeFileSync(attemptBase + '-error.json', JSON.stringify({ category: 'output_truncated' }) + '\n', { flag: 'wx' });
   console.error('STOP: truncated relationships cannot be accepted as complete.');
   process.exit(8);
 }

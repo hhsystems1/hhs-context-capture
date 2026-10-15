@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { ensureIngestWorkspace, publishCaptureSourceVersionFromClient, buildIds } from "./ingest.js";
 import { sha256 } from "@hhs/memory-schema";
-import { validationSummary } from "./reconstruction-diagnostics.js";
+import { quarantineDetails, validationSummary } from "./reconstruction-diagnostics.js";
 import type { DbClient } from "./db.js";
 import type { VerifiedArchive } from "./archive.js";
 
@@ -35,5 +35,12 @@ describe("capture intake trust", () => {
     expect(diagnostic.code).toBe("unknown_evidence_reference");
     expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE_REFERENCE");
     expect(diagnostic.issue_count).toBe(1);
+  });
+  it("does not present an old standard validation diagnosis as a current linker/runtime failure", () => {
+    const [diagnostic] = quarantineDetails('/not-read-for-runtime-failure', 'scope', [{
+      source_conversation_id: 'source', title: 'Preserved source', reason: 'Error: node exited with status 1'
+    }]);
+    expect(diagnostic).toMatchObject({ code: 'reconstruction_failed', issue_count: 0 });
+    expect(diagnostic?.summary).not.toContain('citation');
   });
 });

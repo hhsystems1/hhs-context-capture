@@ -20,6 +20,11 @@ export function quarantineDetails(root: string, workspace: string, quarantined: 
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) throw new Error("Invalid quarantine source identity.");
     let diagnostic = { code: "reconstruction_failed", issue_count: 0,
       summary: "Processing stopped. Preserved attempts need operator review before retrying." };
+    // A cached, older standard validation error cannot explain a current
+    // provider/chunk/linker failure. Only inspect it for a validation outcome.
+    if (!/standard validation failed|trusted validation|exited with status 10\b/i.test(String(item.reason ?? ""))) {
+      return { source_conversation_id: id, title: String(item.title ?? "Historical conversation").slice(0, 160), ...diagnostic };
+    }
     const failed = path.join(root, ".runtime/reconstruction/priority-runs/failed-attempts");
     try {
       const bases = fs.readdirSync(failed).filter(name => /^priority-\d+-/.test(name) && name.endsWith(`-${id}`));
