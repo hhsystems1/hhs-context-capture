@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { LINKING_REQUEST_VERSION } from './reconstruction-provider.mjs';
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -253,7 +254,10 @@ function attempts(directory, number) {
   return new Set(fs.readdirSync(directory).map((name) => name.match(pattern)?.[1]).filter(Boolean)).size;
 }
 function linkerAttempts(directory) {
-  return fs.readdirSync(directory).filter((name) => /^parent-link-attempt-\d+-raw\.json$/.test(name)).length;
+  // A concrete input-policy repair gets its own bounded budget. Old attempts
+  // remain immutable; even a torn request counts against this policy's budget.
+  return fs.readdirSync(directory).filter(name => /^parent-link-attempt-\d+-request\.json$/.test(name)
+    && read(path.join(directory, name)).request_version === LINKING_REQUEST_VERSION).length;
 }
 function run(command, args) {
   return spawnSync(command, args, { cwd: ROOT, env: { ...process.env, MEMORY_WORKSPACE_ID: WORKSPACE }, stdio: "inherit" });

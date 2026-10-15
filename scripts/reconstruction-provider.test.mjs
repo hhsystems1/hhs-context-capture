@@ -109,6 +109,19 @@ describe("bounded reconstruction requests", () => {
     expect(JSON.stringify(projected)).not.toMatch(/private-path|private-version|resolution_expected_sha256/);
     expect(JSON.stringify(projected).length).toBeLessThan(original.length / 4);
   });
+  it("bounds extra relationship anchors across chunks without dropping or mutating retained findings", () => {
+    const rows = Array.from({ length: 65 }, (_, index) => ({ observation_ref: `chunk${String(Math.floor(index / 5) + 1).padStart(3, '0')}__o${index}`,
+      statement: index % 5 === 4 ? 'User corrected a requirement.' : 'Assistant explored an idea.',
+      observation_kind: index % 5 === 4 ? 'correction' : 'proposal', attribution: { subject: index % 5 === 4 ? 'user' : 'assistant' }, evidence: [{ evidence_ref: 'original' }] }));
+    const before = JSON.stringify(rows);
+    const anchors = modelLinkingObservations(rows, 16);
+    expect(anchors).toHaveLength(16);
+    const canonical = restoreLinkingRefs(anchors.map(row => ({ from_observation_ref: row.observation_ref, to_observation_ref: row.observation_ref })), rows);
+    expect(new Set(canonical.map(row => row.from_observation_ref.match(/^chunk\d+/)[0])).size).toBe(13);
+    expect(anchors.filter(row => row.attribution.subject === 'user').length).toBeGreaterThanOrEqual(13);
+    expect(JSON.stringify(rows)).toBe(before);
+    expect(modelLinkingObservations(rows)).toHaveLength(65);
+  });
   it("does not turn an unknown alias into evidence or collide with original reference names", () => {
     const input = { evidence: [{ evidence_ref: 'E1', text: 'a' }, { evidence_ref: '_E2', text: 'b' }] };
     const restored = restoreModelEvidenceRefs({ observations: [{ evidence: ['__E1', { evidence_ref: '__E2' }, { evidence_ref: '__E999' }] }] }, input);

@@ -144,9 +144,26 @@ export function restoreModelEvidenceRefs(candidate, exchange) {
 
 // Relationships need the validated claims and attribution, not repeated storage
 // citations. The full observations remain unchanged in the final validated output.
-export function modelLinkingObservations(observations) {
+export const LINKING_REQUEST_VERSION = 'hhs-linking-anchors/1';
+export function modelLinkingObservations(observations, limit = observations.length) {
   const refs = linkingAliases(observations);
-  return observations.map(row => ({ observation_ref: refs.get(row.observation_ref), observation_kind: row.observation_kind,
+  const groups = new Map();
+  for (const row of observations) {
+    const chunk = row.observation_ref.match(/^chunk\d+/)?.[0] ?? 'source';
+    const group = groups.get(chunk) ?? []; group.push(row); groups.set(chunk, group);
+  }
+  const selected = new Set();
+  const priority = row => row.attribution?.subject === 'user' && /correct|reject|decis|prefer|require|chang|request/i.test(row.observation_kind + ' ' + row.statement);
+  const add = row => { if (row && selected.size < limit) selected.add(row); };
+  // Spread a sparse linking pass across chunks; never shorten the retained output.
+  const chunks = [...groups.values()];
+  for (let index = 0; index < Math.min(limit, chunks.length); index++) {
+    const group = chunks[Math.floor(index * chunks.length / Math.min(limit, chunks.length))];
+    add(group.find(priority) ?? group[0]);
+  }
+  for (const row of observations.filter(priority)) add(row);
+  for (const row of observations) add(row);
+  return observations.filter(row => selected.has(row)).map(row => ({ observation_ref: refs.get(row.observation_ref), observation_kind: row.observation_kind,
     statement: row.statement, payload: row.payload, attribution: row.attribution, confidence: row.confidence }));
 }
 export function restoreLinkingRefs(links, observations) {

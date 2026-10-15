@@ -21,7 +21,7 @@ const SOURCE = "synthetic-source";
 const WORKSPACE = "synthetic-workspace";
 const MODEL = "synthetic-model";
 const roots: string[] = [];
-const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
+const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function root(): string { const value = fs.mkdtempSync(path.join(os.tmpdir(), "hhs-runner-unit-")); roots.push(value); return value; }
 function put(directory: string, file: string, value: unknown): void {
@@ -107,7 +107,7 @@ async function run(directory: string, script: string, args: string[], spawnSync:
     await vm.runInNewContext(`(async () => { ${source} })()`, {
       fs: localFs, path, spawnSync, jsonrepair, process: fakeProcess, Buffer, fetch,
       providerRequestSignal: () => providerRequestSignal(fakeProcess.env),
-      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs,
+      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION,
       mkdir: (file: string, options: any) => mkdir(resolve(file), options),
       readFile: (file: string, options: any) => readFile(resolve(file), options),
       writeFile: (file: string, value: any, options: any) => writeFile(resolve(file), value, options),
@@ -464,6 +464,21 @@ function completeParent(directory: string): void {
 function orchestratorArgs(directory: string): string[] { return ["--run-dir", directory, "--workspace", WORKSPACE]; }
 
 describe("existing oversized runner continuation", () => {
+  it("retains legacy linker attempts but counts every current-policy request, including torn requests, against resume", async () => {
+    const directory = root(); oversized(directory, 1); completeChunk(directory, '001');
+    for (let index = 1; index <= 3; index++) put(directory, `parent-link-attempt-00${index}-raw.json`, { model: MODEL });
+    for (let index = 4; index <= 5; index++) put(directory, `parent-link-attempt-00${index}-request.json`, { request_version: LINKING_REQUEST_VERSION });
+    let calls = 0;
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes('validate')) return validate(directory, args);
+      if (args.includes('scripts/run-oversized-linker-nemotron.mjs')) { calls++; put(directory, 'parent-link-attempt-006-request.json', { request_version: LINKING_REQUEST_VERSION }); return result(9); }
+      throw new Error('Cached chunks must not regenerate');
+    };
+    await expect(run(directory, 'run-oversized-orchestrator.mjs', orchestratorArgs(directory), spawn)).rejects.toThrow('Linker attempt limit');
+    expect(calls).toBe(1);
+    await expect(run(directory, 'run-oversized-orchestrator.mjs', orchestratorArgs(directory), spawn)).rejects.toThrow('Linker attempt limit');
+    expect(calls).toBe(1);
+  });
   it("skips revalidated completed chunks, retries validation failures, retries linker failures, and replays without model work", async () => {
     const directory = root(); oversized(directory); completeChunk(directory, "001");
     let chunks = 0; let links = 0;
@@ -614,6 +629,22 @@ describe("runner attribution normalization remains under trusted validation", ()
       expect((await run(directory, script, args, spawn, fetch)).code).toBe(script.includes('chunk') ? 8 : 10);
       expect(fs.existsSync(path.join(directory, script.includes('chunk') ? 'chunk-001-output.json' : `${BASE}-output.json`))).toBe(false);
     }
+  });
+  it("validates and retains all source findings when the extra linker sees bounded representative anchors", async () => {
+    const directory = root(); const input = exchange();
+    const merged = output(input);
+    merged.observations = Array.from({ length: 26 }, (_, index) => ({ ...merged.observations[0]!, statement: `Assistant proposal number ${index}.`, observation_ref: `chunk${String(Math.floor(index / 2) + 1).padStart(3, '0')}__o${index}` }));
+    put(directory, 'parent-input.json', input); put(directory, 'parent-deterministic-merged-output.json', merged);
+    const fetch = async (_url: string, options: any) => {
+      const sent = JSON.parse(JSON.parse(options.body).messages[1].content.split('validated observations:\n\n')[1]);
+      expect(sent.observations).toHaveLength(16);
+      return { ok: true, status: 200, json: async () => ({ model: MODEL, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ links: [{
+        from_observation_ref: sent.observations[0].observation_ref, to_observation_ref: sent.observations[1].observation_ref,
+        link_kind: 'related', payload: {}, confidence: 0.5 }] }) } }] }) };
+    };
+    expect((await run(directory, 'run-oversized-linker-nemotron.mjs', ['--run-dir', directory], (_command, args) => validate(directory, args), fetch)).code).toBe(0);
+    expect(get(directory, 'parent-output.json').observations).toEqual(merged.observations);
+    expect(get(directory, 'parent-model.json')).toMatchObject({ validated: true, observations: 26, linking_anchors: 16, relationship_coverage: 'representative_anchors' });
   });
   it("retains linker truncation diagnostics and never validates or saves a truncated graph", async () => {
     const directory = root();

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs } from "./reconstruction-provider.mjs";
+import { requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -45,7 +45,7 @@ const validRefs = new Set(
 const existingAttempts = fs.readdirSync(runDirectory)
   .filter((name) =>
     name.startsWith("parent-link-attempt-")
-    && /-(raw|error|output)\.json$/.test(name)
+    && /-(raw|error|output|request)\.json$/.test(name)
   )
   .map((name) => Number(name.split("-")[3]))
   .filter(Number.isFinite);
@@ -77,13 +77,19 @@ const systemPrompt = [
   "Do not include self-links or duplicate links."
 ].join("\n\n");
 
+const linkingObservations = modelLinkingObservations(merged.observations, 16);
+const issuedRefs = new Set(linkingObservations.map(row => row.observation_ref));
+fs.writeFileSync(attemptBase + '-request.json', JSON.stringify({ request_version: LINKING_REQUEST_VERSION,
+  retained_observations: merged.observations.length, linking_anchors: linkingObservations.length }) + '\n', { flag: 'wx' });
 const userPrompt =
+  "These are representative linking anchors selected across the source chunks. All other validated observations and existing within-chunk links are retained locally. Do not claim a complete relationship graph.\n\n"
+  +
   "Create the relationship graph for these validated observations:\n\n"
   + JSON.stringify({
     source_conversation_id:
       parentExchange.selection[0].source_conversation_id,
     title: parentExchange.selection[0].title,
-    observations: modelLinkingObservations(merged.observations)
+    observations: linkingObservations
   });
 
 let result;
@@ -135,7 +141,7 @@ try {
 }
 
 const suppliedLinks = Array.isArray(candidate.links)
-  ? restoreLinkingRefs(candidate.links, merged.observations)
+  ? restoreLinkingRefs(candidate.links.filter(link => issuedRefs.has(link?.from_observation_ref) && issuedRefs.has(link?.to_observation_ref)), merged.observations)
   : [];
 const seen = new Set();
 const links = [];
@@ -242,6 +248,8 @@ fs.writeFileSync(
     runner_version: RUNNER_VERSION,
     attempt: attemptNumber,
     observations: merged.observations.length,
+    relationship_coverage: 'representative_anchors',
+    linking_anchors: linkingObservations.length,
     generated_links: links.length,
     validated: true
   }, null, 2) + "\n",
