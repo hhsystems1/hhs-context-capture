@@ -21,7 +21,7 @@ const SOURCE = "synthetic-source";
 const WORKSPACE = "synthetic-workspace";
 const MODEL = "synthetic-model";
 const roots: string[] = [];
-const { providerRequestSignal } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
+const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function root(): string { const value = fs.mkdtempSync(path.join(os.tmpdir(), "hhs-runner-unit-")); roots.push(value); return value; }
 function put(directory: string, file: string, value: unknown): void {
@@ -30,6 +30,11 @@ function put(directory: string, file: string, value: unknown): void {
   fs.writeFileSync(destination, JSON.stringify(value, null, 2) + "\n");
 }
 function get(directory: string, file: string): any { return JSON.parse(fs.readFileSync(path.resolve(directory, file), "utf8")); }
+function providerAudit(directory: string): any {
+  const folder = path.join(directory, '.runtime/reconstruction/priority-runs');
+  const file = fs.readdirSync(folder).find(name => name.endsWith('-provider-attempts.json'))!;
+  return get(folder, file);
+}
 function exchange(id = "exchange"): DiscoveryExchange {
   const text = `The assistant suggests documenting the workflow (${id}).`;
   const hash = sha256(text);
@@ -102,6 +107,7 @@ async function run(directory: string, script: string, args: string[], spawnSync:
     await vm.runInNewContext(`(async () => { ${source} })()`, {
       fs: localFs, path, spawnSync, jsonrepair, process: fakeProcess, Buffer, fetch,
       providerRequestSignal: () => providerRequestSignal(fakeProcess.env),
+      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory,
       mkdir: (file: string, options: any) => mkdir(resolve(file), options),
       readFile: (file: string, options: any) => readFile(resolve(file), options),
       writeFile: (file: string, value: any, options: any) => writeFile(resolve(file), value, options),
@@ -495,6 +501,54 @@ function provider(candidate: DiscoveryOutput, overloaded = false) {
   });
 }
 describe("runner attribution normalization remains under trusted validation", () => {
+  it("sends compact exact evidence but validates against the untouched full local exchange", async () => {
+    const directory = root(); priority(directory);
+    const input = exchange();
+    const candidate = output(input); candidate.observations[0]!.evidence[0]!.evidence_ref = 'E1';
+    const fetch = provider(candidate);
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) return inventory();
+      if (args.includes("export")) return result(0, input);
+      if (args.includes("validate")) { expect(get(directory, `${BASE}-input.json`)).toEqual(input); return validate(directory, args); }
+      throw new Error("Unexpected subprocess");
+    };
+    expect((await run(directory, "run-next-priority-nemotron.mjs", ["--workspace", WORKSPACE], spawn, fetch)).code).toBe(0);
+    const sent = JSON.parse(fetch.mock.calls[0]![1].body).messages[1].content;
+    expect(sent).toContain('"evidence_ref":"E1"');
+    expect(sent).toContain(input.evidence[0]!.text);
+    expect(sent).not.toContain("resolution_observed_sha256");
+    expect(providerAudit(directory).attempts[0]).toMatchObject({ category: "content_received", http_status: 200 });
+  });
+  it("preserves safe provider failure receipts without echoed messages or credentials", async () => {
+    const directory = root(); priority(directory);
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("scripts/reconstruction-inventory.ts")) return inventory();
+      if (args.includes("export")) return result(0, exchange());
+      throw new Error("Unexpected persistence");
+    };
+    const fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: { message: "synthetic-secret credential" } }) });
+    expect((await run(directory, "run-next-priority-nemotron.mjs", ["--workspace", WORKSPACE], spawn, fetch)).code).toBe(7);
+    const saved = providerAudit(directory);
+    expect(saved.attempts).toHaveLength(2);
+    expect(saved.attempts.every((row: any) => row.category === "provider_auth")).toBe(true);
+    expect(JSON.stringify(saved)).not.toMatch(/synthetic-secret|synthetic-key/);
+  });
+  it("never repairs a length-truncated result into falsely completed historical discovery", async () => {
+    for (const script of ['run-next-priority-nemotron.mjs', 'run-oversized-chunk-nemotron.mjs']) {
+      const directory = root(); priority(directory);
+      if (script.includes('chunk')) oversized(directory, 1);
+      const spawn: Spawn = (_command, args) => {
+        if (args.includes('scripts/reconstruction-inventory.ts')) return inventory();
+        if (args.includes('export')) return result(0, exchange());
+        throw new Error('Truncated output must never validate or persist');
+      };
+      const fetch = async () => ({ ok: true, status: 200, json: async () => ({ model: MODEL,
+        choices: [{ finish_reason: 'length', message: { content: JSON.stringify(output()) } }] }) });
+      const args = script.includes('chunk') ? ['--run-dir', directory] : ['--workspace', WORKSPACE];
+      expect((await run(directory, script, args, spawn, fetch)).code).toBe(script.includes('chunk') ? 8 : 10);
+      expect(fs.existsSync(path.join(directory, script.includes('chunk') ? 'chunk-001-output.json' : `${BASE}-output.json`))).toBe(false);
+    }
+  });
   it("requires an explicit workspace instead of selecting the persistent proof workspace", async () => {
     const directory = root();
     const spawn = vi.fn(() => { throw new Error("Unexpected subprocess"); });

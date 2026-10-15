@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { providerRequestSignal } from "./reconstruction-provider.mjs";
+import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerRequestSignal } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -96,7 +96,7 @@ const systemPrompt = [
 
 const userPrompt =
   "Deeply digest this bounded conversation chunk and return the required discovery JSON:\n\n"
-  + JSON.stringify(exchange);
+  + JSON.stringify(modelDiscoveryExchange(exchange));
 
 let modelResult;
 
@@ -123,6 +123,10 @@ fs.writeFileSync(
 );
 console.log("MODEL USED:", modelResult.model);
 console.log("raw response saved:", rawPath);
+if (modelResult.data.choices?.[0]?.finish_reason === "length") {
+  console.error("STOP: truncated chunk output requires retry/splitting, not partial persistence.");
+  process.exit(8);
+}
 
 let output;
 let jsonRepaired = false;
@@ -190,6 +194,7 @@ for (const observation of output.observations ?? []) {
 }
 
 const normalizedStatements = new Map();
+output = restoreModelEvidenceRefs(output, exchange);
 
 for (const observation of output.observations ?? []) {
   const key =
@@ -339,6 +344,8 @@ async function callModel(model, system, user) {
           },
           body: JSON.stringify({
             model,
+            max_tokens: 32768,
+            reasoning: { enabled: false },
             messages: [
               { role: "system", content: system },
               { role: "user", content: user }

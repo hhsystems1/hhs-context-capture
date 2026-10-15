@@ -3,7 +3,7 @@ import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { jsonrepair } from "jsonrepair";
-import { providerRequestSignal } from "./reconstruction-provider.mjs";
+import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal } from "./reconstruction-provider.mjs";
 
 const ROOT = process.cwd();
 const PRIORITY_PATH = ".runtime/reconstruction/business-priority-index-v1.json";
@@ -124,6 +124,7 @@ const base = `priority-${safeRank}-${next.source_conversation_id}`;
 const exchangePath = path.join(RUNS_DIR, `${base}-input.json`);
 const outputPath = path.join(RUNS_DIR, `${base}-output.json`);
 const rawPath = path.join(RUNS_DIR, `${base}-openrouter-raw.json`);
+const providerAuditPath = path.join(RUNS_DIR, `${base}-${Date.now()}-${process.pid}-provider-attempts.json`);
 
 if (fs.existsSync(exchangePath) || fs.existsSync(outputPath) || fs.existsSync(rawPath)) {
   console.error("STOP: artifacts already exist for this priority conversation.");
@@ -336,6 +337,14 @@ const preferredModels = [
 ];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const providerAttempts = [];
+function recordProviderAttempt(model, attempt, outcome) {
+  providerAttempts.push({ model, attempt, at: new Date().toISOString(), ...outcome });
+  fs.writeFileSync(providerAuditPath, JSON.stringify({
+    schema_version: "hhs-provider-attempts/1", workspace: WORKSPACE,
+    source_conversation_id: next.source_conversation_id, attempts: providerAttempts
+  }, null, 2) + "\n");
+}
 
 async function callModel(model) {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -351,13 +360,15 @@ async function callModel(model) {
         },
         body: JSON.stringify({
           model,
+          max_tokens: 32768,
+          reasoning: { enabled: false },
           messages: [
             { role: "system", content: systemPrompt },
             {
               role: "user",
               content:
                 "Deeply digest this complete bounded HHS conversation evidence and return the required discovery JSON:\n\n" +
-                JSON.stringify(exchange)
+                JSON.stringify(modelDiscoveryExchange(exchange))
             }
           ],
           temperature: 0.2
@@ -369,6 +380,9 @@ async function callModel(model) {
 
       if (!response.ok || embeddedError) {
         const message = embeddedError?.message ?? `HTTP ${response.status}`;
+        recordProviderAttempt(model, attempt, { http_status: response.status,
+          ...(Number.isInteger(embeddedError?.code) ? { provider_error_code: embeddedError.code } : {}),
+          category: providerFailureCategory(embeddedError?.code ?? response.status, JSON.stringify(embeddedError ?? { message })) });
         console.log(`Model failed: ${message}`);
 
         const retryable =
@@ -394,6 +408,7 @@ async function callModel(model) {
       const content = data?.choices?.[0]?.message?.content;
 
       if (!content) {
+        recordProviderAttempt(model, attempt, { http_status: response.status, category: "empty_content" });
         return {
           ok: false,
           model,
@@ -401,8 +416,10 @@ async function callModel(model) {
         };
       }
 
+      recordProviderAttempt(model, attempt, { http_status: response.status, category: "content_received" });
       return { ok: true, model, data, content };
     } catch (error) {
+      recordProviderAttempt(model, attempt, { category: error.name === "TimeoutError" || error.name === "AbortError" ? "request_timeout" : "request_failed" });
       console.log(`Request error: ${error.message}`);
 
       if (attempt < 3) {
@@ -460,6 +477,10 @@ await writeFile(
 );
 
 console.log("raw response saved:", rawPath);
+if (apiResponse.choices?.[0]?.finish_reason === "length") {
+  console.error("STOP: truncated discovery is not complete historical coverage. Raw response preserved; no persistence.");
+  process.exit(10);
+}
 
 let output;
 let jsonRepaired = false;
@@ -528,6 +549,7 @@ for (const observation of output.observations ?? []) {
 const validObservationRefs = new Set(
   (output.observations ?? []).map((observation) => observation.observation_ref)
 );
+output = restoreModelEvidenceRefs(output, exchange);
 
 output.links = (output.links ?? []).filter((link) =>
   validObservationRefs.has(link.from_observation_ref) &&
