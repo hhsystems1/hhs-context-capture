@@ -117,10 +117,15 @@ for (const candidate of candidates) {
     const preparedChunks = fs.existsSync(path.join(OVERSIZED_RUNS, path.basename(base), "manifest.json"));
     if (fs.existsSync(base + "-input.json")) assertPreparedIdentity(candidate, base + "-input.json");
     const estimatedCharacters = candidate.estimated_input_tokens * 4 + (current?.evidence_block_count ?? 0) * 160;
-    const result = !replayable && (preparedChunks || !Number.isFinite(estimatedCharacters) || estimatedCharacters > SINGLE_RUN_CHARACTERS)
+    const chunked = !replayable && (preparedChunks || !Number.isFinite(estimatedCharacters) || estimatedCharacters > SINGLE_RUN_CHARACTERS);
+    receipt.current_source = { source_conversation_id: candidate.source_conversation_id, title: candidate.title,
+      priority_rank: priorityRank(candidate), mode: chunked ? 'chunks' : 'standard', stage: 'preparing' };
+    sourceStage('preparing');
+    const result = chunked
       ? processOversized(candidate, sourceStartedAt, inheritedDeadline)
       : processStandard(candidate);
     receipt.completed.push(result);
+    sourceStage('complete');
   } catch (error) {
     const item = {
       source_conversation_id: candidate.source_conversation_id,
@@ -152,6 +157,7 @@ if (receipt.quarantined.length > 0) {
 }
 
 function processStandard(candidate) {
+  sourceStage('generating');
   const rank = String(priorityRank(candidate)).padStart(4, "0");
   const base = `priority-${rank}-${candidate.source_conversation_id}`;
   const exchange = path.join(PRIORITY_RUNS, `${base}-input.json`);
@@ -321,6 +327,7 @@ function processOversized(candidate, sourceStartedAt, inheritedDeadline) {
   const oversizedBudget = Math.max(SOURCE_BUDGET_MS, Math.min(60 * 60 * 1000, (pendingChunks + 1) * chunkRequestBudget + 60000));
   if (!Number.isSafeInteger(oversizedBudget)) throw new Error("Invalid oversized source budget");
   process.env.HHS_RECONSTRUCTION_DEADLINE_AT = String(Math.min(sourceStartedAt + oversizedBudget, inheritedDeadline));
+  sourceStage('generating');
   if (!fs.existsSync(path.join(directory, "parent-output.json")) || !fs.existsSync(path.join(directory, "parent-model.json"))) {
     checked(process.execPath, [
       "scripts/run-oversized-orchestrator.mjs",
@@ -333,9 +340,17 @@ function processOversized(candidate, sourceStartedAt, inheritedDeadline) {
   const modelFile = path.join(directory, "parent-model.json");
   if (!fs.existsSync(modelFile)) throw new Error("oversized parent model receipt is missing");
   const model = read(modelFile).model;
+  sourceStage('saving');
   validate(exchange, output, model, OVERSIZED_VERSION);
   const persistedResult = persist(exchange, output, model, OVERSIZED_VERSION);
   return summary(candidate, "oversized", persistedResult);
+}
+
+function sourceStage(stage) {
+  if (!receipt.current_source) return;
+  receipt.current_source.stage = stage;
+  receipt.progress_updated_at = new Date().toISOString();
+  writeReceipt(receipt);
 }
 
 // Fail closed before using or regenerating a prepared exchange after a source refresh.
@@ -400,6 +415,7 @@ function validate(exchange, output, model, version) {
 }
 
 function persist(exchange, output, model, version) {
+  sourceStage('saving');
   const result = captured("npx", discoveryArgs("persist", exchange, output, model, version));
   process.stdout.write(result.stdout);
   return JSON.parse(result.stdout);

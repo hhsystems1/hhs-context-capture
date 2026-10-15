@@ -142,6 +142,25 @@ export function restoreModelEvidenceRefs(candidate, exchange) {
   }) };
 }
 
+// Relationships need the validated claims and attribution, not repeated storage
+// citations. The full observations remain unchanged in the final validated output.
+export function modelLinkingObservations(observations) {
+  const refs = linkingAliases(observations);
+  return observations.map(row => ({ observation_ref: refs.get(row.observation_ref), observation_kind: row.observation_kind,
+    statement: row.statement, payload: row.payload, attribution: row.attribution, confidence: row.confidence }));
+}
+export function restoreLinkingRefs(links, observations) {
+  const refs = new Map([...linkingAliases(observations)].map(([original, alias]) => [alias, original]));
+  return links.map(link => ({ ...link, from_observation_ref: refs.get(link.from_observation_ref) ?? link.from_observation_ref,
+    to_observation_ref: refs.get(link.to_observation_ref) ?? link.to_observation_ref }));
+}
+function linkingAliases(observations) {
+  const originals = new Set(observations.map(row => row.observation_ref));
+  let prefix = 'L';
+  while (observations.some((_, index) => originals.has(`${prefix}${index + 1}`))) prefix = '_' + prefix;
+  return new Map(observations.map((row, index) => [row.observation_ref, `${prefix}${index + 1}`]));
+}
+
 // Safe diagnostics only: never retain echoed provider messages/prompt text/keys.
 export function providerFailureCategory(status, message) {
   status = Number(status);

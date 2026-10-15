@@ -9,6 +9,8 @@ import { MissionControlStore } from "../../mission-control/src/store.js";
 import { assertLocalDatabaseUrl } from "./config.js";
 import { loadReconstructionInventory } from "./reconstruction-inventory.js";
 import { quarantineDetails } from "./reconstruction-diagnostics.js";
+import { reconstructionProgress } from './reconstruction-progress.js';
+import { readAuditStatus } from '../../../scripts/reconstruction-audit-status.mjs';
 
 export const LOOPBACK_HOST = "127.0.0.1";
 const ROOT = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -23,6 +25,8 @@ export interface OperationsDeps {
   status(workspace: string): Promise<{ memory: unknown; reconstruction: unknown }>;
   receipts(workspace: string): Record<string, unknown>[];
   diagnostics?(workspace: string, quarantined: unknown[]): unknown[];
+  progress?(workspace: string, operation: string, receipt: Record<string, unknown>): unknown;
+  audit?(workspace: string, operation: string): { phase: string } | undefined;
   operations(workspace: string): Operation[];
   save(operation: Operation): void;
   acquire(operation: Operation): void;
@@ -105,6 +109,7 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
     else if (receipt && ["completed", "partial", "failed"].includes(String(receipt.status))) state = String(receipt.status);
     else if (operation || receipt) state = "interrupted";
     const fields: Record<string, unknown> = {};
+    if (operation && deps.audit) fields.audit = deps.audit(workspace, operation.operation_id);
     if (receipt) {
       if (receipt.schema_version !== "hhs-reconstruction-batch/0.1.0") throw new Error("Unsupported batch receipt");
       for (const key of ["requested", "selected"]) {
@@ -114,6 +119,7 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       if (!Array.isArray(receipt.completed) || !Array.isArray(receipt.quarantined)) throw new Error("Invalid batch receipt");
       fields.completed_count = receipt.completed.length;
       fields.quarantined_count = receipt.quarantined.length;
+      if (operation && deps.progress) fields.progress = deps.progress(workspace, operation.operation_id, receipt);
       if (deps.diagnostics && receipt.quarantined.length) fields.quarantine_details = deps.diagnostics(workspace, receipt.quarantined);
       fields.prepared_artifact_review_required = receipt.quarantined.some(item => item && typeof item === "object" && typeof item.reason === "string" && (item.reason.includes("prepared_source_identity_mismatch") || item.reason.includes("Discovery exchange does not match current trusted database evidence")));
       for (const key of ["started_at", "finished_at"]) if (typeof receipt[key] === "string" && Number.isFinite(Date.parse(receipt[key]))) fields[key] = receipt[key];
@@ -155,6 +161,8 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       // Verify reporting is available before authorizing execution. Never infer zeros.
       const prior = await status(workspace);
       if (["running", "unknown", "interrupted"].includes(prior.state)) throw new OperationsError(409, "execution_active_or_unresolved");
+      const priorAudit = (prior as Record<string, unknown>).audit as { phase: string } | undefined;
+      if (priorAudit && ['pending', 'validating', 'coherence', 'failed', 'review_required'].includes(priorAudit.phase)) throw new OperationsError(409, 'audit_required');
       const operation: Operation = { workspace, operation_id: `operation_${randomUUID().replaceAll("-", "")}`, started_at: new Date().toISOString() };
       deps.acquire(operation); // atomic durable exclusion, including across service restarts
       deps.save(operation);
@@ -252,6 +260,8 @@ export async function startFromEnvironment(): Promise<http.Server> {
   const reader = createOperationsStatusReader(process.env.MEMORY_REPORT_DATABASE_URL!);
   const server = createContextOperationsService(config, {
     ...localExecutionDeps(ROOT), status: reader.status,
+    progress: (workspace, operation, receipt) => reconstructionProgress(ROOT, workspace, operation, receipt),
+    audit: (workspace, operation) => readAuditStatus(ROOT, workspace, operation),
     diagnostics: (workspace, quarantined) => quarantineDetails(ROOT, workspace, quarantined),
     launch: (executable, args, options) => {
       const env = { ...process.env };

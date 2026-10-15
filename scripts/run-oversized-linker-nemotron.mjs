@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { requestDiscoveryModel } from "./reconstruction-provider.mjs";
+import { requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -45,7 +45,7 @@ const validRefs = new Set(
 const existingAttempts = fs.readdirSync(runDirectory)
   .filter((name) =>
     name.startsWith("parent-link-attempt-")
-    && name.endsWith("-raw.json")
+    && /-(raw|error|output)\.json$/.test(name)
   )
   .map((name) => Number(name.split("-")[3]))
   .filter(Number.isFinite);
@@ -81,7 +81,7 @@ const userPrompt =
     source_conversation_id:
       parentExchange.selection[0].source_conversation_id,
     title: parentExchange.selection[0].title,
-    observations: merged.observations
+    observations: modelLinkingObservations(merged.observations)
   });
 
 let result;
@@ -92,6 +92,7 @@ for (const model of MODELS) {
 }
 
 if (!result?.ok) {
+  fs.writeFileSync(attemptBase + '-error.json', JSON.stringify(result?.error ?? { category: 'provider_error' }, null, 2) + '\n', { flag: 'wx' });
   console.error("STOP: all linker models failed.");
   process.exit(7);
 }
@@ -103,6 +104,10 @@ fs.writeFileSync(
 );
 console.log("MODEL USED:", result.model);
 console.log("raw response saved:", rawPath);
+if (result.data.choices?.[0]?.finish_reason === 'length') {
+  console.error('STOP: truncated relationships cannot be accepted as complete.');
+  process.exit(8);
+}
 
 let candidate;
 try {
@@ -127,7 +132,7 @@ try {
 }
 
 const suppliedLinks = Array.isArray(candidate.links)
-  ? candidate.links
+  ? restoreLinkingRefs(candidate.links, merged.observations)
   : [];
 const seen = new Set();
 const links = [];
@@ -246,7 +251,8 @@ console.log("links:", finalOutput.links.length);
 console.log("DATABASE WRITES: NONE");
 
 async function callModel(model, system, user) {
-  return requestDiscoveryModel(model, system, user, { env: process.env, fetch, maxTokens: 16384 });
+  return requestDiscoveryModel(model, system, user, { env: { ...process.env,
+    HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS: process.env.HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS ?? '360000' }, fetch, maxTokens: 16384 });
 }
 
 function flag(name) {

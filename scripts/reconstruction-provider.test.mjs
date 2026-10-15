@@ -1,8 +1,20 @@
 import { describe, it, expect } from "vitest";
-import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel } from "./reconstruction-provider.mjs";
+import { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs } from "./reconstruction-provider.mjs";
 import { setTimeout, clearTimeout } from "node:timers";
 
 describe("bounded reconstruction requests", () => {
+  it('projects relationship inputs without changing observations or guessing unknown references', () => {
+    const rows = [{ observation_ref: 'L1', statement: 'A proposal', attribution: { subject: 'assistant', claim_type: 'proposal' }, evidence: [{ evidence_ref: 'private-long-storage-ref' }], payload: { detail: 'preserve' } },
+      { observation_ref: 'chunk2__obs', statement: 'A revision', attribution: { subject: 'user', claim_type: 'revision' }, payload: {} }];
+    const before = JSON.stringify(rows);
+    const projected = modelLinkingObservations(rows);
+    expect(projected.map(row => row.observation_ref)).toEqual(['_L1', '_L2']);
+    expect(projected[0]).toMatchObject({ statement: rows[0].statement, attribution: rows[0].attribution, payload: rows[0].payload });
+    expect(JSON.stringify(projected)).not.toContain('private-long-storage-ref');
+    expect(restoreLinkingRefs([{ from_observation_ref: '_L1', to_observation_ref: '_L2' }, { from_observation_ref: '_L999', to_observation_ref: '_L2' }], rows))
+      .toEqual([{ from_observation_ref: 'L1', to_observation_ref: 'chunk2__obs' }, { from_observation_ref: '_L999', to_observation_ref: 'chunk2__obs' }]);
+    expect(JSON.stringify(rows)).toBe(before);
+  });
   const stream = lines => {
     const bytes = new globalThis.TextEncoder().encode(lines.join('\r\n') + '\r\n');
     return new globalThis.Response(new globalThis.ReadableStream({ start(controller) {

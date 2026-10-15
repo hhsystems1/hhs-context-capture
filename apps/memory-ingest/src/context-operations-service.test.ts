@@ -67,6 +67,18 @@ function putReceipt(root: string, op: string | undefined, state: string, extra =
   fs.writeFileSync(path.join(directory, `batch-${op ?? "cli"}.json`), JSON.stringify({ schema_version: "hhs-reconstruction-batch/0.1.0", workspace: W, operation_id: op, started_at: "2026-01-01T00:00:00.000Z", status: state, requested: 10, selected: 2, completed: [{}], quarantined: state === "completed" ? [] : [{ reason: "prepared_source_identity_mismatch secret" }], provider: TOKEN, ...extra }));
 }
 describe("Context Operations boundary", () => {
+  it('exposes scoped audit status and refuses continuation until its checks pass', async () => {
+    const { server, root, deps, child } = setup();
+    const accepted = await request(server, 'start');
+    putReceipt(root, accepted.body.operation_id, 'completed'); child.emit('close', 0);
+    deps.audit = vi.fn(() => ({ phase: 'coherence' }));
+    expect((await request(server, 'status')).body.audit.phase).toBe('coherence');
+    expect((await request(server, 'resume')).body.error).toBe('audit_required');
+    expect(deps.launch).toHaveBeenCalledTimes(1);
+    deps.audit = vi.fn(() => ({ phase: 'passed' }));
+    expect((await request(server, 'resume')).code).toBe(202);
+    expect(deps.launch).toHaveBeenCalledTimes(2);
+  });
   it("requires separate hashed named tokens and existing non-admin loopback roles", () => {
     expect(config.port).toBe(54433); expect(JSON.stringify(config)).not.toContain(TOKEN);
     for (const key of ["MEMORY_DATABASE_URL", "MEMORY_REVIEW_DATABASE_URL", "MEMORY_QUERY_SERVICE_TOKENS", "MEMORY_PROVISIONING_SERVICE_TOKENS"]) expect(() => loadOperationsConfig({ ...env, [key]: "secret" })).toThrow();
