@@ -598,8 +598,11 @@ export async function validateAndPersistDiscovery(
 
 function claimsUserAuthority(item: DiscoveryObservationOutput): boolean {
   const protectedClaim = /decision|requirement|preference|instruction|commitment|directive/i;
-  const statementClaimsUser = /\b(user|stephen|operator)\b.{0,80}\b(decid|requir|prefer|instruct|commit|directive)/i.test(item.statement)
-    || /\b(decid|requir|prefer|instruct|commit|directive)\w*\b.{0,80}\b(user|stephen|operator)\b/i.test(item.statement);
+  // A billing unit such as $25/user/month names a seat, not the person whose
+  // decisions require user-authored evidence. Keep the original statement intact.
+  const statement = item.statement.replace(/\/user\b/gi, "/seat");
+  const statementClaimsUser = /\b(user|stephen|operator)\b.{0,80}\b(decid|requir|prefer|instruct|commit|directive)/i.test(statement)
+    || /\b(decid|requir|prefer|instruct|commit|directive)\w*\b.{0,80}\b(user|stephen|operator)\b/i.test(statement);
   if (statementClaimsUser) return true;
   return item.attribution?.subject === "user"
     && (protectedClaim.test(item.attribution.claim_type) || protectedClaim.test(item.observation_kind));

@@ -23,6 +23,12 @@ describe('operation-scoped audit visibility', () => {
       expect(readAuditStatus(root, 'workspace_a', 'operation_' + 'b'.repeat(32))).toBeUndefined();
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
+  it('never advertises automatic continuation for an explicitly single-batch session', () => {
+    const operation = 'operation_' + 'a'.repeat(32);
+    for (const status of ['waiting_for_batch', 'auditing', 'launching_next_batch']) {
+      expect(auditStatusFromSession('workspace_a', operation, { status, single_batch: true }).continuation).toBe('paused');
+    }
+  });
   it('keeps active, blocked and failed review distinct from approval', () => {
     const operation = 'operation_' + 'a'.repeat(32);
     expect(auditStatusFromSession('workspace_a', operation, { status: 'auditing', current_stage: 'coherence_review' }).phase).toBe('coherence');

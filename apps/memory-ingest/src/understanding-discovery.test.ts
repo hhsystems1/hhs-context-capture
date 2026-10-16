@@ -166,6 +166,38 @@ describe("provider-neutral discovery validation", () => {
     expect(result.issues.some((issue) => issue.problem.includes("requires user-authored evidence"))).toBe(true);
   });
 
+  it("retains assistant pricing with a per-user billing unit without inventing user authority", () => {
+    const statement = "Business seats cost $25/user/month, requiring a two-seat minimum.";
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({
+      observation_kind: "pricing_detail", statement,
+      attribution: { subject: "assistant", claim_type: "pricing_information" },
+      evidence: [{ evidence_ref: "ev-assistant" }]
+    })]), TRUSTED_MODEL);
+    expect(result.issues).toEqual([]);
+    expect(result.valid?.observations[0]?.statement).toBe(statement);
+  });
+
+  it.each([
+    "Stephen decided to buy seats at $25/user/month.",
+    "The user requires a plan at $25/user/month.",
+    "The operator instructed the team to buy $25/user/month seats."
+  ])("still rejects explicit user authority beside a billing unit: %s", statement => {
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({
+      observation_kind: "pricing_detail", statement,
+      attribution: { subject: "assistant", claim_type: "pricing_information" },
+      evidence: [{ evidence_ref: "ev-assistant" }]
+    })]), TRUSTED_MODEL);
+    expect(result.issues.some(issue => issue.problem.includes("requires user-authored evidence"))).toBe(true);
+  });
+
+  it("still requires user evidence for a user-attributed purchase commitment", () => {
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({
+      observation_kind: "commitment", statement: "Buy seats at $25/user/month.",
+      attribution: { subject: "user", claim_type: "commitment" }, evidence: [{ evidence_ref: "ev-assistant" }]
+    })]), TRUSTED_MODEL);
+    expect(result.issues.some(issue => issue.problem.includes("requires user-authored evidence"))).toBe(true);
+  });
+
   it("does not mistake Product Direction for a user directive", () => {
     const result = validateDiscoveryOutput(EXCHANGE, output([observation({
       observation_kind: "team_structure",

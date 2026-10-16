@@ -207,7 +207,33 @@ function validate(exchange, output, model = MODEL, version = VERSION) {
 function resumeValidatedOutput(directory, prefix, input) {
   const output = path.join(directory, `${prefix}-output.json`);
   const modelFile = path.join(directory, `${prefix}-model.json`);
-  if (!fs.existsSync(output) && !fs.existsSync(modelFile)) return false;
+  if (!fs.existsSync(output) && !fs.existsSync(modelFile)) {
+    // Revalidate exact preserved chunk attempts after a validator repair before
+    // spending another attempt or splitting. Parent linker policy is separate.
+    if (prefix === "parent") return false;
+    const pattern = new RegExp("^" + prefix + "-attempt-(\\d+)-openrouter-raw\\.json$");
+    for (const name of fs.readdirSync(directory).sort().reverse()) {
+      const match = name.match(pattern);
+      if (!match) continue;
+      const attempted = path.join(directory, prefix + "-attempt-" + match[1] + "-output.json");
+      if (!fs.existsSync(attempted)) continue;
+      const raw = read(path.join(directory, name));
+      if (typeof raw.model !== "string" || !raw.model.trim()) continue;
+      if (raw.error || raw.choices?.[0]?.finish_reason === "length" || raw.usage?.cost > 0) continue;
+      const version = "hhs-oversized-nemotron-runner/0.1.0";
+      const checked = run("npx", ["tsx", "--env-file=.env.memory-v1.local",
+        "scripts/understanding-discovery.ts", "validate", "--workspace", WORKSPACE,
+        "--exchange", input, "--output", attempted, "--provider", PROVIDER,
+        "--model", raw.model, "--runner-version", version]);
+      if (checked.status !== 0) continue;
+      writeIfMissing(modelFile, { provider: PROVIDER, model: raw.model, runner_version: version,
+        attempt: Number(match[1]), validated: true, recovered_from_attempt: true,
+        ...(typeof raw.json_repaired === "boolean" ? { json_repaired: raw.json_repaired } : {}) });
+      copy(attempted, output);
+      return true;
+    }
+    return false;
+  }
   let receipt;
   let source = output;
   if (fs.existsSync(modelFile)) {

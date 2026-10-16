@@ -527,6 +527,62 @@ describe("existing oversized runner continuation", () => {
     expect(links).toBe(1);
   });
 
+  it("revalidates a preserved rejected attempt after a validator repair without regeneration or overwrites", async () => {
+    const directory = root(); oversized(directory, 1);
+    const input = get(directory, "chunk-001-input.json");
+    const candidate = output(input);
+    candidate.observations[0]!.statement = "Business seats require two seats at $25/user/month.";
+    candidate.observations[0]!.observation_kind = "pricing_detail";
+    put(directory, "chunk-001-attempt-003-output.json", candidate);
+    put(directory, "chunk-001-attempt-003-openrouter-raw.json", { model: MODEL, json_repaired: false });
+    const original = fs.readFileSync(path.join(directory, "chunk-001-attempt-003-output.json"), "utf8");
+    let links = 0;
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("validate")) return validate(directory, args);
+      if (args.includes("scripts/run-oversized-linker-nemotron.mjs")) { links++; completeParent(directory); return result(); }
+      throw new Error("Must not regenerate or split the recovered chunk");
+    };
+    await run(directory, "run-oversized-orchestrator.mjs", orchestratorArgs(directory), spawn);
+    expect(get(directory, "chunk-001-model.json")).toMatchObject({ attempt: 3, recovered_from_attempt: true, validated: true, json_repaired: false });
+    expect(fs.readFileSync(path.join(directory, "chunk-001-attempt-003-output.json"), "utf8")).toBe(original);
+    await run(directory, "run-oversized-orchestrator.mjs", orchestratorArgs(directory), spawn);
+    expect(links).toBe(1);
+  });
+
+  it.each([
+    { choices: [{ finish_reason: "length" }] },
+    { usage: { cost: 1 } },
+    { error: { code: 503 } }
+  ])("does not recover truncated, paid or provider-error attempts: %j", async raw => {
+    const directory = root(); oversized(directory, 1);
+    for (let n = 1; n <= 3; n++) {
+      put(directory, "chunk-001-attempt-00" + n + "-output.json", output(get(directory, "chunk-001-input.json")));
+      put(directory, "chunk-001-attempt-00" + n + "-openrouter-raw.json", { model: MODEL, ...raw });
+    }
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("export-chunks")) return result(0, { chunks: [exchange()] });
+      throw new Error("Must not validate or publish a failed provider result");
+    };
+    await expect(run(directory, "run-oversized-orchestrator.mjs", orchestratorArgs(directory), spawn)).rejects.toThrow(/unsplittable/);
+    expect(fs.existsSync(path.join(directory, "chunk-001-model.json"))).toBe(false);
+  });
+
+  it("does not recover a preserved attempt that still invents user authority", async () => {
+    const directory = root(); oversized(directory, 1);
+    for (let n = 1; n <= 3; n++) {
+      put(directory, `chunk-001-attempt-00${n}-output.json`, output(get(directory, "chunk-001-input.json"), true));
+      put(directory, `chunk-001-attempt-00${n}-openrouter-raw.json`, { model: MODEL });
+    }
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("validate")) return validate(directory, args);
+      if (args.includes("export-chunks")) return result(0, { chunks: [exchange()] });
+      throw new Error("Rejected attempts must not regenerate after the exhausted budget");
+    };
+    await expect(run(directory, "run-oversized-orchestrator.mjs", orchestratorArgs(directory), spawn)).rejects.toThrow(/unsplittable/);
+    expect(fs.existsSync(path.join(directory, "chunk-001-output.json"))).toBe(false);
+    expect(fs.existsSync(path.join(directory, "chunk-001-model.json"))).toBe(false);
+  });
+
   it("bounds retries even without raw artifacts and refuses unsplittable failed work", async () => {
     const directory = root(); oversized(directory, 1); let attempts = 0;
     const spawn: Spawn = (_command, args) => {
