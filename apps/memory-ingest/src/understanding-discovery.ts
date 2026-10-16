@@ -627,9 +627,27 @@ export async function validateAndPersistDiscovery(
 
 function claimsUserAuthority(item: DiscoveryObservationOutput): boolean {
   const protectedClaim = /decision|requirement|preference|instruction|commitment|directive/i;
-  // A billing unit such as $25/user/month names a seat, not the person whose
-  // decisions require user-authored evidence. Keep the original statement intact.
-  const statement = item.statement.replace(/\/user\b/gi, "/seat");
+  // Match on a local copy only; original statements/evidence stay immutable.
+  let statement = item.statement.replace(/\/user\b/gi, "/seat");
+  // Explicit ownership is protected even under a conflicting assistant label.
+  if (/\b(?:user|stephen(?:\s+curry)?|operator)(?:['’]s)?\s+(?:decision|requirement|preference|instruction|commitment|directive)s?\b/i.test(statement)
+    || /\b(?:decision|requirement|preference|instruction|commitment|directive)s?\s+(?:made\s+)?(?:by|from|of)\s+(?:the\s+)?(?:user|stephen|operator)\b/i.test(statement)) return true;
+  // A shared commitment still claims human authority, even if the assistant leads.
+  if (/\bcommits\b[^.!?;]{0,80}\b(?:with|alongside)\s+(?:the\s+)?(?:user|stephen|operator)\b/i.test(statement)) return true;
+  if (item.attribution?.subject === "assistant") {
+    // An assistant's own commitment is historical assistant behavior, not user
+    // authority. Mask only that verb, then run the unchanged user-claim checks.
+    statement = statement.replace(/^((?:the\s+)?assistant\s+)commits\b/i, "$1plans");
+    statement = statement.replace(
+      /^((?:the\s+)?assistant\s+(?:acknowledges|admits|recognizes)\s+\w+ing\b[^.!?;]*?,\s+and\s+)commits\b/i,
+      (match, prefix: string) => {
+        // The observed self-correction mentions user frustration as an effect.
+        // Any other named actor makes the coordinated subject unresolved.
+        const actors = prefix.replace(/\buser frustration\b/gi, "frustration");
+        return /\b(user|stephen|operator)\b/i.test(actors) ? match : prefix + "plans";
+      }
+    );
+  }
   const statementClaimsUser = /\b(user|stephen|operator)\b.{0,80}\b(decid|requir|prefer|instruct|commit|directive)/i.test(statement)
     || /\b(decid|requir|prefer|instruct|commit|directive)\w*\b.{0,80}\b(user|stephen|operator)\b/i.test(statement);
   if (statementClaimsUser) return true;
