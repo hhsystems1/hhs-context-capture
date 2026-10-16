@@ -464,6 +464,42 @@ function completeParent(directory: string): void {
 function orchestratorArgs(directory: string): string[] { return ["--run-dir", directory, "--workspace", WORKSPACE]; }
 
 describe("existing oversized runner continuation", () => {
+  it("subdivides a truncated chunk immediately, preserves its attempt and replays the merged result", async () => {
+    const directory = root(); oversized(directory, 1);
+    const left = exchange("left"), right = exchange("right"), combined = exchange("combined");
+    combined.evidence = [...left.evidence, ...right.evidence]; combined.evidence_sha256 = sha256(combined.evidence);
+    put(directory, "chunk-001-input.json", combined); put(directory, "parent-input.json", combined);
+    let chunkCalls = 0, exports = 0, links = 0;
+    const raw = { model: MODEL, choices: [{ finish_reason: "length" }] };
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes("validate")) return validate(directory, args);
+      if (args.includes("scripts/run-oversized-chunk-nemotron.mjs")) {
+        chunkCalls++;
+        const runDir = argument(args, "run-dir");
+        if (runDir === directory) {
+          put(directory, "chunk-001-attempt-001-openrouter-raw.json", raw);
+          put(directory, "chunk-001-attempt-001-error.json", { category: "model_output_truncated" });
+          return result(11);
+        }
+        const number = fs.existsSync(path.join(runDir,"chunk-001-output.json")) ? "002" : "001";
+        completeChunk(runDir,number); return result();
+      }
+      if (args.includes("export-chunks")) {
+        exports++; expect(args).toContain("--subdivide-messages");
+        return result(0,{parent_exchange:combined,chunks:[left,right].map((child,index)=>({
+          chunk_number:index+1,chunk_count:2,exchange:child,evidence_characters:1000,exceeds_target:false}))});
+      }
+      if (args.includes("scripts/run-oversized-linker-nemotron.mjs")) { links++; completeParent(directory);return result(); }
+      throw new Error("Unexpected work");
+    };
+    await run(directory,"run-oversized-orchestrator.mjs",orchestratorArgs(directory),spawn);
+    expect(chunkCalls).toBe(3); expect(exports).toBe(1);
+    expect(get(directory,"chunk-001-attempt-001-openrouter-raw.json")).toEqual(raw);
+    expect(get(directory,"parent-output.json").observations).toHaveLength(2);
+    await run(directory,"run-oversized-orchestrator.mjs",orchestratorArgs(directory),spawn);
+    expect(chunkCalls).toBe(3);expect(links).toBe(1);
+  });
+
   it("retains legacy linker attempts but counts every current-policy request, including torn requests, against resume", async () => {
     const directory = root(); oversized(directory, 1); completeChunk(directory, '001');
     for (let index = 1; index <= 3; index++) put(directory, `parent-link-attempt-00${index}-raw.json`, { model: MODEL });
@@ -682,7 +718,7 @@ describe("runner attribution normalization remains under trusted validation", ()
       const fetch = async () => ({ ok: true, status: 200, json: async () => ({ model: MODEL,
         choices: [{ finish_reason: 'length', message: { content: JSON.stringify(output()) } }] }) });
       const args = script.includes('chunk') ? ['--run-dir', directory] : ['--workspace', WORKSPACE];
-      expect((await run(directory, script, args, spawn, fetch)).code).toBe(script.includes('chunk') ? 8 : 10);
+      expect((await run(directory, script, args, spawn, fetch)).code).toBe(script.includes('chunk') ? 11 : 10);
       expect(fs.existsSync(path.join(directory, script.includes('chunk') ? 'chunk-001-output.json' : `${BASE}-output.json`))).toBe(false);
     }
   });
@@ -955,4 +991,32 @@ describe("Context Operations runner correlation and source refresh", () => {
     expect(batchReceipt(directory).quarantined[0].reason).toContain("prepared_source_identity_mismatch");
     expect(fs.readFileSync(path.join(directory, inputFile), "utf8")).toBe(before);
   });
+});
+
+
+describe("operation-specific oversized failure categories", () => {
+  it.each(["request_timeout", "source_deadline", "incomplete_response"])("preserves %s without relabeling it as evidence validation", async category => {
+    const directory = root(); oversized(directory, 1);
+    const operation = "operation_" + "c".repeat(32);
+    const spawn: Spawn = (_command, args) => {
+      expect(args).toContain("scripts/run-oversized-chunk-nemotron.mjs");
+      put(directory, "chunk-001-attempt-001-error.json", { category });
+      return result(7);
+    };
+    await expect(run(directory, "run-oversized-orchestrator.mjs", [...orchestratorArgs(directory), "--operation-id", operation], spawn)).rejects.toThrow(/exit 7/);
+    expect(get(directory, "failure-" + operation + ".json")).toMatchObject({
+      workspace: WORKSPACE, operation_id: operation, source_conversation_id: SOURCE,
+      failure_code: category === "incomplete_response" ? "reconstruction_failed" : category
+    });
+    expect(fs.existsSync(path.join(directory, "chunk-001-output.json"))).toBe(false);
+  });
+});
+
+
+it("reports a rejected cached output as current evidence validation, not an older failure", async () => {
+  const directory = root(); oversized(directory, 1); completeChunk(directory, "001");
+  const operation = "operation_" + "d".repeat(32);
+  const spawn: Spawn = (_command, args) => { expect(args).toContain("validate"); return result(1); };
+  await expect(run(directory, "run-oversized-orchestrator.mjs", [...orchestratorArgs(directory), "--operation-id", operation], spawn)).rejects.toThrow(/Validation failed/);
+  expect(get(directory, "failure-" + operation + ".json").failure_code).toBe("evidence_validation");
 });

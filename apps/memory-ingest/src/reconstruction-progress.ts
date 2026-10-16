@@ -36,11 +36,7 @@ export function reconstructionProgress(root: string, workspace: string, operatio
           if (model.validated === true) chunksValidated++;
         }
       }
-      for (const name of fs.readdirSync(directory)) {
-        if (/^(?:chunk-\d+-(?:model|output|attempt-\d+-(?:error|output|openrouter-raw))|parent-(?:output|model|link-attempt-\d+-(?:raw|output|error)))\.json$/.test(name)) {
-          lastActivity = Math.max(lastActivity, fs.statSync(path.join(directory, name)).mtimeMs);
-        }
-      }
+      lastActivity = Math.max(lastActivity, oversizedActivity(directory, source.source_conversation_id));
       if (stage === 'generating' && chunksTotal !== undefined && chunksTotal > 0 && chunksValidated === chunksTotal) stage = 'linking';
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || source.stage !== 'preparing') throw error;
@@ -55,4 +51,22 @@ export function reconstructionProgress(root: string, workspace: string, operatio
   return { source_conversation_id: source.source_conversation_id, title: source.title.slice(0, 160), mode: source.mode, stage,
     ...(chunksTotal === undefined ? {} : { chunks_total: chunksTotal, chunks_validated: chunksValidated }),
     last_activity_at: new Date(lastActivity).toISOString(), activity: Date.now() - lastActivity > 6 * 60 * 1000 ? 'quiet' : 'recent' };
+}
+
+// Nested subchunks are processing views of this same source, not additional root
+// chunks or analyzed conversations. Read only activity metadata; never follow links.
+function oversizedActivity(directory: string, source: string, depth = 0): number {
+  let latest = 0;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const file = path.join(directory, entry.name);
+    if (entry.isFile() && /^(?:chunk-\d+-(?:model|output|attempt-\d+-(?:error|output|openrouter-raw))|parent-(?:output|model|link-attempt-\d+-(?:raw|output|error)))\.json$/.test(entry.name)) {
+      latest = Math.max(latest, fs.statSync(file).mtimeMs);
+    } else if (entry.isDirectory() && depth < 3 && /^chunk-\d+-subrun$/.test(entry.name)) {
+      const manifest = path.join(file, 'manifest.json');
+      if (fs.existsSync(manifest) && JSON.parse(fs.readFileSync(manifest, 'utf8')).source_conversation_id === source) {
+        latest = Math.max(latest, oversizedActivity(file, source, depth + 1));
+      }
+    }
+  }
+  return latest;
 }

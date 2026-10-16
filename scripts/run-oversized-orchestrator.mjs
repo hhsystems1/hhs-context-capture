@@ -10,6 +10,9 @@ const MAX_ATTEMPTS = Number(flag("max-attempts") ?? 3);
 const MAX_DEPTH = Number(flag("max-depth") ?? 3);
 const MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const PROVIDER = "openrouter";
+const OPERATION_ID = flag("operation-id");
+if (OPERATION_ID && !/^operation_[0-9a-f]{32}$/.test(OPERATION_ID)) throw new Error("Invalid operation identity");
+let stopCategory = "reconstruction_failed";
 const VERSION = "hhs-oversized-orchestrator/0.1.0";
 
 if (!WORKSPACE) throw new Error("--workspace or MEMORY_WORKSPACE_ID is required.");
@@ -18,13 +21,26 @@ if (!Number.isInteger(MAX_ATTEMPTS) || MAX_ATTEMPTS < 1) throw new Error("Invali
 if (!Number.isInteger(MAX_DEPTH) || MAX_DEPTH < 1) throw new Error("Invalid --max-depth.");
 
 console.log("=== RESUMABLE OVERSIZED RECONSTRUCTION ===");
-processRun(RUN_DIR, 0);
-finalize(RUN_DIR);
+try {
+  processRun(RUN_DIR, 0);
+  stopCategory = "reconstruction_failed";
+  finalize(RUN_DIR);
+} catch (error) {
+  if (OPERATION_ID) {
+    const source = read(path.join(RUN_DIR, "manifest.json")).source_conversation_id;
+    writeIfMissing(path.join(RUN_DIR, "failure-" + OPERATION_ID + ".json"), {
+      workspace: WORKSPACE, operation_id: OPERATION_ID, source_conversation_id: source,
+      failure_code: stopCategory, recorded_at: new Date().toISOString()
+    });
+  }
+  throw error;
+}
 console.log("DATABASE WRITES: NONE");
 
 function processRun(directory, depth) {
   const manifest = read(path.join(directory, "manifest.json"));
   for (const chunk of manifest.chunks) {
+    stopCategory = "reconstruction_failed";
     const number = pad(chunk.chunk_number);
     const output = path.join(directory, `chunk-${number}-output.json`);
     if (resumeValidatedOutput(directory, `chunk-${number}`, path.join(directory, chunk.input_file))) {
@@ -41,6 +57,8 @@ function processRun(directory, depth) {
         "scripts/run-oversized-chunk-nemotron.mjs", "--run-dir", directory
       ]);
       if (result.status === 0 && resumeValidatedOutput(directory, `chunk-${number}`, path.join(directory, chunk.input_file))) break;
+      stopCategory = chunkFailureCategory(directory, number);
+      if (result.status === 11) break; // truncation requests immediate evidence-preserving subdivision
       if (![8, 9].includes(result.status)) {
         throw new Error(`Chunk ${number} stopped with exit ${result.status}; review required.`);
       }
@@ -60,11 +78,28 @@ function processRun(directory, depth) {
 
     if (resumeValidatedOutput(directory, `chunk-${number}`, path.join(directory, chunk.input_file))) continue;
 
+    stopCategory = chunkFailureCategory(directory, number);
     if (depth >= MAX_DEPTH) throw new Error(`Chunk ${number} reached split-depth limit.`);
     const subrun = prepareSubrun(directory, chunk, depth + 1);
     processRun(subrun, depth + 1);
+    stopCategory = "reconstruction_failed";
     merge(directory, chunk, subrun);
   }
+}
+
+function chunkFailureCategory(directory, number) {
+  const pattern = new RegExp("^chunk-" + number + "-attempt-(\\d+)-(?:openrouter-raw|output|error)\\.json$");
+  const ids = fs.readdirSync(directory).map(name => name.match(pattern)?.[1]).filter(Boolean).map(Number);
+  const latest = Math.max(0, ...ids);
+  const base = path.join(directory, "chunk-" + number + "-attempt-" + pad(latest));
+  if (fs.existsSync(base + "-openrouter-raw.json") && read(base + "-openrouter-raw.json").choices?.[0]?.finish_reason === "length") return "model_output_truncated";
+  if (fs.existsSync(base + "-error.json")) {
+    const error = read(base + "-error.json");
+    if (["model_output_truncated", "malformed_model_json", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable"].includes(error.category)) return error.category;
+    if (error.message === "Model response could not be repaired as JSON.") return "malformed_model_json";
+    return "reconstruction_failed"; // An unrecognized provider/runtime error is not evidence validation.
+  }
+  return fs.existsSync(base + "-output.json") ? "evidence_validation" : "reconstruction_failed";
 }
 
 function prepareSubrun(directory, chunk, depth) {
@@ -72,16 +107,16 @@ function prepareSubrun(directory, chunk, depth) {
   const subrun = path.join(directory, `chunk-${number}-subrun`);
   if (fs.existsSync(path.join(subrun, "manifest.json"))) return subrun;
   const input = path.join(directory, chunk.input_file);
-  const target = Math.max(12000, Math.floor(chunk.evidence_characters / 2));
+  const target = Math.max(1024, Math.floor(chunk.evidence_characters / 2));
   const result = capture("npx", [
     "tsx", "--env-file=.env.memory-v1.local",
     "scripts/understanding-discovery.ts", "export-chunks",
     "--workspace", WORKSPACE, "--exchange", input,
-    "--max-evidence-characters", String(target)
+    "--max-evidence-characters", String(target), "--subdivide-messages"
   ]);
   const bundle = JSON.parse(result.stdout);
   if (bundle.chunks.length < 2) {
-    throw new Error(`Chunk ${number} is one unsplittable message; quarantined.`);
+    throw new Error(`Chunk ${number} is one unsplittable evidence view; quarantined.`);
   }
   fs.mkdirSync(subrun, { recursive: true });
   write(path.join(subrun, "parent-input.json"), bundle.parent_exchange);
@@ -199,7 +234,10 @@ function validate(exchange, output, model = MODEL, version = VERSION) {
     "--provider", PROVIDER, "--model", model,
     "--runner-version", version
   ]);
-  if (result.status !== 0) throw new Error(`Validation failed: ${output}`);
+  if (result.status !== 0) {
+    stopCategory = "evidence_validation";
+    throw new Error(`Validation failed: ${output}`);
+  }
 }
 
 // Revalidate cached artifacts before skipping. Recover a torn publication only

@@ -26,3 +26,25 @@ it('reads scoped cached-chunk progress without exposing source text or file path
     expect(reconstructionProgress(root, 'workspace_a', 'operation_a', { workspace: 'workspace_a', operation_id: 'operation_a' })).toBeUndefined();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+
+it('uses nested same-source activity without inflating root-chunk completion', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reconstruction-progress-'));
+  try {
+    const old = new Date(Date.now() - 20 * 60 * 1000);
+    const receipt = { workspace: 'w', operation_id: 'o', progress_updated_at: old.toISOString(),
+      current_source: { source_conversation_id: 'source', title: 'Sample', priority_rank: 1, mode: 'chunks', stage: 'generating' } };
+    const directory = path.join(root, '.runtime/reconstruction/oversized-runs/priority-0001-source');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'manifest.json'), JSON.stringify({ source_conversation_id: 'source', chunk_count: 1, chunks: [{ chunk_number: 1 }] }));
+    expect(reconstructionProgress(root, 'w', 'o', receipt)?.activity).toBe('quiet');
+    const child = path.join(directory, 'chunk-001-subrun'); fs.mkdirSync(child);
+    fs.writeFileSync(path.join(child, 'manifest.json'), JSON.stringify({ source_conversation_id: 'source' }));
+    const model = path.join(child, 'chunk-001-model.json'); fs.writeFileSync(model, '{"validated":true}');
+    const nested = reconstructionProgress(root, 'w', 'o', receipt);
+    expect(nested).toMatchObject({ activity: 'recent', chunks_total: 1, chunks_validated: 0 });
+    expect(Date.parse(nested!.last_activity_at)).toBe(Math.floor(fs.statSync(model).mtimeMs));
+    fs.writeFileSync(path.join(child, 'manifest.json'), JSON.stringify({ source_conversation_id: 'unrelated' }));
+    expect(reconstructionProgress(root, 'w', 'o', receipt)?.activity).toBe('quiet');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

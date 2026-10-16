@@ -24,7 +24,7 @@ export interface Operation { operation_id: string; workspace: string; started_at
 export interface OperationsDeps {
   status(workspace: string): Promise<{ memory: unknown; reconstruction: unknown }>;
   receipts(workspace: string): Record<string, unknown>[];
-  diagnostics?(workspace: string, quarantined: unknown[]): unknown[];
+  diagnostics?(workspace: string, quarantined: unknown[], operation?: string): unknown[];
   progress?(workspace: string, operation: string, receipt: Record<string, unknown>): unknown;
   audit?(workspace: string, operation: string): { phase: string } | undefined;
   operations(workspace: string): Operation[];
@@ -120,7 +120,7 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       fields.completed_count = receipt.completed.length;
       fields.quarantined_count = receipt.quarantined.length;
       if (operation && deps.progress) fields.progress = deps.progress(workspace, operation.operation_id, receipt);
-      if (deps.diagnostics && receipt.quarantined.length) fields.quarantine_details = deps.diagnostics(workspace, receipt.quarantined);
+      if (deps.diagnostics && receipt.quarantined.length) fields.quarantine_details = deps.diagnostics(workspace, receipt.quarantined, operation?.operation_id);
       fields.prepared_artifact_review_required = receipt.quarantined.some(item => item && typeof item === "object" && typeof item.reason === "string" && (item.reason.includes("prepared_source_identity_mismatch") || item.reason.includes("Discovery exchange does not match current trusted database evidence")));
       for (const key of ["started_at", "finished_at"]) if (typeof receipt[key] === "string" && Number.isFinite(Date.parse(receipt[key]))) fields[key] = receipt[key];
     }
@@ -262,7 +262,7 @@ export async function startFromEnvironment(): Promise<http.Server> {
     ...localExecutionDeps(ROOT), status: reader.status,
     progress: (workspace, operation, receipt) => reconstructionProgress(ROOT, workspace, operation, receipt),
     audit: (workspace, operation) => readAuditStatus(ROOT, workspace, operation),
-    diagnostics: (workspace, quarantined) => quarantineDetails(ROOT, workspace, quarantined),
+    diagnostics: (workspace, quarantined, operation) => quarantineDetails(ROOT, workspace, quarantined, operation),
     launch: (executable, args, options) => {
       const env = { ...process.env };
       delete env.MEMORY_CONTEXT_OPERATIONS_TOKENS;

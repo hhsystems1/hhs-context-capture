@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, it, expect } from "vitest";
 import { ensureIngestWorkspace, publishCaptureSourceVersionFromClient, buildIds } from "./ingest.js";
 import { sha256 } from "@hhs/memory-schema";
@@ -35,6 +38,27 @@ describe("capture intake trust", () => {
     expect(diagnostic.code).toBe("unknown_evidence_reference");
     expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE_REFERENCE");
     expect(diagnostic.issue_count).toBe(1);
+  });
+  it.each([
+    ["model_output_truncated", "output limit"], ["malformed_model_json", "malformed JSON"],
+    ["request_timeout", "timed out"], ["source_deadline", "deadline"]
+  ])("reports %s separately without exposing provider output", (failure_code, text) => {
+    const [diagnostic] = quarantineDetails("/not-read", "scope", [{source_conversation_id:"source",
+      title:"Historical source",failure_code,reason:"PRIVATE provider content"}]);
+    expect(diagnostic?.code).toBe(failure_code);expect(diagnostic?.summary).toContain(text);
+    expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE");
+  });
+  it("resolves only same-operation/workspace/source preserved failure diagnostics", () => {
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"hhs-failure-diag-"));
+    try {
+      const operation="operation_"+"a".repeat(32),dir=path.join(root,".runtime/reconstruction/oversized-runs/priority-0001-source");
+      fs.mkdirSync(dir,{recursive:true});
+      fs.writeFileSync(path.join(dir,"failure-"+operation+".json"),JSON.stringify({workspace:"scope",operation_id:operation,source_conversation_id:"source",failure_code:"model_output_truncated"}));
+      const row={source_conversation_id:"source",title:"Source",reason:"Error: node exited with status 1"};
+      expect(quarantineDetails(root,"scope",[row],operation)[0]?.code).toBe("model_output_truncated");
+      expect(quarantineDetails(root,"other",[row],operation)[0]?.code).toBe("reconstruction_failed");
+      expect(quarantineDetails(root,"scope",[row],"operation_"+"b".repeat(32))[0]?.code).toBe("reconstruction_failed");
+    } finally {fs.rmSync(root,{recursive:true,force:true});}
   });
   it("does not present an old standard validation diagnosis as a current linker/runtime failure", () => {
     const [diagnostic] = quarantineDetails('/not-read-for-runtime-failure', 'scope', [{

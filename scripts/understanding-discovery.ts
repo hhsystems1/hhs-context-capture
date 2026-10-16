@@ -31,7 +31,7 @@ if (command === "select") {
   const parentExchange = exchangePath
     ? JSON.parse(await readFile(exchangePath, "utf8")) as DiscoveryExchange
     : await prepareDiscoveryExchange(workspaceId, conversations);
-  const chunks = splitDiscoveryExchange(parentExchange, maxEvidenceCharacters);
+  const chunks = splitDiscoveryExchange(parentExchange, maxEvidenceCharacters, { subdivideMessages: process.argv.includes("--subdivide-messages") });
   console.log(JSON.stringify({
     parent_exchange: parentExchange,
     chunks

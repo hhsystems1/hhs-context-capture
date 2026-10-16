@@ -101,6 +101,14 @@ async function readDiscoveryStream(response) {
 // paths, database IDs and repeated hashes remain in the trusted local exchange;
 // sending them for every content block inflated small conversations past context.
 // Never mutate/truncate that exchange: validation/persistence still use it whole.
+function discoveryViews(exchange) {
+  return exchange.evidence.flatMap(row => {
+    const fragments = (exchange.evidence_fragments ?? []).filter(f => f.parent_evidence_ref === row.evidence_ref);
+    return fragments.length ? fragments.map(f => ({ ...row, evidence_ref: f.fragment_ref,
+      text: f.fragment_text, derived_fragment: true, start_offset: f.start_offset, end_offset: f.end_offset })) : [row];
+  });
+}
+
 export function modelDiscoveryExchange(exchange) {
   const refs = discoveryAliases(exchange);
   return {
@@ -111,20 +119,22 @@ export function modelDiscoveryExchange(exchange) {
       source_conversation_id: row.source_conversation_id, title: row.title,
       message_count: row.message_count, content_characters: row.content_characters
     })),
-    evidence: exchange.evidence.map(row => ({
+    evidence: discoveryViews(exchange).map(row => ({
       evidence_ref: refs.get(row.evidence_ref),
       message_sequence: row.message_sequence, role: row.role, active_path: row.active_path,
-      block_kind: row.block_kind, representation_kind: row.representation_kind, text: row.text
+      block_kind: row.block_kind, representation_kind: row.representation_kind, text: row.text,
+      ...(row.derived_fragment ? { derived_fragment: true, start_offset: row.start_offset, end_offset: row.end_offset } : {})
     })),
     model_instructions: exchange.model_instructions
   };
 }
 
 function discoveryAliases(exchange) {
-  const originals = new Set(exchange.evidence.map(row => row.evidence_ref));
+  const views = discoveryViews(exchange);
+  const originals = new Set([...exchange.evidence.map(row => row.evidence_ref), ...views.map(row => row.evidence_ref)]);
   let prefix = 'E';
-  while (exchange.evidence.some((_, index) => originals.has(`${prefix}${index + 1}`))) prefix = `_${prefix}`;
-  return new Map(exchange.evidence.map((row, index) => [row.evidence_ref, `${prefix}${index + 1}`]));
+  while (views.some((_, index) => originals.has(`${prefix}${index + 1}`))) prefix = `_${prefix}`;
+  return new Map(views.map((row, index) => [row.evidence_ref, `${prefix}${index + 1}`]));
 }
 
 // Expand only issued aliases back to immutable canonical references, before the
@@ -137,7 +147,12 @@ export function restoreModelEvidenceRefs(candidate, exchange) {
     return { ...row, evidence: row.evidence.map(cite => {
       if (typeof cite === 'string') return originalByAlias.get(cite) ?? cite;
       if (!cite || typeof cite !== 'object') return cite;
-      return { ...cite, evidence_ref: originalByAlias.get(cite.evidence_ref) ?? cite.evidence_ref };
+      const ref = originalByAlias.get(cite.evidence_ref) ?? cite.evidence_ref;
+      const fragment = (exchange.evidence_fragments ?? []).find(f => f.fragment_ref === ref);
+      return fragment ? { ...cite, evidence_ref: fragment.parent_evidence_ref,
+        fragment: cite.fragment ?? { parent_evidence_ref: fragment.parent_evidence_ref,
+          start_offset: fragment.start_offset, end_offset: fragment.end_offset, fragment_sha256: fragment.fragment_sha256 } }
+        : { ...cite, evidence_ref: ref };
     }) };
   }) };
 }

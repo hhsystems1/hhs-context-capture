@@ -13,13 +13,24 @@ export function validationSummary(issues: Array<{ problem: string }>) {
 }
 
 // Read old attempts as well as new diagnostics; terminal batch receipts stay intact.
-export function quarantineDetails(root: string, workspace: string, quarantined: unknown[]) {
+export function quarantineDetails(root: string, workspace: string, quarantined: unknown[], operation?: string) {
   return quarantined.slice(0, 10).map(value => {
     const item = value as Record<string, unknown>;
     const id = String(item.source_conversation_id ?? "");
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) throw new Error("Invalid quarantine source identity.");
     let diagnostic = { code: "reconstruction_failed", issue_count: 0,
       summary: "Processing stopped. Preserved attempts need operator review before retrying." };
+    const specific: Record<string, { code: string; issue_count: number; summary: string }> = {
+      model_output_truncated: { code: "model_output_truncated", issue_count: 0, summary: "Oversized source: model response exceeded its output limit. Evidence-preserving subdivision could not finish; attempts are preserved for review." },
+      malformed_model_json: { code: "malformed_model_json", issue_count: 0, summary: "Model returned malformed JSON. No incomplete output was saved; failed attempts are preserved." },
+      request_timeout: { code: "request_timeout", issue_count: 0, summary: "Model request timed out. Completed chunks and failed attempts remain available for resume." },
+      source_deadline: { code: "source_deadline", issue_count: 0, summary: "Source processing reached its bounded deadline. Completed chunks remain available for resume." },
+      evidence_validation: { code: "validation_failed", issue_count: 0, summary: "Model output failed trusted evidence validation. Original evidence and rejected attempts are preserved." }
+    };
+    const code = item.failure_code ?? preservedFailureCode(root, workspace, id, operation);
+    if (typeof code === "string" && Object.hasOwn(specific, code)) {
+      return { source_conversation_id: id, title: String(item.title ?? "Historical conversation").slice(0, 160), ...specific[code]! };
+    }
     // A cached, older standard validation error cannot explain a current
     // provider/chunk/linker failure. Only inspect it for a validation outcome.
     if (!/standard validation failed|trusted validation|exited with status 10\b/i.test(String(item.reason ?? ""))) {
@@ -47,4 +58,19 @@ export function quarantineDetails(root: string, workspace: string, quarantined: 
     } catch { /* A missing/incomplete diagnostic must not expose private exceptions. */ }
     return { source_conversation_id: id, title: String(item.title ?? "Historical conversation").slice(0, 160), ...diagnostic };
   });
+}
+
+function preservedFailureCode(root: string, workspace: string, source: string, operation?: string): unknown {
+  if (!operation || !/^operation_[0-9a-f]{32}$/.test(operation)) return undefined;
+  try {
+    const directory = path.join(root, ".runtime/reconstruction/oversized-runs");
+    const names = fs.readdirSync(directory).filter(name => /^priority-\d+-/.test(name) && name.endsWith("-" + source)).slice(-2);
+    for (const name of names) {
+      const file = path.join(directory, name, "failure-" + operation + ".json");
+      if (!fs.existsSync(file)) continue;
+      const value = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (value.workspace === workspace && value.operation_id === operation && value.source_conversation_id === source) return value.failure_code;
+    }
+  } catch { /* Missing diagnostics stay generic; never expose private exceptions. */ }
+  return undefined;
 }

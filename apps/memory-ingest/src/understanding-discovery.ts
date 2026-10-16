@@ -6,6 +6,7 @@
  * it; only this trusted local module resolves hashes and derives database IDs.
  */
 import pg from "pg";
+import { createEvidenceFragment, fragmentMatchesEvidence, fragmentProof, type EvidenceFragment, type EvidenceFragmentProof } from "./discovery-fragments.js";
 import { deterministicId, idempotencyKey, sha256 } from "@hhs/memory-schema";
 import { createPool, immutableInsert, readOnlyTransaction, transaction, type DbClient } from "./db.js";
 
@@ -74,6 +75,7 @@ export interface DiscoveryExchange {
   created_at: string;
   selection: DiscoverySelection[];
   evidence: DiscoveryEvidence[];
+  evidence_fragments?: EvidenceFragment[];
   model_instructions: {
     output_schema_version: typeof UNDERSTANDING_OUTPUT_SCHEMA;
     observation_kinds_are_free_text: true;
@@ -88,6 +90,8 @@ export interface DiscoveryExchange {
 
 export interface DiscoveryCitationOutput {
   evidence_ref: string;
+  /** Trusted derived-view proof, always checked against the original canonical row. */
+  fragment?: EvidenceFragmentProof;
   /** Optional model-authored display text. Never used as canonical evidence. */
   excerpt?: string;
   role?: "supporting" | "context" | "contradicting";
@@ -276,90 +280,87 @@ export interface DiscoveryExchangeChunk {
 }
 
 /**
- * Deterministically partitions an exchange without splitting a message.
- * A message that individually exceeds the target remains intact and is
- * explicitly marked exceeds_target.
+ * Prefer intact messages. The recursive runner may explicitly subdivide an
+ * oversized message into existing evidence rows, then exact derived fragments.
+ * Original evidence rows, message identities, text and hashes never change.
  */
 export function splitDiscoveryExchange(
   exchange: DiscoveryExchange,
-  maxEvidenceCharacters: number
+  maxEvidenceCharacters: number,
+  options: { subdivideMessages?: boolean } = {}
 ): DiscoveryExchangeChunk[] {
   if (!Number.isInteger(maxEvidenceCharacters) || maxEvidenceCharacters < 1) {
     throw new Error("maxEvidenceCharacters must be a positive integer.");
   }
-  if (exchange.evidence.length === 0) {
-    throw new Error("Cannot split an exchange with no evidence.");
+  if (!exchange.evidence.length) throw new Error("Cannot split an exchange with no evidence.");
+  type Unit = { row: DiscoveryEvidence; fragment?: EvidenceFragment };
+  const units: Unit[] = exchange.evidence.flatMap(row => {
+    const fragments = (exchange.evidence_fragments ?? []).filter(f => f.parent_evidence_ref === row.evidence_ref);
+    if (fragments.some(f => !fragmentMatchesEvidence(row, f, true))) throw new Error("Invalid evidence fragment in processing exchange.");
+    return fragments.length ? fragments.map(fragment => ({ row, fragment })) : [{ row }];
+  });
+  const cost = (unit: Unit) => JSON.stringify(unit.fragment
+    ? { ...unit.row, text: unit.fragment.fragment_text, fragment: fragmentProof(unit.fragment) } : unit.row).length;
+  const messages: Unit[][] = [];
+  for (const unit of units) {
+    const previous = messages.at(-1)?.[0]?.row;
+    if (previous && previous.source_conversation_id === unit.row.source_conversation_id
+      && previous.message_id === unit.row.message_id && previous.message_sequence === unit.row.message_sequence) {
+      messages.at(-1)!.push(unit);
+    } else messages.push([unit]);
   }
-
-  const messageGroups: DiscoveryEvidence[][] = [];
-  for (const row of exchange.evidence) {
-    const previous = messageGroups.at(-1);
-    const sameMessage = previous
-      && previous[0]!.source_conversation_id === row.source_conversation_id
-      && previous[0]!.message_id === row.message_id
-      && previous[0]!.message_sequence === row.message_sequence;
-    if (sameMessage) previous.push(row);
-    else messageGroups.push([row]);
-  }
-
-  const groupedChunks: DiscoveryEvidence[][] = [];
-  let current: DiscoveryEvidence[] = [];
-  let currentCharacters = 0;
-
-  for (const group of messageGroups) {
-    const groupCharacters = group.reduce(
-      (sum, row) => sum + JSON.stringify(row).length,
-      0
-    );
-    if (current.length > 0 && currentCharacters + groupCharacters > maxEvidenceCharacters) {
-      groupedChunks.push(current);
-      current = [];
-      currentCharacters = 0;
+  const groups: Unit[][] = [];
+  for (const message of messages) {
+    if (!options.subdivideMessages || message.reduce((n, unit) => n + cost(unit), 0) <= maxEvidenceCharacters) {
+      groups.push(message); continue;
     }
-    current.push(...group);
-    currentCharacters += groupCharacters;
-  }
-  if (current.length > 0) groupedChunks.push(current);
-
-  return groupedChunks.map((chunkEvidence, index) => {
-    const evidenceSha = sha256(chunkEvidence);
-    const sourceIds = new Set(
-      chunkEvidence.map((row) => row.source_conversation_id)
-    );
-    const selection = exchange.selection
-      .filter((item) => sourceIds.has(item.source_conversation_id))
-      .map((item) => {
-        const rows = chunkEvidence.filter(
-          (row) => row.source_conversation_id === item.source_conversation_id
-        );
-        return {
-          ...item,
-          message_count: new Set(rows.map((row) => row.message_id)).size,
-          content_characters: rows.reduce((sum, row) => sum + row.text.length, 0)
-        };
-      });
-    const evidenceCharacters = chunkEvidence.reduce(
-      (sum, row) => sum + JSON.stringify(row).length,
-      0
-    );
-
-    return {
-      chunk_number: index + 1,
-      chunk_count: groupedChunks.length,
-      evidence_characters: evidenceCharacters,
-      exceeds_target: evidenceCharacters > maxEvidenceCharacters,
-      exchange: {
-        ...exchange,
-        exchange_id: deterministicId(
-          "discovery_exchange_chunk",
-          exchange.exchange_id,
-          { chunk_number: index + 1, evidence_sha256: evidenceSha }
-        ),
-        evidence_sha256: evidenceSha,
-        selection,
-        evidence: chunkEvidence
+    for (const unit of message) {
+      const start = unit.fragment?.start_offset ?? 0;
+      const end = unit.fragment?.end_offset ?? unit.row.text.length;
+      if (cost(unit) <= maxEvidenceCharacters || end - start <= 1) { groups.push([unit]); continue; }
+      const overhead = JSON.stringify({ ...unit.row, text: "" }).length + 256;
+      const size = Math.max(256, maxEvidenceCharacters - overhead - 256);
+      for (let offset = start; offset < end;) {
+        let next = Math.min(end, offset + size);
+        if (next < end && /[\uD800-\uDBFF]/.test(unit.row.text[next - 1]!)
+          && /[\uDC00-\uDFFF]/.test(unit.row.text[next]!)) next--;
+        if (next <= offset) next = Math.min(end, offset + 2);
+        groups.push([{ row: unit.row, fragment: createEvidenceFragment(unit.row, offset, next) }]);
+        offset = next;
       }
-    };
+    }
+  }
+  const packed: Unit[][] = [];
+  let current: Unit[] = [], characters = 0;
+  for (const group of groups) {
+    const count = group.reduce((n, unit) => n + cost(unit), 0);
+    if (current.length && characters + count > maxEvidenceCharacters) {
+      packed.push(current); current = []; characters = 0;
+    }
+    current.push(...group); characters += count;
+  }
+  if (current.length) packed.push(current);
+  return packed.map((chunk, index) => {
+    const rows = [...new Map(chunk.map(unit => [unit.row.evidence_ref, unit.row])).values()];
+    const fragments = chunk.flatMap(unit => unit.fragment ? [unit.fragment] : []);
+    const evidenceSha = sha256(rows);
+    const sourceIds = new Set(rows.map(row => row.source_conversation_id));
+    const selection = exchange.selection.filter(item => sourceIds.has(item.source_conversation_id)).map(item => ({
+      ...item, message_count: new Set(rows.filter(row => row.source_conversation_id === item.source_conversation_id).map(row => row.message_id)).size,
+      content_characters: chunk.filter(unit => unit.row.source_conversation_id === item.source_conversation_id)
+        .reduce((n, unit) => n + (unit.fragment?.fragment_text.length ?? unit.row.text.length), 0)
+    }));
+    const base = { ...exchange };
+    delete base.evidence_fragments;
+    const evidenceCharacters = chunk.reduce((n, unit) => n + cost(unit), 0);
+    return { chunk_number: index + 1, chunk_count: packed.length, evidence_characters: evidenceCharacters,
+      exceeds_target: evidenceCharacters > maxEvidenceCharacters, exchange: {
+        ...base, exchange_id: deterministicId("discovery_exchange_chunk", exchange.exchange_id, {
+          chunk_number: index + 1, evidence_sha256: evidenceSha,
+          ...(fragments.length ? { fragments_sha256: sha256(fragments) } : {})
+        }), evidence_sha256: evidenceSha, selection, evidence: rows,
+        ...(fragments.length ? { evidence_fragments: fragments } : {})
+      } };
   });
 }
 
@@ -396,6 +397,17 @@ export function validateDiscoveryOutput(
       || selection.capture_version_id !== row.capture_version_id) {
       issues.push({ record_ref: "exchange", problem: `evidence_ref ${row.evidence_ref} does not match its selected conversation/version` });
     }
+  }
+  const fragmentsByRef = new Map<string, EvidenceFragment>();
+  if (exchange.evidence_fragments !== undefined && !Array.isArray(exchange.evidence_fragments)) {
+    issues.push({ record_ref: "exchange", problem: "invalid evidence fragments" });
+  }
+  for (const fragment of Array.isArray(exchange.evidence_fragments) ? exchange.evidence_fragments : []) {
+    const parent = exchange.evidence.find(row => row.evidence_ref === fragment?.parent_evidence_ref);
+    if (!parent || !fragmentMatchesEvidence(parent, fragment, true) || fragmentsByRef.has(fragment.fragment_ref)
+      || exchangeEvidenceRefs.has(fragment.fragment_ref)) {
+      issues.push({ record_ref: "exchange", problem: "evidence fragment does not resolve exactly to canonical evidence" });
+    } else fragmentsByRef.set(fragment.fragment_ref, fragment);
   }
   if (issues.length) return { issues };
   if (!isRecord(candidate)) return { issues: [{ record_ref: "output", problem: "output must be an object" }] };
@@ -436,7 +448,9 @@ export function validateDiscoveryOutput(
       if (!isRecord(citation) || typeof citation.evidence_ref !== "string" || !citation.evidence_ref.trim()) {
         local.push("each citation needs a non-empty evidence_ref"); continue;
       }
-      const evidenceRef = citation.evidence_ref.trim();
+      const suppliedRef = citation.evidence_ref.trim();
+      const issuedFragment = fragmentsByRef.get(suppliedRef);
+      const evidenceRef = issuedFragment?.parent_evidence_ref ?? suppliedRef;
       if (citation.excerpt !== undefined && typeof citation.excerpt !== "string") {
         local.push(`optional excerpt for ${evidenceRef} must be a string`); continue;
       }
@@ -454,9 +468,23 @@ export function validateDiscoveryOutput(
         || evidenceRow.resolution_observed_sha256 !== evidenceRow.representation_sha256) {
         local.push(`hash resolution mismatch in ${evidenceRef}`); continue;
       }
-      const key = `${evidenceRef}:${String(citation.role ?? "supporting")}`;
+      if (issuedFragment && citation.fragment !== undefined
+        && (!fragmentMatchesEvidence(evidenceRow, citation.fragment)
+          || JSON.stringify(fragmentProof(citation.fragment)) !== JSON.stringify(fragmentProof(issuedFragment)))) {
+        local.push("fragment citation did not match its issued view"); continue;
+      }
+      const proof = issuedFragment ? fragmentProof(issuedFragment) : citation.fragment;
+      if (proof !== undefined && !fragmentMatchesEvidence(evidenceRow, proof)) {
+        local.push("fragment citation substring/hash/offset mismatch"); continue;
+      }
+      const issuedForParent = [...fragmentsByRef.values()].filter(f => f.parent_evidence_ref === evidenceRef);
+      if (issuedForParent.length && (!proof || !issuedForParent.some(f => JSON.stringify(fragmentProof(f)) === JSON.stringify(fragmentProof(proof))))) {
+        local.push("citation did not use an issued evidence fragment"); continue;
+      }
+      const key = evidenceRef + ":" + String(citation.role ?? "supporting") + ":" + JSON.stringify(proof ?? null);
       if (!seenEvidence.has(key)) citations.push({
         evidence_ref: evidenceRef,
+        ...(proof ? { fragment: fragmentProof(proof) } : {}),
         ...(citation.excerpt === undefined ? {} : { excerpt: citation.excerpt }),
         ...(citation.role === undefined ? {} : { role: citation.role }),
         evidence_row: evidenceRow, canonical_text: evidenceRow.text,
@@ -520,6 +548,7 @@ export async function persistValidatedDiscovery(
       evidence_refs: observation.citations.map((item) => ({
         evidence_ref: item.evidence_ref, role: item.role ?? "supporting",
         untrusted_model_excerpt: item.excerpt ?? null,
+        ...(item.fragment ? { fragment: fragmentProof(item.fragment) } : {}),
         canonical_text: item.canonical_text,
         canonical_text_sha256: item.canonical_text_sha256
       })),

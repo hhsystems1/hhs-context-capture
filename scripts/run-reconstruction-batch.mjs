@@ -130,7 +130,8 @@ for (const candidate of candidates) {
     const item = {
       source_conversation_id: candidate.source_conversation_id,
       title: candidate.title,
-      reason: String(error)
+      reason: String(error),
+      ...(oversizedFailure(candidate) ? { failure_code: oversizedFailure(candidate) } : {})
     };
     receipt.quarantined.push(item);
     console.error("QUARANTINED:", item.reason);
@@ -319,12 +320,14 @@ function processOversized(candidate, sourceStartedAt, inheritedDeadline) {
     const number = String(chunk.chunk_number).padStart(3, "0");
     return !fs.existsSync(path.join(directory, `chunk-${number}-output.json`))
       || !fs.existsSync(path.join(directory, `chunk-${number}-model.json`));
-  }).length;
+  });
+  const requestUnits = pendingChunks.reduce((sum, chunk) => sum + (chunk.exceeds_target && chunk.message_count === 1
+    && Number.isFinite(chunk.evidence_characters) ? Math.max(1, Math.ceil(chunk.evidence_characters / Math.max(12000, CHUNK_CHARACTERS / 2))) : 1), 0);
   // Measured valid free-model chunks can take over two minutes. Budget one
   // bounded request per pending chunk plus the linker, up to one hour total.
   // Cached chunks remain revalidated, and an explicit caller deadline still wins.
   const chunkRequestBudget = Number(process.env.HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS ?? 180000);
-  const oversizedBudget = Math.max(SOURCE_BUDGET_MS, Math.min(60 * 60 * 1000, (pendingChunks + 1) * chunkRequestBudget + 60000));
+  const oversizedBudget = Math.max(SOURCE_BUDGET_MS, Math.min(60 * 60 * 1000, (requestUnits + 1) * chunkRequestBudget + 60000));
   if (!Number.isSafeInteger(oversizedBudget)) throw new Error("Invalid oversized source budget");
   process.env.HHS_RECONSTRUCTION_DEADLINE_AT = String(Math.min(sourceStartedAt + oversizedBudget, inheritedDeadline));
   sourceStage('generating');
@@ -332,7 +335,8 @@ function processOversized(candidate, sourceStartedAt, inheritedDeadline) {
     checked(process.execPath, [
       "scripts/run-oversized-orchestrator.mjs",
       "--run-dir", directory,
-      "--workspace", WORKSPACE
+      "--workspace", WORKSPACE,
+      ...(OPERATION_ID ? ["--operation-id", OPERATION_ID] : [])
     ]);
   }
   const exchange = path.join(directory, "parent-input.json");
@@ -344,6 +348,16 @@ function processOversized(candidate, sourceStartedAt, inheritedDeadline) {
   validate(exchange, output, model, OVERSIZED_VERSION);
   const persistedResult = persist(exchange, output, model, OVERSIZED_VERSION);
   return summary(candidate, "oversized", persistedResult);
+}
+
+function oversizedFailure(candidate) {
+  if (!OPERATION_ID) return undefined;
+  const directory = path.join(OVERSIZED_RUNS, "priority-" + String(priorityRank(candidate)).padStart(4, "0") + "-" + candidate.source_conversation_id);
+  const file = path.join(directory, "failure-" + OPERATION_ID + ".json");
+  if (!fs.existsSync(file)) return undefined;
+  const failure = read(file);
+  if (failure.workspace !== WORKSPACE || failure.operation_id !== OPERATION_ID || failure.source_conversation_id !== candidate.source_conversation_id) return undefined;
+  return ["model_output_truncated", "malformed_model_json", "evidence_validation", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable"].includes(failure.failure_code) ? failure.failure_code : undefined;
 }
 
 function sourceStage(stage) {

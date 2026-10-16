@@ -64,6 +64,7 @@ console.log("attempt:", attemptNumber);
 const systemPrompt = [
   "You are the semantic discovery worker for the HHS Company Reconstruction pipeline.",
   "Analyze this chronological CHUNK of one larger conversation.",
+  "Rows marked derived_fragment are partial exact views of one canonical evidence row; do not treat fragment boundaries as new messages. Cite only the issued evidence_ref. Do not invent fragment offsets or metadata.",
   "Extract every distinct, meaningful, evidence-supported observation in this chunk.",
   "Do not assume this chunk contains the beginning or end of the conversation.",
   "Preserve historical states, changes, corrections, rejected approaches, unresolved questions, and attribution.",
@@ -124,8 +125,10 @@ fs.writeFileSync(
 console.log("MODEL USED:", modelResult.model);
 console.log("raw response saved:", rawPath);
 if (modelResult.data.choices?.[0]?.finish_reason === "length") {
-  console.error("STOP: truncated chunk output requires retry/splitting, not partial persistence.");
-  process.exit(8);
+  fs.writeFileSync(errorPath, JSON.stringify({ category: "model_output_truncated", finish_reason: "length",
+    completion_tokens: modelResult.data.usage?.completion_tokens ?? null }) + "\n", { flag: "wx" });
+  console.error("STOP: truncated chunk output requires subdivision, not partial persistence.");
+  process.exit(11);
 }
 
 let output;
@@ -142,6 +145,7 @@ try {
     fs.writeFileSync(
       errorPath,
       JSON.stringify({
+        category: "malformed_model_json",
         message: "Model response could not be repaired as JSON.",
         initial_cause: String(initialError),
         repair_cause: String(repairError)
