@@ -1,3 +1,4 @@
+import { captureDiagnosticError, captureFailure, captureStep, safeCaptureFailure } from "@hhs/capture-operations";
 import { ChatGptAdapter } from "@hhs/adapter-chatgpt";
 import { ChatGptDomSidebarPort, ChatGptSidebarInventoryAdapter, hashInventoryEvidence } from "@hhs/adapter-chatgpt/inventory";
 import { SCHEMA_VERSION, type CaptureBundle, type EvidenceRecord } from "@hhs/canonical-schema";
@@ -60,7 +61,7 @@ if (!contentScope.__hhsContextCaptureRegistered) {
           safe_error_summary: "The active conversation identity changed or did not match.",
           reason_code: "identity_mismatch"
         });
-        throw new Error("Active conversation identity changed during capture.");
+        throw captureFailure("identity_read","identity_mismatch");
       }
       await emitOperationEvent({ ...operation, eventSequence: operation.eventSequence + 1 }, "capture_progress", "extension_content", {
         stage: "extraction_completed", message_count: bundle.messages.length
@@ -73,7 +74,7 @@ if (!contentScope.__hhsContextCaptureRegistered) {
       return { archive, captureStatus: bundle.verification.status, messageCount: bundle.messages.length };
     }).then(
       (result) => sendResponse({ ok: true, ...result }),
-      (error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+      (error: unknown) => { const diagnostic=safeCaptureFailure(error,"page_extraction"); sendResponse({ok:false,error:diagnostic.safe_error_summary,diagnostic}); },
     );
     return true;
   });
@@ -98,13 +99,13 @@ async function streamJsonToBackground<T>(value: unknown, portName: StreamPortNam
     };
     port.onMessage.addListener((message: unknown) => {
       if (typeof message !== "object" || message === null) return;
-      const response = message as { type?: string; nextIndex?: number; error?: string; receipt?: T };
+      const response = message as { type?: string; nextIndex?: number; error?: string; diagnostic?: unknown; receipt?: T };
       if (response.type === "READY") sendChunk(0);
       else if (response.type === "ACK" && typeof response.nextIndex === "number") sendChunk(response.nextIndex);
       else if (response.type === "STORED" && response.receipt) { completed = true; resolve(response.receipt); port.disconnect(); }
-      else if (response.type === "ERROR") { completed = true; reject(new Error(response.error ?? "Local stream failed.")); port.disconnect(); }
+      else if (response.type === "ERROR") { completed = true; reject(captureDiagnosticError(response,"extension_channel")); port.disconnect(); }
     });
-    port.onDisconnect.addListener(() => { if (!completed) reject(new Error(chrome.runtime.lastError?.message ?? "Local stream disconnected before completion.")); });
+    port.onDisconnect.addListener(() => { if (!completed) reject(captureFailure("extension_channel","stream_disconnected")); });
     port.postMessage({ type: "START", totalChunks, ...(operation ? { operation } : {}) });
   });
 }
@@ -192,8 +193,8 @@ async function observedCaptureIdentity(): Promise<{ platform: string; opaqueAcco
 }
 
 async function collectorRequest(endpoint: string, body: unknown): Promise<Record<string, unknown>> {
-  const response = await chrome.runtime.sendMessage({ type: "HHS_COLLECTOR_REQUEST", endpoint, body }) as { ok: boolean; body?: Record<string, unknown>; error?: string };
-  if (!response.ok || !response.body) throw new Error(response.error ?? "Local collector request failed.");
+  const response = await chrome.runtime.sendMessage({ type: "HHS_COLLECTOR_REQUEST", endpoint, body }) as { ok: boolean; body?: Record<string, unknown>; error?: string; diagnostic?: unknown };
+  if (!response.ok || !response.body) throw captureDiagnosticError(response,"operation_event");
   return response.body;
 }
 
@@ -230,12 +231,12 @@ async function captureConversation(onProgress: (message: string) => void): Promi
       return { evidence_id: crypto.randomUUID(), kind: "screenshot", portion, captured_at: new Date().toISOString(), media_type: "image/png", sha256: await sha256DataUrl(response.dataUrl), inline_data: response.dataUrl, metadata: { viewport: { width: innerWidth, height: innerHeight, scroll_x: scrollX, scroll_y: scrollY }, ...metadata } };
     },
   };
-  const detection = await adapter.detect(context);
-  if (!detection.detected) throw new Error(`ChatGPT conversation not detected: ${detection.reasons.join(" ")}`);
-  const identity = await adapter.identifyConversation(context);
-  const extracted = await adapter.capture(context);
-  const verification = verifyCapture(extracted);
-  const account = await opaqueAccountReference();
+  const detection = await captureStep("page_detection",()=>adapter.detect(context));
+  if (!detection.detected) throw captureFailure("page_detection","conversation_not_rendered");
+  const identity = await captureStep("identity_read",()=>adapter.identifyConversation(context));
+  const extracted = await captureStep("page_extraction",()=>adapter.capture(context));
+  const verification = await captureStep("capture_validation",()=>verifyCapture(extracted));
+  const account = await captureStep("account_read",()=>opaqueAccountReference());
   const captureId = crypto.randomUUID();
   return {
     schema_version: SCHEMA_VERSION,

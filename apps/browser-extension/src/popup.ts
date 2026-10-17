@@ -1,3 +1,4 @@
+import { captureDiagnosticError, safeCaptureFailure } from "@hhs/capture-operations";
 import type { DiscoverySummary, SiteDiscoveryResult } from "./discovery/run.js";
 import type { ComparisonOutcome } from "./discovery/compare.js";
 
@@ -132,13 +133,14 @@ captureButton.addEventListener("click", async () => {
     operation.eventSequence++;
     setStatus("Capturing. Keep this ChatGPT tab active...");
     const result = await sendPageRequest<CaptureReceipt>(tabId, { type: "HHS_CAPTURE_CURRENT", operation });
-    if (!result.ok || !result.archive) throw new Error(result.error ?? "Capture failed in the page.");
+    if (!result.ok || !result.archive) throw captureDiagnosticError(result,"extension_channel");
     const report = await collectorApi<{ operation: OperationReport }>(`operations/${encodeURIComponent(operationId)}`, "GET");
     await rememberOperation(report.operation);
     setStatus(`${report.operation.status}: ${result.archive.messageCount} messages archived as ${report.operation.safe_capture_reference ?? "a private capture reference"}.`);
-  } catch {
-    if (operation) await recordSafeCaptureFailure(operation);
-    setStatus("Capture stopped before completion. Open the latest operation report for the safe last-known stage.", true);
+  } catch (error) {
+    if (operation) await recordSafeCaptureFailure(operation,error);
+    const diagnostic=safeCaptureFailure(error,"extension_channel");
+    setStatus(`Capture stopped at ${diagnostic.stage}: ${diagnostic.reason_code}. Open the latest operation report.`,true);
   } finally { await enablePairedActions(); }
 });
 
@@ -310,7 +312,7 @@ type OperationContext = { operationId: string; correlationId: string; eventSeque
 type OperationReport = {
   operation_id: string; correlation_id: string; status: string; last_event_sequence: number;
   last_event_type: string; last_event_at: string; last_successful_stage: string;
-  safe_capture_reference: string | null; stop_summary: string | null;
+  safe_capture_reference: string | null; stop_summary: string | null; stop_reason_code?: string | null;
 };
 type ClassificationCounts = Record<"new" | "possibly_changed" | "unchanged" | "missing" | "needs_review", number>;
 type InventoryReceipt = { ok: boolean; inventory?: { verificationStatus: string; observedCount: number; classificationCounts: ClassificationCounts; inventoryPath: string }; error?: string };
@@ -356,15 +358,13 @@ async function appendEvent(operation: OperationContext, eventType: string, sourc
   });
 }
 
-async function recordSafeCaptureFailure(operation: OperationContext): Promise<void> {
+async function recordSafeCaptureFailure(operation: OperationContext,error?:unknown): Promise<void> {
   try {
     const result = await collectorApi<{ operation: OperationReport }>(`operations/${encodeURIComponent(operation.operationId)}`, "GET");
     if (["completed", "needs_review", "failed", "interrupted", "canceled"].includes(result.operation.status)) return void await rememberOperation(result.operation);
     operation.eventSequence = result.operation.last_event_sequence + 1;
     await appendEvent(operation, "capture_failed", "extension_popup", {
-      safe_error_code: "internal_error",
-      safe_error_summary: "A local component reported a safe internal failure.",
-      reason_code: "internal_error",
+      ...safeCaptureFailure(error,"extension_channel"),
       last_successful_stage: result.operation.last_successful_stage
     });
     const updated = await collectorApi<{ operation: OperationReport }>(`operations/${encodeURIComponent(operation.operationId)}`, "GET");
@@ -379,7 +379,7 @@ async function reconcileLatestOperation(): Promise<void> {
     const result = await collectorApi<{ operation: OperationReport | null }>("operations/latest", "GET");
     if (!result.operation) return setStatus("Collector paired. No capture operation has been recorded yet.");
     await rememberOperation(result.operation);
-    setStatus(`Latest operation: ${result.operation.status}; last stage: ${result.operation.last_successful_stage}.`);
+    setStatus(`Latest operation: ${result.operation.status}; last stage: ${result.operation.last_successful_stage}.${result.operation.stop_reason_code ? " Reason: "+result.operation.stop_reason_code+"." : ""}`);
   } catch {
     setStatus("Stored pairing is no longer valid. Pair with the current local collector before reconciling status.", true);
     captureButton.disabled = true;

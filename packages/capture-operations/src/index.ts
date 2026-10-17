@@ -271,3 +271,45 @@ const transitionTable: Record<OperationEventType, { from: Array<OperationStatus 
   capture_interrupted: { from: ["created", "pairing", "prepared", "capturing", "delivering", "archiving", "verifying"], to: "interrupted" },
   operation_canceled: { from: ["created", "pairing", "prepared", "capturing", "delivering", "archiving", "verifying"], to: "canceled" }
 };
+
+
+// Diagnostic transport only: do not retain exception messages, payloads, URLs or
+// credentials. Existing operation metadata fields/error codes remain unchanged.
+export const captureFailureStages = ['page_detection','identity_read','page_extraction','capture_validation','account_read','operation_event','collector_delivery','extension_channel'] as const;
+export type CaptureFailureStage = (typeof captureFailureStages)[number];
+type CaptureFailureMetadata = {stage:CaptureFailureStage;reason_code:string;safe_error_code:SafeErrorCode;safe_error_summary:string};
+const captureReasons = new Set(['local_failure','conversation_not_rendered','collector_unreachable','collector_invalid_response','collector_pairing_missing','stream_disconnected','type_error','reference_error','range_error','dom_error','identity_mismatch']);
+function failureMetadata(stage:CaptureFailureStage,reason:string): CaptureFailureMetadata {
+  const code:SafeErrorCode = reason==='identity_mismatch' ? 'identity_mismatch' : reason==='collector_unreachable' ? 'collector_unavailable'
+    : /^http_(?:401|403)$/.test(reason)||reason==='collector_pairing_missing' ? 'pairing_failed'
+    : /^http_(?:400|413|422)$/.test(reason) ? 'validation_failed'
+    : /^http_[45]\d\d$/.test(reason) ? 'delivery_failed' : 'internal_error';
+  return {stage,reason_code:reason,safe_error_code:code,safe_error_summary:safeErrorSummaries[code]};
+}
+export function safeCaptureFailure(error:unknown,fallback:CaptureFailureStage): CaptureFailureMetadata {
+  const candidate=typeof error==='object'&&error!==null ? (error as {diagnostic?:unknown}).diagnostic : undefined;
+  if(typeof candidate==='object'&&candidate!==null&&!Array.isArray(candidate)) {
+    const d=candidate as Record<string,unknown>;
+    if(Object.keys(d).sort().join(',')==='reason_code,safe_error_code,safe_error_summary,stage'
+      && captureFailureStages.includes(d.stage as CaptureFailureStage)&&typeof d.reason_code==='string'
+      && (captureReasons.has(d.reason_code)||/^http_[45]\d\d$/.test(d.reason_code))) {
+      const canonical=failureMetadata(d.stage as CaptureFailureStage,d.reason_code);
+      if(d.safe_error_code===canonical.safe_error_code&&d.safe_error_summary===canonical.safe_error_summary)return canonical;
+    }
+  }
+  const name=error instanceof Error ? error.name : '';
+  const reason=typeof DOMException!=='undefined'&&error instanceof DOMException ? 'dom_error' : ({TypeError:'type_error',ReferenceError:'reference_error',RangeError:'range_error'} as Record<string,string>)[name]??'local_failure';
+  return failureMetadata(fallback,reason);
+}
+export function captureDiagnosticError(error:unknown,stage:CaptureFailureStage): Error & {diagnostic:CaptureFailureMetadata} {
+  const diagnostic=safeCaptureFailure(error,stage);
+  return Object.assign(new Error(diagnostic.safe_error_summary),{diagnostic});
+}
+export function captureFailure(stage:CaptureFailureStage,reason:string): Error & {diagnostic:CaptureFailureMetadata} {
+  if(!captureReasons.has(reason)&&!/^http_[45]\d\d$/.test(reason))reason='local_failure';
+  const diagnostic=failureMetadata(stage,reason);
+  return Object.assign(new Error(diagnostic.safe_error_summary),{diagnostic});
+}
+export async function captureStep<T>(stage:CaptureFailureStage,action:()=>T|Promise<T>): Promise<T> {
+  try{return await action();}catch(error){throw captureDiagnosticError(error,stage);}
+}

@@ -1,3 +1,4 @@
+import { captureFailure, safeCaptureFailure, type CaptureFailureStage } from "@hhs/capture-operations";
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
   if (isScreenshotRequest(message)) {
     chrome.tabs.captureVisibleTab({ format: "png" }).then(
@@ -7,7 +8,7 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
   } else if (isCollectorRequest(message)) {
     submitToCollector(JSON.stringify(message.body ?? {}), message.endpoint).then(
       (body) => sendResponse({ ok: true, body }),
-      (error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+      (error: unknown) => { const diagnostic=safeCaptureFailure(error,"operation_event"); sendResponse({ok:false,error:diagnostic.safe_error_summary,diagnostic}); },
     );
   } else if (isMemoryQueryRequest(message)) {
     submitToMemoryQueryService(JSON.stringify(message.body ?? {}), message.endpoint).then(
@@ -63,7 +64,7 @@ chrome.runtime.onConnect.addListener((port) => {
       } else {
         void deliverStream(chunks.join(""), endpoint, operation).then(
           (receipt) => port.postMessage({ type: "STORED", receipt }),
-          (error: unknown) => port.postMessage({ type: "ERROR", error: error instanceof Error ? error.message : String(error) }),
+          (error: unknown) => { const diagnostic=safeCaptureFailure(error,"collector_delivery"); port.postMessage({type:"ERROR",error:diagnostic.safe_error_summary,diagnostic}); },
         );
       }
     }
@@ -81,9 +82,7 @@ async function deliverStream(serializedPayload: string, endpoint: string, operat
   } catch (error) {
     try {
       await submitOperationEvent({ ...operation, eventSequence: operation.eventSequence + 1 }, "collector_delivery_failed", "extension_worker", {
-        safe_error_code: "delivery_failed",
-        safe_error_summary: "The capture could not be delivered to the local collector.",
-        reason_code: "delivery_failed"
+        ...safeCaptureFailure(error,"collector_delivery")
       });
     } catch {
       // If the collector is unreachable, durable reconciliation will classify the last authoritative stage.
@@ -111,12 +110,15 @@ async function submitOperationEvent(
 }
 
 async function submitToCollector(serializedPayload: string, endpoint: string, extraHeaders: Record<string, string> = {}): Promise<unknown> {
-  const { collectorToken } = await chrome.storage.local.get("collectorToken");
-  if (typeof collectorToken !== "string") throw new Error("Collector pairing expired.");
-  const response = await fetch(`${COLLECTOR}/${endpoint}`, { method: "POST", headers: { authorization: `Bearer ${collectorToken}`, "content-type": "application/json", ...extraHeaders }, body: serializedPayload });
-  const body = await response.json() as { error?: string };
-  if (!response.ok) throw new Error(body.error ?? "Collector rejected local payload.");
-  return body;
+  const stage:CaptureFailureStage=endpoint.startsWith('operations/')?'operation_event':'collector_delivery';
+  const { collectorToken } = await chrome.storage.local.get('collectorToken');
+  if(typeof collectorToken!=='string')throw captureFailure(stage,'collector_pairing_missing');
+  let response:Response;
+  try { response=await fetch(COLLECTOR+'/'+endpoint,{method:'POST',headers:{authorization:'Bearer '+collectorToken,'content-type':'application/json',...extraHeaders},body:serializedPayload}); }
+  catch { throw captureFailure(stage,'collector_unreachable'); }
+  // Status is sufficient for diagnosis; rejected body text may contain private data.
+  if(!response.ok)throw captureFailure(stage,'http_'+response.status);
+  try{return await response.json();}catch{throw captureFailure(stage,'collector_invalid_response');}
 }
 
 async function submitToMemoryQueryService(serializedPayload: string, endpoint: string): Promise<unknown> {
