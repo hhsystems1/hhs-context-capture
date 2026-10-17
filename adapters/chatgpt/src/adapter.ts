@@ -4,7 +4,6 @@ import type {
   CanonicalMessage,
   ContentBlock,
   EvidenceRecord,
-  MessageRole,
   PreservedRepresentation,
   VerificationCheck,
 } from "@hhs/canonical-schema";
@@ -17,9 +16,9 @@ import {
   type PlatformAdapter,
 } from "@hhs/capture-engine";
 
+import { inspectChatGptPage } from './structure.js';
 import { preserveOriginalUserText } from './user-text-coverage.js';
 
-const MESSAGE_SELECTORS = ["[data-message-author-role]", "article[data-testid^='conversation-turn-']"];
 const STABLE_PASSES = 3;
 const MIN_SCROLL_PASSES = 200;
 const EMERGENCY_MAX_SCROLL_PASSES = 5_000;
@@ -27,20 +26,28 @@ type ObservedBranchIndicator = { key: string; current?: number; total?: number; 
 
 export class ChatGptAdapter implements PlatformAdapter {
   readonly platform = "chatgpt";
-  readonly adapterVersion = "0.1.2";
+  readonly adapterVersion = "0.1.3";
 
   async detect(context: AdapterContext) {
-    const supportedHost = /(^|\.)(chatgpt\.com|chat\.openai\.com)$/.test(location.hostname);
-    const hasConversation = findMessageElements(context.document).length > 0;
-    return { detected: supportedHost && hasConversation, platform: this.platform, confidence: supportedHost && hasConversation ? "high" as const : "low" as const, reasons: [supportedHost ? "Supported ChatGPT host." : "Unsupported host.", hasConversation ? "Conversation turns found." : "No conversation turns found."] };
+    const url=new URL(context.sourceUrl);
+    const supportedHost=/^(chatgpt\.com|chat\.openai\.com)$/.test(url.hostname);
+    const conversationPath=/^\/(?:g\/[^/]+\/)?c\/[^/?#]+/.test(url.pathname);
+    let structure=inspectChatGptPage(context.document);
+    if(supportedHost&&conversationPath)for(let pass=0;pass<6&&(structure.loading||structure.messages===0);pass++){
+      context.signal?.throwIfAborted();await new Promise(resolve=>setTimeout(resolve,250));structure=inspectChatGptPage(context.document);
+    }
+    const detected=supportedHost&&conversationPath&&structure.ready;
+    const reason=!supportedHost||!conversationPath?'unsupported_page':structure.loading?'page_loading':structure.issues.length?'page_requires_review':'conversation_not_rendered';
+    return {detected,platform:this.platform,confidence:detected?'high' as const:'low' as const,reasons:[supportedHost?'Supported ChatGPT host.':'Unsupported host.',detected?'Recognized message structure; completeness not established.':reason],structure,...(!detected?{reason}:{})};
   }
 
   async identifyConversation(context: AdapterContext): Promise<ConversationIdentity> {
     const url = new URL(context.sourceUrl);
     const match = url.pathname.match(/\/c\/([^/?#]+)/);
+    if (!match?.[1]) throw new Error("A native ChatGPT conversation identity is required.");
     const title = context.document.title.replace(/\s*[-–|]\s*ChatGPT\s*$/i, "");
     return {
-      conversationId: match?.[1] ?? `local-${await sha256(`${url.origin}${url.pathname}|${title}`)}`,
+      conversationId: match[1],
       ...(match?.[1] ? { platformConversationId: match[1] } : {}),
       title,
       sourceUrl: `${url.origin}${url.pathname}`,
@@ -65,6 +72,7 @@ export class ChatGptAdapter implements PlatformAdapter {
     }
     const initial = await observeViewport(context.document);
     accumulator.observe(initial.messages);
+    warnings.push(...initial.warnings);
     collectBranchIndicators(context.document, observedBranchIndicators);
     const initialCount = accumulator.size;
 
@@ -102,6 +110,7 @@ export class ChatGptAdapter implements PlatformAdapter {
     }
 
     const checks: VerificationCheck[] = [
+      check("layout.authorship_identity", !warnings.some(warning => warning.startsWith("ChatGPT layout requires review:")), "Every observed message layout had unambiguous authorship and source identity."),
       check("boundary.earliest", upward.boundary, "Earliest accessible boundary reached and stabilized."),
       check("boundary.latest", downward.boundary, "Latest accessible boundary reached and stabilized."),
       check("scroll.stabilized", upward.stable && downward.stable, "Scrolling stabilized in both directions."),
@@ -188,14 +197,16 @@ function scrollPassBudget(scrollHeight: number, step: number): number {
   return Math.min(EMERGENCY_MAX_SCROLL_PASSES, Math.max(MIN_SCROLL_PASSES, distanceAware));
 }
 
-async function observeViewport(document: Document): Promise<{ messages: MessageObservation[]; warnings: string[] }> {
+export async function observeViewport(document: Document): Promise<{ messages: MessageObservation[]; warnings: string[] }> {
   const warnings: string[] = [];
-  const elements = findMessageElements(document);
+  const structure = inspectChatGptPage(document, true);
+  const elements = structure.nodes;
+  warnings.push(...structure.summary.issues.map(issue => `ChatGPT layout requires review: ${issue}.`));
+  if (structure.summary.loading) warnings.push("ChatGPT layout requires review: generation_or_page_loading.");
   const seenFallbacks = new Set<string>();
   const messages: MessageObservation[] = [];
-  for (const [index, element] of elements.entries()) {
-    const role = determineRole(element);
-    const platformId = element.getAttribute("data-message-id") ?? element.querySelector("[data-message-id]")?.getAttribute("data-message-id") ?? undefined;
+  for (const [index, messageNode] of elements.entries()) {
+    const { element, role, platformId } = messageNode;
     const locator = platformId ? `chatgpt:message:${platformId}` : `chatgpt:viewport:${index}`;
     const representations = await representationsFor(element, locator);
     const semanticStructureSha256 = await semanticStructureHash(representations.find((item) => item.kind === "sanitized_html")?.value ?? "");
@@ -210,32 +221,17 @@ async function observeViewport(document: Document): Promise<{ messages: MessageO
       ...(platformId ? { platform_message_id: platformId } : {}),
       role,
       representations,
-      content_blocks: await preserveOriginalUserText(await extractContentBlocks(element, locator), representations, locator, role),
+      content_blocks: await preserveOriginalUserText(await extractContentBlocks(element, locator, messageNode.layout === "business_turn"), representations, locator, role),
       evidence_locators: [locator],
       observed_at: new Date().toISOString(),
-      platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256 },
+      platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256, layout: messageNode.layout, role_source: messageNode.roleSource, identity_source: messageNode.identitySource },
     });
   }
   return { messages, warnings };
 }
 
 function findMessageElements(document: Document): HTMLElement[] {
-  for (const selector of MESSAGE_SELECTORS) {
-    const found = [...document.querySelectorAll<HTMLElement>(selector)];
-    if (found.length > 0) {
-      return found.filter((element) => !found.some((candidate) => candidate !== element && candidate.contains(element)));
-    }
-  }
-  return [];
-}
-
-function determineRole(element: HTMLElement): MessageRole {
-  const role = element.getAttribute("data-message-author-role") ?? element.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role");
-  if (role === "user" || role === "assistant" || role === "tool") return role;
-  const testId = element.getAttribute("data-testid") ?? "";
-  if (/user/i.test(testId)) return "user";
-  if (/assistant/i.test(testId)) return "assistant";
-  return "unknown";
+  return inspectChatGptPage(document, true).nodes.map(node => node.element);
 }
 
 async function representationsFor(element: HTMLElement, locator: string): Promise<PreservedRepresentation[]> {
@@ -255,8 +251,8 @@ async function representation(kind: PreservedRepresentation["kind"], value: stri
   return { kind, value, sha256: await sha256(value), extraction_method: extractionMethod, evidence_locator: locator };
 }
 
-async function extractContentBlocks(message: HTMLElement, locator: string): Promise<ContentBlock[]> {
-  const root = message.querySelector<HTMLElement>(".markdown, [class*='markdown'], [data-message-content]") ?? message;
+async function extractContentBlocks(message: HTMLElement, locator: string, fullMessage = false): Promise<ContentBlock[]> {
+  const root = fullMessage ? message : message.querySelector<HTMLElement>(".markdown, [class*='markdown'], [data-message-content]") ?? message;
   const candidates = [...root.querySelectorAll<HTMLElement>("p,h1,h2,h3,h4,h5,h6,pre,ul,ol,blockquote,table,a,img,figure")]
     .filter((element) => !element.parentElement?.closest("p,h1,h2,h3,h4,h5,h6,pre,ul,ol,blockquote,table,a,figure") || element.parentElement?.closest("p,h1,h2,h3,h4,h5,h6,pre,ul,ol,blockquote,table,a,figure") === element);
   const blocks: ContentBlock[] = [];

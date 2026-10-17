@@ -7,7 +7,7 @@ describe('capture diagnostic handoff without any real capture',()=>{
   vi.resetModules();const {ChatGptAdapter}=await import('@hhs/adapter-chatgpt');let listener:((message:unknown,sender:unknown,sendResponse:(body:unknown)=>void)=>boolean)|undefined;
   vi.stubGlobal('chrome',{runtime:{onMessage:{addListener:(fn:typeof listener)=>{listener=fn;}},sendMessage:vi.fn(async()=>({ok:true,body:{}}))}});
   vi.stubGlobal('document',{});vi.stubGlobal('location',{href:'https://chatgpt.com/c/synthetic',hostname:'chatgpt.com'});
-  vi.spyOn(ChatGptAdapter.prototype,'detect').mockResolvedValue({detected:false,platform:'chatgpt',confidence:'low',reasons:['Synthetic not-ready fixture.']});
+  vi.spyOn(ChatGptAdapter.prototype,'detect').mockResolvedValue({detected:false,platform:'chatgpt',confidence:'low',reasons:['Synthetic not-ready fixture.'],reason:'conversation_not_rendered',structure:{layout:'unrecognized',messages:0,users:0,assistants:0,unknown_roles:0,turns:0,missing_ids:0,loading:false,issues:[],ready:false,completeness:'not_established'}});
   await import('./content.js');const sendResponse=vi.fn();
   expect(listener?.({type:'HHS_CAPTURE_CURRENT',operation:{operationId:'operation_synthetic',correlationId:'correlation_synthetic',eventSequence:5,expectedConversationReference:'conversation_synthetic'}},{},sendResponse)).toBe(true);
   await vi.waitFor(()=>expect(sendResponse).toHaveBeenCalled());
@@ -38,7 +38,7 @@ it('records the received safe stage/reason at the popup without overwriting last
  }});
  const storage={get:vi.fn(async()=>({collectorToken:'synthetic_token',captureOperationRecent:[]})),set:vi.fn()};
  const diagnostic=captureFailure('page_detection','conversation_not_rendered').diagnostic;
- vi.stubGlobal('chrome',{storage:{local:storage},runtime:{onMessage:{addListener:vi.fn()}},tabs:{query:vi.fn(async()=>[{id:77,url:'https://chatgpt.com/c/synthetic'}]),sendMessage:vi.fn(async(_id:number,message:{type:string})=>message.type==='HHS_OBSERVE_CAPTURE_IDENTITY'?{ok:true,identity:{platform:'chatgpt',opaqueAccountReference:'account_synthetic',opaqueConversationReference:'conversation_synthetic'}}:{ok:false,diagnostic,error:'PRIVATE conversation discarded'})}});
+ vi.stubGlobal('chrome',{storage:{local:storage},runtime:{onMessage:{addListener:vi.fn()}},scripting:{executeScript:vi.fn(async()=>[{result:{host:'chatgpt.com',conversation_path:true,ready:true,messages:2,loading:false}}])},tabs:{query:vi.fn(async()=>[{id:77,url:'https://chatgpt.com/c/synthetic'}]),sendMessage:vi.fn(async(_id:number,message:{type:string})=>message.type==='HHS_OBSERVE_CAPTURE_IDENTITY'?{ok:true,identity:{platform:'chatgpt',opaqueAccountReference:'account_synthetic',opaqueConversationReference:'conversation_synthetic'}}:{ok:false,diagnostic,error:'PRIVATE conversation discarded'})}});
  const events:Array<Record<string,unknown>>=[];let operationId='',correlationId='';
  vi.stubGlobal('fetch',vi.fn(async(url:string,init?:{method?:string;body?:string})=>{
   if(url.endsWith('/operations/latest'))return Response.json({operation:null});

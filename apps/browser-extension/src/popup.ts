@@ -1,3 +1,5 @@
+import { resolveDiscoveryAdapter } from "./discovery/registry.js";
+import { inspectRenderedPage } from "./discovery/page.js";
 import { captureDiagnosticError, safeCaptureFailure } from "@hhs/capture-operations";
 import type { DiscoverySummary, SiteDiscoveryResult } from "./discovery/run.js";
 import type { ComparisonOutcome } from "./discovery/compare.js";
@@ -13,7 +15,11 @@ const prepareRecaptureButton = document.querySelector<HTMLButtonElement>("#prepa
 const confirmRecaptureButton = document.querySelector<HTMLButtonElement>("#confirm-recapture")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 
+let pageInspectionReady = false;
+let pairingVerified = false;
+let actionBusy = false;
 void restoreState();
+void inspectCurrentPage();
 
 pairButton.addEventListener("click", async () => {
   setStatus("Pairing with local collector...");
@@ -36,7 +42,7 @@ pairButton.addEventListener("click", async () => {
     await chrome.storage.local.set({ collectorToken: body.token });
     await chrome.storage.local.remove("pendingRecaptureIntent");
     pairCode.value = "";
-    captureButton.disabled = false;
+    pairingVerified = true;
     inventoryButton.disabled = false;
     prepareRecaptureButton.disabled = false;
     confirmRecaptureButton.disabled = true;
@@ -46,6 +52,7 @@ pairButton.addEventListener("click", async () => {
 });
 
 prepareRecaptureButton.addEventListener("click", async () => {
+  if (actionBusy) return;
   setActionButtonsDisabled(true);
   try {
     const tabId = await activeChatGptTab("Manually open one cataloged ChatGPT conversation before preparing recapture.");
@@ -56,10 +63,11 @@ prepareRecaptureButton.addEventListener("click", async () => {
     setStatus(`Selected: ${String(result.intent.title ?? "cataloged conversation")}. No capture yet. Use Confirm One Immutable Recapture only after separate approval.`);
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), true);
-  } finally { await enablePairedActions(); }
+  } finally { actionBusy = false; await enablePairedActions(); }
 });
 
 confirmRecaptureButton.addEventListener("click", async () => {
+  if (actionBusy) return;
   const { pendingRecaptureIntent } = await chrome.storage.local.get("pendingRecaptureIntent");
   if (typeof pendingRecaptureIntent !== "string") return setStatus("Prepare the current cataloged conversation first.", true);
   const confirmed = confirm("Create exactly one new immutable capture version of the currently open, manually selected conversation? This does not navigate, regenerate, edit, or submit. Continue only with explicit approval for this exact conversation.");
@@ -98,13 +106,16 @@ confirmRecaptureButton.addEventListener("click", async () => {
   } catch {
     if (operation) await recordSafeCaptureFailure(operation);
     setStatus("Recapture stopped before completion. Inspect the latest safe operation report.", true);
-  } finally { await enablePairedActions(); }
+  } finally { actionBusy = false; await enablePairedActions(); }
 });
 
 captureButton.addEventListener("click", async () => {
+  if (actionBusy) return;
   setActionButtonsDisabled(true);
   let operation: OperationContext | undefined;
   try {
+    await inspectCurrentPage();
+    if (!pageInspectionReady) return setStatus("This page requires review or is still loading. No capture started.", true);
     const tabId = await activeChatGptTab("Open a ChatGPT conversation in the active tab before capturing.");
     const identityResult = await sendPageRequest<IdentityReceipt>(tabId, { type: "HHS_OBSERVE_CAPTURE_IDENTITY" });
     if (!identityResult.ok || !identityResult.identity) throw new Error("Capture identity could not be observed safely.");
@@ -141,10 +152,11 @@ captureButton.addEventListener("click", async () => {
     if (operation) await recordSafeCaptureFailure(operation,error);
     const diagnostic=safeCaptureFailure(error,"extension_channel");
     setStatus(`Capture stopped at ${diagnostic.stage}: ${diagnostic.reason_code}. Open the latest operation report.`,true);
-  } finally { await enablePairedActions(); }
+  } finally { actionBusy = false; await enablePairedActions(); }
 });
 
 inventoryButton.addEventListener("click", async () => {
+  if (actionBusy) return;
   const confirmed = confirm("Run one read-only sidebar inventory? This scrolls the ChatGPT sidebar and restores its initial position where possible. It will not open or capture conversations.");
   if (!confirmed) return;
   setActionButtonsDisabled(true);
@@ -157,10 +169,11 @@ inventoryButton.addEventListener("click", async () => {
     setStatus(`${receipt.verificationStatus}: ${receipt.observedCount} conversations. new=${receipt.classificationCounts.new}, possibly_changed=${receipt.classificationCounts.possibly_changed}, unchanged=${receipt.classificationCounts.unchanged}, missing=${receipt.classificationCounts.missing}, needs_review=${receipt.classificationCounts.needs_review}. Inventory: ${receipt.inventoryPath}`);
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), true);
-  } finally { await enablePairedActions(); }
+  } finally { actionBusy = false; await enablePairedActions(); }
 });
 
 discoverButton.addEventListener("click", async () => {
+  if (actionBusy) return;
   setActionButtonsDisabled(true);
   discoverySummary.hidden = true;
   try {
@@ -178,7 +191,7 @@ discoverButton.addEventListener("click", async () => {
     setStatus(/receiving end|establish connection|cannot access|no tab with id/i.test(detail)
       ? "This site is not supported for discovery yet. The extension holds no permission to read it."
       : detail, true);
-  } finally { await enablePairedActions(); }
+  } finally { actionBusy = false; await enablePairedActions(); }
 });
 
 function renderDiscoverySummary(summary: DiscoverySummary): void {
@@ -265,23 +278,25 @@ chrome.runtime.onMessage.addListener((message: unknown) => {
 
 async function restoreState(): Promise<void> {
   await enablePairedActions();
-  if (captureButton.disabled) return setStatus("Start the collector, enter its one-time pairing code, then pair.");
+  const {collectorToken}=await chrome.storage.local.get("collectorToken");
+  if(typeof collectorToken!=="string") return setStatus("Start the collector, enter its one-time pairing code, then pair.");
   await reconcileLatestOperation();
 }
 
 async function enablePairedActions(): Promise<void> {
   const { collectorToken, pendingRecaptureIntent } = await chrome.storage.local.get(["collectorToken", "pendingRecaptureIntent"]);
-  const disabled = typeof collectorToken !== "string";
-  captureButton.disabled = disabled;
+  const disabled = typeof collectorToken !== "string" || actionBusy || !pairingVerified;
+  captureButton.disabled = disabled || !pageInspectionReady;
   inventoryButton.disabled = disabled;
   prepareRecaptureButton.disabled = disabled;
   confirmRecaptureButton.disabled = disabled || typeof pendingRecaptureIntent !== "string";
   // Dry discovery writes nothing and never contacts the collector, so it needs no pairing.
-  discoverButton.disabled = false;
+  discoverButton.disabled = actionBusy;
 }
 
 function setActionButtonsDisabled(disabled: boolean): void {
-  captureButton.disabled = disabled;
+  actionBusy = disabled;
+  captureButton.disabled = disabled || !pageInspectionReady || !pairingVerified;
   discoverButton.disabled = disabled;
   inventoryButton.disabled = disabled;
   prepareRecaptureButton.disabled = disabled;
@@ -377,10 +392,13 @@ async function recordSafeCaptureFailure(operation: OperationContext,error?:unkno
 async function reconcileLatestOperation(): Promise<void> {
   try {
     const result = await collectorApi<{ operation: OperationReport | null }>("operations/latest", "GET");
+    pairingVerified=true;
+    await enablePairedActions();
     if (!result.operation) return setStatus("Collector paired. No capture operation has been recorded yet.");
     await rememberOperation(result.operation);
     setStatus(`Latest operation: ${result.operation.status}; last stage: ${result.operation.last_successful_stage}.${result.operation.stop_reason_code ? " Reason: "+result.operation.stop_reason_code+"." : ""}`);
   } catch {
+    pairingVerified=false;
     setStatus("Stored pairing is no longer valid. Pair with the current local collector before reconciling status.", true);
     captureButton.disabled = true;
     inventoryButton.disabled = true;
@@ -409,4 +427,35 @@ async function rememberOperation(report: OperationReport): Promise<void> {
 async function sha256Text(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Read-only current-page selection; never runs sidebar traversal or starts capture. */
+async function inspectCurrentPage(): Promise<void> {
+  pageInspectionReady=false;captureButton.disabled=true;
+  const panel=document.querySelector<HTMLElement>('#page-inspection');
+  const summary=document.querySelector<HTMLElement>('#page-status');
+  try {
+    const [tab]=await chrome.tabs.query({active:true,currentWindow:true});
+    if(tab?.id===undefined||!tab.url||!/^https?:/.test(tab.url))throw Error('unsupported_browser_page');
+    const [observation]=await chrome.scripting.executeScript({target:{tabId:tab.id},func:inspectRenderedPage});
+    const page=observation?.result;if(!page||page.host!==new URL(tab.url).hostname)throw Error('inspection_unavailable');
+    const resolution=resolveDiscoveryAdapter(page.host);
+    let assessment;
+    if(resolution.supported&&resolution.registration.capture&&page.conversation_path){
+      for(let pass=0;pass<7;pass++){
+        const [probe]=await chrome.scripting.executeScript({target:{tabId:tab.id},func:resolution.registration.capture.inspect});
+        assessment=probe?.result;
+        if(assessment?.ready||assessment&&assessment.messages>0&&!assessment.loading)break;
+        if(pass<6)await new Promise(resolve=>setTimeout(resolve,250));
+      }
+      pageInspectionReady=assessment?.ready===true;
+    }
+    const adapter=resolution.supported?resolution.registration.capture?.id:undefined;
+    const state=pageInspectionReady?'Recognized; ready for an authorized capture.':adapter&&page.conversation_path?'Not ready: loading, changed layout or evidence needs review.':'No verified extraction adapter for this page.';
+    if(summary)summary.textContent=page.host+' · '+page.kind+' · '+state;
+    if(panel)panel.textContent=JSON.stringify({page,adapter:adapter??null,assessment:assessment??null,capture_started:false},null,2);
+  }catch{
+    if(summary)summary.textContent='Page inspection unavailable. Open a normal website and reopen this popup.';
+    if(panel)panel.textContent='No page content was read or stored by this check.';
+  }finally{await enablePairedActions();}
 }

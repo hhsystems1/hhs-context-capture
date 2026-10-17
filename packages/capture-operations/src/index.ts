@@ -278,7 +278,7 @@ const transitionTable: Record<OperationEventType, { from: Array<OperationStatus 
 export const captureFailureStages = ['page_detection','identity_read','page_extraction','capture_validation','account_read','operation_event','collector_delivery','extension_channel'] as const;
 export type CaptureFailureStage = (typeof captureFailureStages)[number];
 type CaptureFailureMetadata = {stage:CaptureFailureStage;reason_code:string;safe_error_code:SafeErrorCode;safe_error_summary:string};
-const captureReasons = new Set(['local_failure','conversation_not_rendered','collector_unreachable','collector_invalid_response','collector_pairing_missing','stream_disconnected','type_error','reference_error','range_error','dom_error','identity_mismatch']);
+const captureReasons = new Set(['local_failure','unsupported_page','page_loading','page_requires_review','conversation_not_rendered','collector_unreachable','collector_invalid_response','collector_pairing_missing','stream_disconnected','type_error','reference_error','range_error','dom_error','identity_mismatch']);
 function failureMetadata(stage:CaptureFailureStage,reason:string): CaptureFailureMetadata {
   const code:SafeErrorCode = reason==='identity_mismatch' ? 'identity_mismatch' : reason==='collector_unreachable' ? 'collector_unavailable'
     : /^http_(?:401|403)$/.test(reason)||reason==='collector_pairing_missing' ? 'pairing_failed'

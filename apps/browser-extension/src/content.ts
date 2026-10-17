@@ -1,5 +1,5 @@
 import { captureDiagnosticError, captureFailure, captureStep, safeCaptureFailure } from "@hhs/capture-operations";
-import { ChatGptAdapter } from "@hhs/adapter-chatgpt";
+import { resolveDiscoveryAdapter } from "./discovery/registry.js";
 import { ChatGptDomSidebarPort, ChatGptSidebarInventoryAdapter, hashInventoryEvidence } from "@hhs/adapter-chatgpt/inventory";
 import { SCHEMA_VERSION, type CaptureBundle, type EvidenceRecord } from "@hhs/canonical-schema";
 import { verifyCapture } from "@hhs/capture-engine";
@@ -218,7 +218,9 @@ async function existingOpaqueAccountReference(): Promise<string> {
 }
 
 async function captureConversation(onProgress: (message: string) => void): Promise<CaptureBundle> {
-  const adapter = new ChatGptAdapter();
+  const resolution = resolveDiscoveryAdapter(new URL(location.href).hostname);
+  if (!resolution.supported || !resolution.registration.capture) throw captureFailure("page_detection", "unsupported_page");
+  const adapter = resolution.registration.capture.create();
   const startedAt = new Date().toISOString();
   const context = {
     document,
@@ -232,7 +234,7 @@ async function captureConversation(onProgress: (message: string) => void): Promi
     },
   };
   const detection = await captureStep("page_detection",()=>adapter.detect(context));
-  if (!detection.detected) throw captureFailure("page_detection","conversation_not_rendered");
+  if (!detection.detected) throw captureFailure("page_detection", detection.reason ?? "conversation_not_rendered");
   const identity = await captureStep("identity_read",()=>adapter.identifyConversation(context));
   const extracted = await captureStep("page_extraction",()=>adapter.capture(context));
   const verification = await captureStep("capture_validation",()=>verifyCapture(extracted));

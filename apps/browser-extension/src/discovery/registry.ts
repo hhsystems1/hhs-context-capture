@@ -1,3 +1,5 @@
+import { ChatGptAdapter } from "@hhs/adapter-chatgpt";
+import { type ChatGptPageSummary, inspectChatGptPage } from "@hhs/adapter-chatgpt/structure";
 import { ChatGptDiscoveryAdapter } from "@hhs/adapter-chatgpt/discovery";
 import type { DiscoveryAdapter } from "@hhs/discovery-engine/adapter-contract";
 
@@ -12,6 +14,7 @@ export interface DiscoveryRegistration {
   hostPattern: RegExp;
   hosts: string[];
   create(): DiscoveryAdapter;
+  capture?: { id: string; create(): ChatGptAdapter; inspect: () => ChatGptPageSummary };
 }
 
 export const DISCOVERY_REGISTRY: readonly DiscoveryRegistration[] = [
@@ -20,7 +23,8 @@ export const DISCOVERY_REGISTRY: readonly DiscoveryRegistration[] = [
     sourceKind: "chatgpt",
     hostPattern: /^(chatgpt\.com|chat\.openai\.com)$/,
     hosts: ["chatgpt.com", "chat.openai.com"],
-    create: () => new ChatGptDiscoveryAdapter()
+    create: () => new ChatGptDiscoveryAdapter(),
+    capture: { id: "chatgpt-conversation", create: () => new ChatGptAdapter(), inspect: inspectChatGptPage }
   }
 ];
 
