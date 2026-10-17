@@ -228,6 +228,12 @@ export async function prepareDiscoveryExchangeFromClient(
   }
   const missing = requested.filter((id) => !selectedByUuid.has(id));
   if (missing.length) throw new Error(`Conversation is outside the authorized clean corpus: ${missing.join(", ")}`);
+  const browserCaptures = selected.rows.filter(row => row.source_family === 'browser_capture').map(row => row.capture_version_id);
+  if (browserCaptures.length) {
+    if (browserCaptures.some(id => typeof id !== 'string')) throw new Error('Browser source capture identity is unavailable.');
+    const coverage = await client.query(BROWSER_USER_TEXT_COVERAGE_SQL, [workspaceId, browserCaptures]);
+    assertBrowserUserTextCoverage(coverage.rows);
+  }
   const evidenceResult = await client.query(AUTHORIZED_EVIDENCE_SQL, [workspaceId, requested, VERIFIED_NATIVE_EXPORT_CONTAINER]);
   const evidence = (evidenceResult.rows as Array<Record<string, unknown>>).map(toEvidence);
   if (evidence.some((row) => !row.resolution_exact || row.representation_sha256 !== sha256(row.text)
@@ -762,3 +768,32 @@ where c.workspace_id=$1 and sv.verification_status='complete' and (
 )
 group by c.source_conversation_id,c.title_representation,sv.source_family,sv.source_observed_at
 order by sv.source_observed_at,c.source_conversation_id`;
+
+// Export only: never silently equate block-valid assistant output with complete user coverage.
+// Existing immutable records/archives are retained; this requires evidence repair before generation.
+export function assertBrowserUserTextCoverage(rows: Array<Record<string, unknown>>) {
+  if (rows.length > 10000) throw new Error('Original user text coverage exceeded its bounded read.');
+  const normalized = (text: string) => text.replace(/\s+/g, ' ').trim();
+  for (const row of rows) {
+    const text = row.text_value;
+    if (typeof text !== 'string' || sha256(text) !== row.representation_sha256 || !Array.isArray(row.block_texts)
+      || row.block_texts.some(item => typeof item !== 'string')) throw new Error('Original user text coverage hash or structure mismatch.');
+    if (!text.trim()) continue;
+    const parts = row.block_texts as string[];
+    if (!parts.some(part => normalized(part) === normalized(text)) && normalized(parts.join('\n')) !== normalized(text)) {
+      throw new Error('Original user text is not fully represented by content blocks; repair source evidence before discovery.');
+    }
+  }
+}
+export const BROWSER_USER_TEXT_COVERAGE_SQL = `select /* original_user_text_coverage */ m.message_id,
+  rep->>'value' text_value,rep->>'sha256' representation_sha256,
+  coalesce((select array_agg(br->>'value' order by b.sequence,b.content_block_id)
+    from memory_v1.content_blocks b cross join lateral jsonb_array_elements(b.representations) br
+    where b.workspace_id=m.workspace_id and b.message_id=m.message_id
+      and b.capture_version_id is not distinct from m.capture_version_id
+      and b.source_version_id is not distinct from m.source_version_id
+      and br->>'representation_kind'='canonical_text'),array[]::text[]) block_texts
+  from memory_v1.messages m cross join lateral jsonb_array_elements(m.representations) rep
+  where m.workspace_id=$1 and m.capture_version_id=any($2::text[]) and m.role='user'
+    and rep->>'representation_kind'='canonical_text'
+  order by m.message_id limit 10001`;

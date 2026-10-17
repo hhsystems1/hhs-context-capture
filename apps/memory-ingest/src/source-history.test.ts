@@ -6,7 +6,7 @@ import { HISTORY_CONVERSATIONS_SQL, HISTORY_EVIDENCE_SQL, readSourceHistoryFromC
 const workspace = "proof-workspace-synthetic";
 const text = "An original user statement.";
 const edge = { provenance_edge_id: "edge_1", source_conversation_id: "source_1", message_id: "message_1", sequence: 1,
-  role: "user", relation: "supports", source_version_id: "version_1", capture_version_id: null,
+  role: "user", active_path: true, relation: "supports", source_version_id: "version_1", capture_version_id: null,
   representation_kind: "canonical_text", representation_sha256: sha256(text), text_value: text, verification_status: "complete" };
 
 describe("historical evidence read model", () => {
@@ -54,7 +54,7 @@ describe("historical evidence read model", () => {
       if (sql.includes("group by c.conversation_id")) return { rowCount: 1, rows: [{ conversation_id: "conv_1", source_conversation_id: "source_1", title: "Synthetic", observations_count: 1 }] };
       if (sql.startsWith("select observation_id")) return { rowCount: 1, rows: [{ observation_id: "observation_1", pipeline_version: "pipeline_1" }] };
       if (sql === HISTORY_CONTEXT_SQL) {
-        expect(args).toEqual([workspace, "conv_1", ["message_1"], 50]);
+        expect(args).toEqual([workspace, "conv_1", ["message_1"], 51]);
         return { rows: [] };
       }
       expect(sql).toBe(HISTORY_EVIDENCE_SQL);
@@ -85,7 +85,7 @@ describe("surrounding original user context", () => {
       if (sql.startsWith("select observation_id")) return { rowCount: 1, rows: [{ observation_id: "observation_1", pipeline_version: "pipeline_1" }] };
       if (sql === HISTORY_EVIDENCE_SQL) return { rows: [{ ...edge, message_id: "assistant_1", role: "assistant", sequence: 2 }] };
       expect(sql).toBe(HISTORY_CONTEXT_SQL);
-      expect(args).toEqual([workspace, "conv_1", ["assistant_1"], 50]);
+      expect(args).toEqual([workspace, "conv_1", ["assistant_1"], 51]);
       return { rows: [row] };
     } } as unknown as DbClient;
     const result = await readSourceHistoryFromClient(client, workspace, { conversation: "source_1", observation: "observation_1" });

@@ -1,0 +1,11 @@
+import { describe,it,expect } from 'vitest';
+import { sha256 } from '@hhs/memory-schema';
+import type { ContentBlock,PreservedRepresentation } from '@hhs/canonical-schema';
+import { preserveOriginalUserText } from './user-text-coverage.js';
+const reps=(text:string):PreservedRepresentation[]=>['canonical_text','inner_text','text_content','sanitized_html'].map(kind=>({kind:kind as PreservedRepresentation['kind'],value:text,sha256:sha256(text),extraction_method:'fixture',evidence_locator:'original:message'}));
+const block=(text:string):ContentBlock=>({block_id:'existing',type:'paragraph',sequence:0,representations:reps(text),attributes:{},platform_metadata:{}});
+describe('complete original user text capture',()=>{
+ it('preserves plain div text even without semantic child blocks',async()=>{const original=reps('No, build the platform itself.');const result=await preserveOriginalUserText([],original,'original:message','user');expect(result).toHaveLength(1);expect(result[0]!.representations).toEqual(original);expect(result[0]!.platform_metadata.projection).toBe('complete_original_user_text_v1');expect(result[0]!.representations.every(r=>sha256(r.value)===r.sha256)).toBe(true);});
+ it('retains semantic blocks and the plain text omitted around them without mutating evidence',async()=>{const existing=[block('linked document')];const original=reps('Please reject the old proposal. linked document');const result=await preserveOriginalUserText(existing,original,'original:message','user');expect(existing).toHaveLength(1);expect(result).toHaveLength(2);expect(result[0]).toEqual(existing[0]);expect(result[1]!.representations).toEqual(original);expect(await preserveOriginalUserText(result,original,'original:message','user')).toEqual(result);});
+ it('does not duplicate complete blocks or invent empty/assistant user content',async()=>{const original=reps('First paragraph. Second paragraph.');const existing=[block('First paragraph.'),{...block('Second paragraph.'),block_id:'second',sequence:1}];expect(await preserveOriginalUserText(existing,original,'x','user')).toBe(existing);expect(await preserveOriginalUserText([],reps(''),'x','user')).toEqual([]);expect(await preserveOriginalUserText([],original,'x','assistant')).toEqual([]);});
+});

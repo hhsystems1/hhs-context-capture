@@ -57,15 +57,15 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
       [workspace, input.observation, selected.rows[0].pipeline_version, input.cursor ?? null, PAGE_SIZE + 1]);
     const evidence = result.rows.slice(0, PAGE_SIZE).map(sourceEvidence);
     const context = evidence.length ? await client.query(HISTORY_CONTEXT_SQL,
-      [workspace, row.conversation_id, [...new Set(evidence.map(item => item.message_id))], PAGE_SIZE]) : { rows: [] };
-    const conversation_context = context.rows.map(sourceConversationContext);
+      [workspace, row.conversation_id, [...new Set(evidence.map(item => item.message_id))], PAGE_SIZE + 1]) : { rows: [] };
+    const conversation_context = context.rows.slice(0, PAGE_SIZE).map(sourceConversationContext);
     for (const item of conversation_context) {
       const anchor = evidence.find(source => source.message_id === item.anchor_message_id);
       if (!anchor || item.source_conversation_id !== conversation.source_conversation_id
         || item.source_version_id !== anchor.source_version_id || item.capture_version_id !== anchor.capture_version_id
         || (item.position === "before" ? item.sequence >= anchor.sequence : item.sequence <= anchor.sequence)) throw new Error("Source context scope mismatch.");
     }
-    return { view: "evidence" as const, conversation, observation_id: input.observation, evidence, conversation_context,
+    return { view: "evidence" as const, conversation, observation_id: input.observation, evidence, conversation_context, conversation_context_truncated: context.rows.length > PAGE_SIZE,
       next_cursor: result.rows.length > PAGE_SIZE ? evidence.at(-1)!.provenance_edge_id : null };
   }
   const result = await client.query(`select observation_id,status,payload from memory_v1.observations
@@ -93,7 +93,7 @@ function sourceExcerpt(row: Record<string, unknown>) {
   }
   return {
     source_conversation_id: String(row.source_conversation_id),
-    message_id: String(row.message_id), sequence: Number(row.sequence), role: String(row.role),
+    message_id: String(row.message_id), sequence: Number(row.sequence), role: String(row.role), active_path: row.active_path === true,
     source_version_id: row.source_version_id === null ? null : String(row.source_version_id),
     capture_version_id: row.capture_version_id === null ? null : String(row.capture_version_id),
     representation_kind: String(row.representation_kind), representation_sha256: String(row.representation_sha256),
@@ -111,30 +111,27 @@ export function sourceConversationContext(row: Record<string, unknown>) {
   return { ...sourceExcerpt(row), role: "user" as const, anchor_message_id: String(row.anchor_message_id), position: row.position as "before" | "after" };
 }
 
-// Read original adjacent user turns from the SAME immutable source/capture version.
-// They are surrounding conversation context, not new findings or provenance edges.
-// Message representations are intentional: some existing browser captures retained
-// user messages but have no extracted user content blocks.
+// Original user turns in source order, scoped by already verified immutable anchors.
+// They are original message evidence, not new blocks, findings or provenance edges.
 export const HISTORY_CONTEXT_SQL = `with anchors as (
   select m.* from memory_v1.messages m
-  where m.workspace_id=$1 and m.conversation_id=$2 and m.message_id=any($3::text[])
+  where m.workspace_id=$1 and m.conversation_id=$2 and m.active_path and m.message_id=any($3::text[])
 )
 select a.message_id anchor_message_id,
   case when m.sequence<a.sequence then 'before' else 'after' end position,
-  c.source_conversation_id,m.message_id,m.sequence,m.role,m.source_version_id,m.capture_version_id,
+  c.source_conversation_id,m.message_id,m.sequence,m.role,m.active_path,m.source_version_id,m.capture_version_id,
   coalesce(sv.verification_status,cv.verification_status) verification_status,
   rep->>'representation_kind' representation_kind,rep->>'sha256' representation_sha256,rep->>'value' text_value
-from anchors a
-cross join lateral (
-  (select u.* from memory_v1.messages u where u.workspace_id=a.workspace_id and u.conversation_id=a.conversation_id
-    and u.source_version_id is not distinct from a.source_version_id and u.capture_version_id is not distinct from a.capture_version_id
-    and u.role='user' and u.sequence<a.sequence order by u.sequence desc,u.message_id limit 1)
-  union all
-  (select u.* from memory_v1.messages u where u.workspace_id=a.workspace_id and u.conversation_id=a.conversation_id
-    and u.source_version_id is not distinct from a.source_version_id and u.capture_version_id is not distinct from a.capture_version_id
-    and u.role='user' and u.sequence>a.sequence order by u.sequence,u.message_id limit 1)
-) m
+from memory_v1.messages m
 join memory_v1.conversations c on c.workspace_id=m.workspace_id and c.conversation_id=m.conversation_id
+join lateral (
+  select a.message_id,a.sequence from anchors a
+  where m.source_version_id is not distinct from a.source_version_id
+    and m.capture_version_id is not distinct from a.capture_version_id
+    and m.message_id<>a.message_id and m.sequence<>a.sequence
+    and not(m.message_id=any($3::text[]))
+  order by abs(m.sequence-a.sequence),a.message_id limit 1
+) a on true
 cross join lateral (
   select value rep from jsonb_array_elements(m.representations)
   where value->>'representation_kind' in ('canonical_text','plain_text','rendered_text')
@@ -142,12 +139,13 @@ cross join lateral (
 ) r
 left join memory_v1.source_versions sv on sv.workspace_id=m.workspace_id and sv.source_version_id=m.source_version_id
 left join memory_v1.capture_versions cv on cv.workspace_id=m.workspace_id and cv.capture_version_id=m.capture_version_id
-order by a.sequence,m.sequence,m.message_id limit $4`;
+where m.workspace_id=$1 and m.conversation_id=$2 and m.role='user' and m.active_path
+order by m.sequence,m.message_id limit $4`;
 
 // Reuses the exact workspace/version/message/representation linkage employed by
 // prepareReconciliationInputFromClient. Only verified excerpts leave this read boundary.
 export const HISTORY_EVIDENCE_SQL = `select p.provenance_edge_id,p.relation,p.representation_kind,p.representation_sha256,
-  p.source_version_id,p.capture_version_id,c.source_conversation_id,m.message_id,m.sequence,m.role,
+  p.source_version_id,p.capture_version_id,c.source_conversation_id,m.message_id,m.sequence,m.role,m.active_path,
   coalesce(sv.verification_status,cv.verification_status) verification_status,
   (select rep->>'value' from jsonb_array_elements(b.representations) rep
     where rep->>'representation_kind'=p.representation_kind and rep->>'sha256'=p.representation_sha256 limit 1) text_value

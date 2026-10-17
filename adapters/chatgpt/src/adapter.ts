@@ -17,6 +17,8 @@ import {
   type PlatformAdapter,
 } from "@hhs/capture-engine";
 
+import { preserveOriginalUserText } from './user-text-coverage.js';
+
 const MESSAGE_SELECTORS = ["[data-message-author-role]", "article[data-testid^='conversation-turn-']"];
 const STABLE_PASSES = 3;
 const MIN_SCROLL_PASSES = 200;
@@ -208,7 +210,7 @@ async function observeViewport(document: Document): Promise<{ messages: MessageO
       ...(platformId ? { platform_message_id: platformId } : {}),
       role,
       representations,
-      content_blocks: await extractContentBlocks(element, locator),
+      content_blocks: await preserveOriginalUserText(await extractContentBlocks(element, locator), representations, locator, role),
       evidence_locators: [locator],
       observed_at: new Date().toISOString(),
       platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256 },

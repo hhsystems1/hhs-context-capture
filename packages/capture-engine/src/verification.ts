@@ -17,6 +17,12 @@ export function verifyCapture(extracted: ExtractedConversation): {
   add("representations.text_stable", extracted.messages.every((message) => !representationDrift(message).some((kind) => kind === "inner_text" || kind === "text_content" || kind === "canonical_text")), "No message textual representation changed between observations.");
   add("representations.structure_stable", extracted.messages.every((message) => semanticStructureStable(message)), "Semantic message structure remained stable; distinct raw sanitized HTML variants were preserved.", "warning");
   add("content_blocks.hashed", extracted.messages.every((message) => message.content_blocks.every((block) => block.representations.length >= 4 && block.representations.every((representation) => /^[a-f0-9]{64}$/.test(representation.sha256)))), "Every extracted content block representation is present and hashed.");
+  add("user_text.covered_by_blocks", extracted.messages.filter(message => message.role === 'user').every(message => {
+    const full = message.representations.find(item => item.kind === 'canonical_text')?.value ?? '';
+    const parts = message.content_blocks.map(block => block.representations.find(item => item.kind === 'canonical_text')?.value ?? '');
+    const normalized = (text: string) => text.replace(/\s+/g, ' ').trim();
+    return !full.trim() || parts.some(part => normalized(part) === normalized(full)) || normalized(parts.join('\n')) === normalized(full);
+  }), "Every nonempty original user text is covered by preserved block text.");
   add("transcript.count_matches", extracted.messages.length === new Set(extracted.messages.map((message) => message.sequence)).size, "Canonical transcript and normalized message projections use the same accumulated message set.");
   add("code.preserved", extracted.messages.flatMap((message) => message.content_blocks).filter((block) => block.type === "code").every((block) => block.representations.some((item) => item.kind === "text_content") && block.representations.some((item) => item.kind === "sanitized_html")), "Every detected code block preserved textual and structural representations.");
   add("tables.preserved", extracted.messages.flatMap((message) => message.content_blocks).filter((block) => block.type === "table").every((block) => block.representations.some((item) => item.kind === "inner_text") && block.representations.some((item) => item.kind === "sanitized_html")), "Every detected table preserved rendered text and structure.");
