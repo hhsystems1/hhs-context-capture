@@ -4,7 +4,7 @@ import { prepareReconciliationInputFromClient, hasSupportingUserEvidence } from 
 
 // Read models over existing immutable observations/provenance. No new queue,
 // ontology, evidence store, reconciliation or approval authority.
-export interface HistoryInput { conversation?: string; observation?: string; cursor?: string }
+export interface HistoryInput { conversation?: string; observation?: string; cursor?: string; focus?: string }
 export class SourceHistoryNotFound extends Error {}
 const PAGE_SIZE = 50;
 const EXCERPT_LIMIT = 2400;
@@ -15,6 +15,8 @@ export const HISTORY_CONVERSATIONS_SQL = `select c.source_conversation_id,
   join memory_v1.observations o on o.workspace_id=c.workspace_id and o.conversation_id=c.conversation_id
   where c.workspace_id=$1 and ($2::text is null or c.source_conversation_id > $2)
   group by c.source_conversation_id,c.title_representation
+  having ($4::text is null or bool_or(position($4 in regexp_replace(lower(
+    coalesce(c.title_representation->>'value','') || ' ' || coalesce(o.payload->>'statement','')), '[^a-z0-9]', '', 'g')) > 0))
   order by c.source_conversation_id limit $3`;
 
 export async function readSourceHistory(workspace: string, input: HistoryInput) {
@@ -28,7 +30,7 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
   await client.query("set local statement_timeout = 5000");
   await client.query("set local lock_timeout = 2000");
   if (!input.conversation) {
-    const result = await client.query(HISTORY_CONVERSATIONS_SQL, [workspace, input.cursor ?? null, PAGE_SIZE + 1]);
+    const result = await client.query(HISTORY_CONVERSATIONS_SQL, [workspace, input.cursor ?? null, PAGE_SIZE + 1, input.focus ?? null]);
     const conversations = result.rows.slice(0, PAGE_SIZE).map(row => ({
       source_conversation_id: String(row.source_conversation_id),
       title: row.title === null ? null : String(row.title), observations_count: Number(row.observations_count)
@@ -54,7 +56,16 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
     const result = await client.query(HISTORY_EVIDENCE_SQL,
       [workspace, input.observation, selected.rows[0].pipeline_version, input.cursor ?? null, PAGE_SIZE + 1]);
     const evidence = result.rows.slice(0, PAGE_SIZE).map(sourceEvidence);
-    return { view: "evidence" as const, conversation, observation_id: input.observation, evidence,
+    const context = evidence.length ? await client.query(HISTORY_CONTEXT_SQL,
+      [workspace, row.conversation_id, [...new Set(evidence.map(item => item.message_id))], PAGE_SIZE]) : { rows: [] };
+    const conversation_context = context.rows.map(sourceConversationContext);
+    for (const item of conversation_context) {
+      const anchor = evidence.find(source => source.message_id === item.anchor_message_id);
+      if (!anchor || item.source_conversation_id !== conversation.source_conversation_id
+        || item.source_version_id !== anchor.source_version_id || item.capture_version_id !== anchor.capture_version_id
+        || (item.position === "before" ? item.sequence >= anchor.sequence : item.sequence <= anchor.sequence)) throw new Error("Source context scope mismatch.");
+    }
+    return { view: "evidence" as const, conversation, observation_id: input.observation, evidence, conversation_context,
       next_cursor: result.rows.length > PAGE_SIZE ? evidence.at(-1)!.provenance_edge_id : null };
   }
   const result = await client.query(`select observation_id,status,payload from memory_v1.observations
@@ -75,14 +86,14 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
     next_cursor: result.rows.length > PAGE_SIZE ? observations.at(-1)!.observation_id : null };
 }
 
-export function sourceEvidence(row: Record<string, unknown>) {
+function sourceExcerpt(row: Record<string, unknown>) {
   const text = row.text_value;
   if (typeof text !== "string" || sha256(text) !== row.representation_sha256 || row.verification_status !== "complete") {
     throw new Error("Source evidence verification failed.");
   }
   return {
-    provenance_edge_id: String(row.provenance_edge_id), source_conversation_id: String(row.source_conversation_id),
-    message_id: String(row.message_id), sequence: Number(row.sequence), role: String(row.role), relation: String(row.relation),
+    source_conversation_id: String(row.source_conversation_id),
+    message_id: String(row.message_id), sequence: Number(row.sequence), role: String(row.role),
     source_version_id: row.source_version_id === null ? null : String(row.source_version_id),
     capture_version_id: row.capture_version_id === null ? null : String(row.capture_version_id),
     representation_kind: String(row.representation_kind), representation_sha256: String(row.representation_sha256),
@@ -90,6 +101,48 @@ export function sourceEvidence(row: Record<string, unknown>) {
     verification: "hash_matched" as const
   };
 }
+
+export function sourceEvidence(row: Record<string, unknown>) {
+  return { ...sourceExcerpt(row), provenance_edge_id: String(row.provenance_edge_id), relation: String(row.relation) };
+}
+
+export function sourceConversationContext(row: Record<string, unknown>) {
+  if (row.role !== "user" || !["before", "after"].includes(String(row.position))) throw new Error("Invalid source context.");
+  return { ...sourceExcerpt(row), role: "user" as const, anchor_message_id: String(row.anchor_message_id), position: row.position as "before" | "after" };
+}
+
+// Read original adjacent user turns from the SAME immutable source/capture version.
+// They are surrounding conversation context, not new findings or provenance edges.
+// Message representations are intentional: some existing browser captures retained
+// user messages but have no extracted user content blocks.
+export const HISTORY_CONTEXT_SQL = `with anchors as (
+  select m.* from memory_v1.messages m
+  where m.workspace_id=$1 and m.conversation_id=$2 and m.message_id=any($3::text[])
+)
+select a.message_id anchor_message_id,
+  case when m.sequence<a.sequence then 'before' else 'after' end position,
+  c.source_conversation_id,m.message_id,m.sequence,m.role,m.source_version_id,m.capture_version_id,
+  coalesce(sv.verification_status,cv.verification_status) verification_status,
+  rep->>'representation_kind' representation_kind,rep->>'sha256' representation_sha256,rep->>'value' text_value
+from anchors a
+cross join lateral (
+  (select u.* from memory_v1.messages u where u.workspace_id=a.workspace_id and u.conversation_id=a.conversation_id
+    and u.source_version_id is not distinct from a.source_version_id and u.capture_version_id is not distinct from a.capture_version_id
+    and u.role='user' and u.sequence<a.sequence order by u.sequence desc,u.message_id limit 1)
+  union all
+  (select u.* from memory_v1.messages u where u.workspace_id=a.workspace_id and u.conversation_id=a.conversation_id
+    and u.source_version_id is not distinct from a.source_version_id and u.capture_version_id is not distinct from a.capture_version_id
+    and u.role='user' and u.sequence>a.sequence order by u.sequence,u.message_id limit 1)
+) m
+join memory_v1.conversations c on c.workspace_id=m.workspace_id and c.conversation_id=m.conversation_id
+cross join lateral (
+  select value rep from jsonb_array_elements(m.representations)
+  where value->>'representation_kind' in ('canonical_text','plain_text','rendered_text')
+  order by case value->>'representation_kind' when 'canonical_text' then 0 when 'plain_text' then 1 else 2 end limit 1
+) r
+left join memory_v1.source_versions sv on sv.workspace_id=m.workspace_id and sv.source_version_id=m.source_version_id
+left join memory_v1.capture_versions cv on cv.workspace_id=m.workspace_id and cv.capture_version_id=m.capture_version_id
+order by a.sequence,m.sequence,m.message_id limit $4`;
 
 // Reuses the exact workspace/version/message/representation linkage employed by
 // prepareReconciliationInputFromClient. Only verified excerpts leave this read boundary.

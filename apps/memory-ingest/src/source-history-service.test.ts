@@ -50,6 +50,15 @@ describe("trusted historical source routes", () => {
       expect(result.calls).toEqual([]);
     }
   });
+  it("accepts a bounded literal project focus only for the authorized source inventory", async () => {
+    const result = await request("/memory/sources/stephen-history/history?focus=tech4health");
+    expect(result.status).toBe(200);
+    expect(result.calls).toEqual([[source.workspaceId, { focus: "tech4health" }]]);
+    for (const query of ["focus=a", "focus=%25", "focus=a&focus=b", "focus=tech4health&conversation=source_1", "focus="+"a".repeat(65)]) {
+      const invalid = await request("/memory/sources/stephen-history/history?"+query);
+      expect(invalid.status).toBe(400); expect(invalid.calls).toEqual([]);
+    }
+  });
   it("redacts backend failure details and distinguishes missing records", async () => {
     expect(await request("/memory/sources/stephen-history/history", { fail: "missing" })).toMatchObject({ status: 404, data: { error: "source_record_not_found" } });
     const failed = await request("/memory/sources/stephen-history/history", { fail: "database" });

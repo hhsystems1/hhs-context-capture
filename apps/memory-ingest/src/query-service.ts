@@ -114,10 +114,10 @@ export function createQueryService(config: QueryServiceConfig, deps: QueryServic
         const source = config.sourceCollections?.find(item => item.sourceRef === historyMatch[1]);
         if (!source) return json(response, 404, { error: "source_not_configured" });
         const params = sourceUrl.searchParams;
-        if (Array.from(params.keys()).some(key => !["conversation", "observation", "cursor"].includes(key)) ||
+        if (Array.from(params.keys()).some(key => !["conversation", "observation", "cursor", "focus"].includes(key)) ||
           new Set(params.keys()).size !== Array.from(params.keys()).length ||
-          Array.from(params.values()).some(value => !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) ||
-          (params.has("observation") && !params.has("conversation"))) return json(response, 400, { error: "invalid_source_request" });
+          Array.from(params).some(([key,value]) => !(key === "focus" ? /^[a-z0-9]{3,64}$/ : /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/).test(value)) ||
+          (params.has("observation") && !params.has("conversation")) || (params.has("focus") && params.has("conversation"))) return json(response, 400, { error: "invalid_source_request" });
         if (!deps.sourceHistory) return json(response, 501, { error: "source_history_not_configured" });
         try {
           const result = await deps.sourceHistory(source.workspaceId, Object.fromEntries(params));

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sha256 } from "@hhs/memory-schema";
 import type { DbClient } from "./db.js";
-import { HISTORY_CONVERSATIONS_SQL, HISTORY_EVIDENCE_SQL, readSourceHistoryFromClient, sourceEvidence, SourceHistoryNotFound } from "./source-history.js";
+import { HISTORY_CONVERSATIONS_SQL, HISTORY_EVIDENCE_SQL, readSourceHistoryFromClient, sourceEvidence, sourceConversationContext, HISTORY_CONTEXT_SQL, SourceHistoryNotFound } from "./source-history.js";
 
 const workspace = "proof-workspace-synthetic";
 const text = "An original user statement.";
@@ -27,7 +27,7 @@ describe("historical evidence read model", () => {
     const client = { query: async (sql: string, args?: unknown[]) => {
       if (sql.startsWith("set local")) return { rows: [] };
       expect(sql).toBe(HISTORY_CONVERSATIONS_SQL);
-      expect(args).toEqual([workspace, "source_before", 51]);
+      expect(args).toEqual([workspace, "source_before", 51, null]);
       return { rows };
     } } as unknown as DbClient;
     const result = await readSourceHistoryFromClient(client, workspace, { cursor: "source_before" });
@@ -53,11 +53,42 @@ describe("historical evidence read model", () => {
       if (sql.startsWith("set local")) return { rows: [] };
       if (sql.includes("group by c.conversation_id")) return { rowCount: 1, rows: [{ conversation_id: "conv_1", source_conversation_id: "source_1", title: "Synthetic", observations_count: 1 }] };
       if (sql.startsWith("select observation_id")) return { rowCount: 1, rows: [{ observation_id: "observation_1", pipeline_version: "pipeline_1" }] };
+      if (sql === HISTORY_CONTEXT_SQL) {
+        expect(args).toEqual([workspace, "conv_1", ["message_1"], 50]);
+        return { rows: [] };
+      }
       expect(sql).toBe(HISTORY_EVIDENCE_SQL);
       expect(args).toEqual([workspace, "observation_1", "pipeline_1", null, 51]);
       return { rows: [edge] };
     } } as unknown as DbClient;
     const result = await readSourceHistoryFromClient(client, workspace, { conversation: "source_1", observation: "observation_1" });
     expect(result).toMatchObject({ view: "evidence", observation_id: "observation_1", next_cursor: null, evidence: [{ excerpt: text }] });
+  });
+});
+
+
+describe("surrounding original user context", () => {
+  const row = { ...edge, anchor_message_id: "assistant_1", position: "before", message_id: "user_1" };
+  it("hash-verifies original user text without pretending it is an observation's provenance edge", () => {
+    const context = sourceConversationContext(row);
+    expect(context).toMatchObject({ anchor_message_id: "assistant_1", position: "before", role: "user", message_id: "user_1", excerpt: text, verification: "hash_matched" });
+    expect(context).not.toHaveProperty("provenance_edge_id");
+    for (const changed of [{ text_value: "tampered" }, { verification_status: "partial" }, { role: "assistant" }, { position: "arbitrary" }]) {
+      expect(() => sourceConversationContext({ ...row, ...changed })).toThrow();
+    }
+  });
+
+  it("reads context only for the already verified anchors in the requested conversation", async () => {
+    const client = { query: async (sql: string, args?: unknown[]) => {
+      if (sql.startsWith("set local")) return { rows: [] };
+      if (sql.includes("group by c.conversation_id")) return { rowCount: 1, rows: [{ conversation_id: "conv_1", source_conversation_id: "source_1", title: "Synthetic", observations_count: 1 }] };
+      if (sql.startsWith("select observation_id")) return { rowCount: 1, rows: [{ observation_id: "observation_1", pipeline_version: "pipeline_1" }] };
+      if (sql === HISTORY_EVIDENCE_SQL) return { rows: [{ ...edge, message_id: "assistant_1", role: "assistant", sequence: 2 }] };
+      expect(sql).toBe(HISTORY_CONTEXT_SQL);
+      expect(args).toEqual([workspace, "conv_1", ["assistant_1"], 50]);
+      return { rows: [row] };
+    } } as unknown as DbClient;
+    const result = await readSourceHistoryFromClient(client, workspace, { conversation: "source_1", observation: "observation_1" });
+    expect(result).toMatchObject({ evidence: [{ role: "assistant" }], conversation_context: [{ role: "user", position: "before" }] });
   });
 });
