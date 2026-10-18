@@ -28,7 +28,7 @@ type ObservedBranchIndicator = { key: string; current?: number; total?: number; 
 
 export class ChatGptAdapter implements PlatformAdapter {
   readonly platform = "chatgpt";
-  readonly adapterVersion = "0.1.4";
+  readonly adapterVersion = "0.1.5";
 
   async detect(context: AdapterContext) {
     const url=new URL(context.sourceUrl);
@@ -79,26 +79,16 @@ export class ChatGptAdapter implements PlatformAdapter {
     collectBranchIndicators(context.document, observedBranchIndicators);
     const initialCount = accumulator.size;
 
-    context.onProgress("Loading earlier accessible messages");
-    const upward = await scrollUntilStable(scrollContainer, -1, accumulator, context, observedBranchIndicators, layoutEvidence);
-    if (upward.boundary) {
-      await addScreenshot(context, evidence, "earliest_boundary");
-      evidence.push(await captureDomEvidence(context.document, "earliest_boundary"));
-    }
-
-    context.onProgress("Loading later accessible messages");
-    const downward = await scrollUntilStable(scrollContainer, 1, accumulator, context, observedBranchIndicators, layoutEvidence);
-    if (downward.boundary) {
-      await addScreenshot(context, evidence, "latest_boundary");
-      evidence.push(await captureDomEvidence(context.document, "latest_boundary"));
-    }
+    const coverage = await establishSourceCoverage(scrollContainer, accumulator, context, observedBranchIndicators, layoutEvidence, evidence);
+    const {upward, downward} = coverage;
+    const activePathNativeIds = accumulator.finalize().messages.flatMap(message => message.platform_message_id ? [message.platform_message_id] : []);
 
     context.onProgress("Inspecting existing response alternatives");
     const traversedBranches = await traverseExistingBranches(context, accumulator, evidence, layoutEvidence);
     collectBranchIndicators(context.document, observedBranchIndicators);
     const branches = reconcileObservedBranches(traversedBranches, observedBranchIndicators);
     const accumulated = accumulator.finalize();
-    warnings.push(...upward.warnings, ...downward.warnings, ...accumulated.warnings);
+    warnings.push(...coverage.warnings, ...accumulated.warnings);
     const attachments = extractAttachments(accumulated.messages);
     const citations = extractCitations(accumulated.messages);
     const artifacts = extractArtifacts(accumulated.messages);
@@ -119,6 +109,7 @@ export class ChatGptAdapter implements PlatformAdapter {
     const checks: VerificationCheck[] = [
       check("layout.authorship_identity", layoutEvidence.issues.size === 0, "Every observed message layout had unambiguous authorship and source identity."),
       check("layout.turn_coverage", turnCoverage.unresolved === 0, "Each observed modern turn was resolved to one source-observed ordered native pair; isolated or conflicting halves require review."),
+      check("source.coverage_coherent", coverage.coherent, "Two consecutive accessible-source sweeps retained the same message set and revalidated both native boundary observations after evidence reads; unknown source history remains unestablished."),
       check("boundary.earliest", upward.boundary, "Earliest accessible boundary reached and stabilized."),
       check("boundary.latest", downward.boundary, "Latest accessible boundary reached and stabilized."),
       check("scroll.stabilized", upward.stable && downward.stable, "Scrolling stabilized in both directions."),
@@ -148,6 +139,12 @@ export class ChatGptAdapter implements PlatformAdapter {
         accumulated_message_count: accumulated.messages.length,
         virtualized_dom_accumulation: true,
         turn_coverage: turnCoverage,
+        source_coverage_baseline: {
+          scope: 'accessible_rendered_conversation', authority: 'observations_only', source_history_completeness: 'not_established',
+          initial_native_message_ids: initial.messages.flatMap(message => message.platform_message_id ? [message.platform_message_id] : []),
+          active_path_native_message_ids: activePathNativeIds, coherent: coverage.coherent,
+          rounds: coverage.rounds, branch_coverage: 'verified_separately',
+        },
         scroll_container: scrollContainerObservation,
         upward_scroll_metrics: upward.metrics,
         downward_scroll_metrics: downward.metrics,
@@ -159,6 +156,61 @@ export class ChatGptAdapter implements PlatformAdapter {
       },
     };
   }
+}
+
+type BoundaryObservation = {top:number;height:number;client:number;messages:Array<{key:string;role:string;text_sha256?:string|undefined}>};
+type BoundaryWitness = {verified:boolean;before:BoundaryObservation;after:BoundaryObservation};
+type CoverageRound = {round:number;count:number;earliest:BoundaryWitness;latest:BoundaryWitness};
+
+function boundaryObservation(container:HTMLElement,messages:MessageObservation[]):BoundaryObservation {
+  return {top:container.scrollTop,height:container.scrollHeight,client:container.clientHeight,
+    messages:messages.map(message=>({key:message.observation_key,role:message.role,text_sha256:message.representations.find(rep=>rep.kind==='canonical_text')?.sha256}))};
+}
+function atScrollBoundary(container:HTMLElement,direction:-1|1):boolean {
+  const tolerance=Math.max(4,Math.min(64,container.clientHeight*0.02));
+  return direction<0?container.scrollTop<=tolerance:container.scrollHeight-container.clientHeight-container.scrollTop<=tolerance;
+}
+async function revalidateBoundary(container:HTMLElement,direction:-1|1,claimed:boolean,accumulator:MessageAccumulator,context:AdapterContext,branches:Map<string,ObservedBranchIndicator>,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<BoundaryWitness> {
+  const observed=await observeViewport(context.document,layout);accumulator.observe(observed.messages);collectBranchIndicators(context.document,branches);
+  const before=boundaryObservation(container,observed.messages);
+  if(!claimed)return {verified:false,before,after:before};
+  const portion=direction<0?'earliest_boundary':'latest_boundary';
+  await addScreenshot(context,evidence,portion);
+  const dom=await captureDomEvidence(context.document,portion);
+  await waitForQuietDom(context.document,350,2000);
+  const settled=await observeViewport(context.document,layout);accumulator.observe(settled.messages);collectBranchIndicators(context.document,branches);
+  const after=boundaryObservation(container,settled.messages);
+  const verified=atScrollBoundary(container,direction)&&JSON.stringify(before)===JSON.stringify(after);
+  dom.metadata={...dom.metadata,boundary_revalidated:verified};evidence.push(dom);
+  return {verified,before,after};
+}
+async function establishSourceCoverage(container:HTMLElement,accumulator:MessageAccumulator,context:AdapterContext,branches:Map<string,ObservedBranchIndicator>,layout:LayoutEvidence,evidence:EvidenceRecord[]) {
+  const rounds:CoverageRound[]=[],warnings:string[]=[];
+  let coherent=false;
+  let upward!:Awaited<ReturnType<typeof scrollUntilStable>>,downward!:Awaited<ReturnType<typeof scrollUntilStable>>;
+  const upwardMetrics:Array<Record<string,unknown>>=[],downwardMetrics:Array<Record<string,unknown>>=[];
+  let upPasses=0,downPasses=0,upExpanded=0,downExpanded=0;
+  // A bounded confirmation of the existing scan, not a second message accumulator.
+  // A quiet pixel boundary is provisional until evidence reads and a second sweep agree.
+  for(let round=1;round<=3;round++) {
+    context.onProgress('Verifying accessible source coverage, sweep '+round+' of 3');
+    upward=await scrollUntilStable(container,-1,accumulator,context,branches,layout);
+    const earliest=await revalidateBoundary(container,-1,upward.boundary,accumulator,context,branches,layout,evidence);
+    upward.boundary=upward.boundary&&earliest.verified;upward.stable=upward.stable&&earliest.verified;
+    downward=await scrollUntilStable(container,1,accumulator,context,branches,layout);
+    const latest=await revalidateBoundary(container,1,downward.boundary,accumulator,context,branches,layout,evidence);
+    downward.boundary=downward.boundary&&latest.verified;downward.stable=downward.stable&&latest.verified;
+    upPasses+=upward.passes;downPasses+=downward.passes;upExpanded+=upward.expanded;downExpanded+=downward.expanded;
+    upwardMetrics.push(...upward.metrics.map(metric=>({...metric,coverage_round:round})));downwardMetrics.push(...downward.metrics.map(metric=>({...metric,coverage_round:round})));
+    warnings.push(...upward.warnings,...downward.warnings);
+    const current:CoverageRound={round,count:accumulator.size,earliest,latest},previous=rounds.at(-1);rounds.push(current);
+    coherent=Boolean(previous&&previous.earliest.verified&&previous.latest.verified&&earliest.verified&&latest.verified
+      &&previous.count===current.count&&JSON.stringify(previous.earliest.after)===JSON.stringify(earliest.after)
+      &&JSON.stringify(previous.latest.after)===JSON.stringify(latest.after));
+    if(coherent)break;
+  }
+  if(!coherent)warnings.push('Accessible-source coverage remained provisional after three bounded sweeps; no complete history claim is supported.');
+  return {coherent,rounds,warnings:unique(warnings),upward:{...upward,passes:upPasses,expanded:upExpanded,metrics:upwardMetrics},downward:{...downward,passes:downPasses,expanded:downExpanded,metrics:downwardMetrics}};
 }
 
 async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>, layoutEvidence: LayoutEvidence) {

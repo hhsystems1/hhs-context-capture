@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HHS Universal Context Capture",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Captures exact accessible rendered AI conversations to the local HHS archive.",
   "permissions": ["activeTab", "storage", "tabs", "scripting"],
   "host_permissions": [

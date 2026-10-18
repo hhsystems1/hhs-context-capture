@@ -39,20 +39,36 @@ export function inspectChatGptPage(root: Document = document, includeNodes = fal
     const users = [...turn.querySelectorAll<HTMLElement>('[data-user-message-bubble]')].filter(node => node.closest('[data-turn-key]') === turn);
     const assistants = [...turn.querySelectorAll<HTMLElement>('[data-chatgpt-selection-message-id]')].filter(node => node.closest('[data-turn-key]') === turn);
     const key = turn.getAttribute('data-turn-key') ?? '';
+    // Image-only native user turns have no text bubble. The separate provider heading,
+    // native user-unit namespace and turn-bound UUID must all agree; never infer a
+    // speaker from an arbitrary image, a loading placeholder or quoted assistant HTML.
+    const attachmentUsers = new Set<HTMLElement>();
+    for (const unit of turn.querySelectorAll<HTMLElement>('[data-chatgpt-search-message-ids]')) {
+      if (unit.closest('[data-turn-key]') !== turn || !unit.classList.contains('group/user-message')
+        || unit.querySelector('[data-user-message-bubble]') || !unit.querySelector('img[src]')
+        || unit.closest('[data-chatgpt-selection-message-id], [data-user-message-bubble]')) continue;
+      const headings = [...(unit.parentElement?.querySelectorAll(':scope > h4') ?? [])];
+      const id = unit.getAttribute('data-chatgpt-search-message-ids') ?? '';
+      const trusted = uuid.test(id) && id === key && headings.length === 1
+        && headings[0]?.textContent?.trim() === 'You said:'
+        && !unit.querySelector('[data-chatgpt-selection-message-id], [data-conversation-role="assistant"]');
+      if (trusted) { users.push(unit); attachmentUsers.add(unit); }
+      else issue('unverified_attachment_user');
+    }
     if (!key || turnKeys.has(key)) issue('missing_or_duplicate_turn_identity');
     turnKeys.add(key);
     if (users.length > 1 || assistants.length > 1) issue('ambiguous_turn');
     else if (users.length !== 1 || assistants.length !== 1) issue('incomplete_turn');
     const firstNode = nodes.length;
     for (const element of users) {
-      const unit = element.closest('[data-chatgpt-search-message-ids]');
+      const unit = attachmentUsers.has(element) ? element : element.closest('[data-chatgpt-search-message-ids]');
       const sourceId = unit?.getAttribute('data-chatgpt-search-message-ids') ?? '';
-      const trustedRole = element.getAttribute('data-user-message-bubble') === 'true'
+      const trustedRole = attachmentUsers.has(element) || element.getAttribute('data-user-message-bubble') === 'true'
         && unit?.closest('[data-turn-key]') === turn
         && !unit.querySelector('[data-conversation-role="assistant"], [data-chatgpt-selection-message-id]');
       if (!trustedRole) issue('ambiguous_authorship');
       if (!uuid.test(sourceId)) issue('missing_or_ambiguous_native_identity');
-      nodes.push({element,role:trustedRole?'user':'unknown',...(uuid.test(sourceId)?{platformId:sourceId}:{}),roleSource:'data-user-message-bubble=true',identitySource:'data-chatgpt-search-message-ids (single UUID)',layout:'business_turn',turnKey:key});
+      nodes.push({element,role:trustedRole?'user':'unknown',...(uuid.test(sourceId)?{platformId:sourceId}:{}),roleSource:attachmentUsers.has(element)?'native image user unit with separate provider user heading':'data-user-message-bubble=true',identitySource:attachmentUsers.has(element)?'single native UUID bound to user turn key':'data-chatgpt-search-message-ids (single UUID)',layout:'business_turn',turnKey:key});
     }
     for (const element of assistants) {
       const unit = element.closest('[data-chatgpt-search-message-ids]');
