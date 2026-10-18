@@ -28,3 +28,70 @@ describe('coverage after delayed boundary rendering',()=>{
  it('does not declare coherent coverage when evidence repeatedly invalidates a boundary',async()=>{await page.setContent(html(pair()));const result=await page.evaluate(async()=>{const api=globalThis.HhsCompleteness,scroller=document.querySelector<HTMLElement>('#scroller')!;const extracted=await new api.ChatGptAdapter().capture({document,sourceUrl:location.href,captureScreenshot:async portion=>{if(portion==='earliest_boundary')scroller.scrollTop=400;return undefined;},onProgress:()=>{}});return {extracted,verification:api.verifyCapture(extracted)};});expect(result.verification.status).toBe('needs_review');expect(result.verification.checks.find(c=>c.check_id==='source.coverage_coherent')?.status).toBe('fail');expect(result.extracted.platformMetadata.source_coverage_baseline).toMatchObject({coherent:false,source_history_completeness:'not_established'});},35000);
  it('retains the unresolved expansion gate without clicking an unproved control',async()=>{await page.setContent(html(pair().replace('Synthetic original request.','Synthetic original request.<button onclick="window.__unsafeClick=true">Show more</button>')));const result=await capture();expect(result.verification.checks.find(c=>c.check_id==='content.not_truncated')?.status).toBe('fail');expect(await page.evaluate(()=>(window as unknown as {__unsafeClick?:boolean}).__unsafeClick)).toBeUndefined();},20000);
 });
+
+
+const fullClipText='Synthetic source text with original decisions, corrections and next steps. '.repeat(12);
+const modernClip=(action='visual')=>{
+ const extra:Record<string,string>={append:"this.previousElementSibling.firstElementChild.textContent+=' Newly loaded source text.';",async:"setTimeout(()=>this.previousElementSibling.firstElementChild.textContent+=' Delayed source text.',50);",loading:"this.previousElementSibling.setAttribute('aria-busy','true');"};
+ const handler="window.__clipClicks=(window.__clipClicks||0)+1;"+(action==='stuck'?'':action==='removed'?'this.remove();':"this.setAttribute('aria-expanded','true');this.textContent='Show less';this.previousElementSibling.style.maxHeight='none';"+(extra[action]??''));
+ return html(pair().replace('<p>Synthetic original request.</p>',`<div data-search-result-target style="max-height:48px;overflow:hidden;line-height:20px"><p>${fullClipText}</p></div><button aria-expanded="false" onclick="${handler}">Show more</button>`));
+};
+
+
+describe('verified loaded-text clipping in native user messages',()=>{
+ it('verifies visual-only expansion only after its stable full source is preserved',async()=>{
+  await page.setContent(modernClip());const result=await capture();
+  expect(result.verification.status).toBe('complete');expect(result.extracted.messages.map(m=>[m.role,m.sequence])).toEqual([['user',0],['assistant',1]]);
+  const proofs=result.extracted.platformMetadata.visual_expansion_verification as Array<{verified:boolean;preserved:boolean;before:{text_sha256:string};after:{text_sha256:string}}>;
+  expect(proofs).toHaveLength(1);expect(proofs[0]).toMatchObject({message_id:ids[0],mode:'expanded',verified:true,preserved:true});expect(proofs[0]!.before.text_sha256).toBe(proofs[0]!.after.text_sha256);
+  expect(result.extracted.messages[0]!.representations.find(r=>r.kind==='sanitized_html')!.value).toContain(fullClipText);
+  expect(result.extracted.evidence.filter(e=>e.metadata?.reason==='visual_expansion_before'||e.metadata?.reason==='visual_expansion_after')).toHaveLength(2);
+  expect(result.extracted.loadResult.checks.find(c=>c.check_id==='content.not_truncated')?.status).toBe('pass');expect(await page.evaluate(()=>(window as unknown as {__clipClicks:number}).__clipClicks)).toBe(1);
+ },20000);
+ it.each(['append','async','loading','stuck','removed'])('retains needs_review for %s content/expansion uncertainty',async action=>{
+  await page.setContent(modernClip(action));const result=await capture();expect(result.verification.status).toBe('needs_review');expect(result.extracted.loadResult.checks.find(c=>c.check_id==='content.not_truncated')?.status).toBe('fail');
+  expect((result.extracted.platformMetadata.visual_expansion_verification as Array<{verified:boolean}>).some(p=>!p.verified)).toBe(true);
+ },20000);
+ it('does not click empty, loading, or payload-embedded expansion controls',async()=>{
+  for(const fixture of [modernClip().replace(fullClipText,''),modernClip().replace('data-search-result-target','aria-busy="true" data-search-result-target'),modernClip().replace('</p></div><button','</p><button').replace('</button>','</button></div>')]){
+   await page.setContent(fixture);const result=await capture();expect(result.verification.status).toBe('needs_review');expect(await page.evaluate(()=>(window as unknown as {__clipClicks?:number}).__clipClicks)).toBeUndefined();
+  }
+ },35000);
+
+ it('fails closed when verified content never reaches the preserved message',async()=>{
+  await page.setContent(modernClip());const result=await page.evaluate(async()=>{const api=globalThis.HhsCompleteness;let removed=false;const extracted=await new api.ChatGptAdapter().capture({document,sourceUrl:location.href,captureScreenshot:async portion=>{if(portion==='uncertainty'&&!removed){removed=true;document.querySelector('[data-search-result-target]')!.remove();}return undefined;},onProgress:()=>{}});return {extracted,verification:api.verifyCapture(extracted)};});
+  expect(result.verification.status).toBe('needs_review');expect(result.extracted.platformMetadata.visual_expansion_verification).toMatchObject([{transition_verified:true,verified:false,preserved:false}]);expect(result.extracted.loadResult.checks.find(c=>c.check_id==='content.not_truncated')?.status).toBe('fail');
+ },20000);
+ it('keeps a claimed expanded but still clipped body under review',async()=>{
+  await page.setContent(modernClip().replace('aria-expanded="false"','aria-expanded="true"').replace('>Show more</button>','>Show less</button>'));const result=await capture();expect(result.verification.status).toBe('needs_review');expect(await page.evaluate(()=>(window as unknown as {__clipClicks?:number}).__clipClicks)).toBeUndefined();
+ },20000);
+ it('re-verifies a remounted native message rather than trusting an old node',async()=>{
+  const fixture=modernClip();await page.setContent(fixture);const result=await page.evaluate(async fixture=>{let remounted=false;const api=globalThis.HhsCompleteness;const extracted=await new api.ChatGptAdapter().capture({document,sourceUrl:location.href,captureScreenshot:async portion=>{if(portion==='earliest_boundary'&&!remounted){remounted=true;document.querySelector('[aria-label="Conversation"]')!.innerHTML=new DOMParser().parseFromString(fixture,'text/html').querySelector('[aria-label="Conversation"]')!.innerHTML;}return undefined;},onProgress:()=>{}});return {extracted,verification:api.verifyCapture(extracted)};},fixture);
+  expect(result.verification.status).toBe('complete');const proofs=result.extracted.platformMetadata.visual_expansion_verification as Array<{verified:boolean;preserved:boolean}>;expect(proofs.length).toBeGreaterThanOrEqual(2);expect(proofs.every(p=>p.verified&&p.preserved)).toBe(true);expect(result.extracted.platformMetadata.collapsed_messages_expanded).toBe(2);expect(result.extracted.messages.map(m=>m.platform_message_id)).toEqual(ids.slice(0,2));
+ },35000);
+ it('verifies an already expanded loaded body without clicking it',async()=>{
+  await page.setContent(modernClip().replace('max-height:48px','max-height:none').replace('aria-expanded="false"','aria-expanded="true"').replace('>Show more</button>','>Show less</button>'));const result=await capture();
+  expect(result.verification.status).toBe('complete');expect(result.extracted.platformMetadata.visual_expansion_verification).toMatchObject([{mode:'already_expanded',verified:true,preserved:true}]);expect(await page.evaluate(()=>(window as unknown as {__clipClicks?:number}).__clipClicks)).toBeUndefined();
+ },20000);
+
+ it('rejects body-level loading flags even when placeholder text is already present',async()=>{
+  await page.setContent(modernClip().replace('data-search-result-target','data-state="loading" data-search-result-target'));const result=await capture();expect(result.verification.status).toBe('needs_review');expect(await page.evaluate(()=>(window as unknown as {__clipClicks?:number}).__clipClicks)).toBeUndefined();
+ },20000);
+ it('does not accept a contradictory Show less state',async()=>{
+  await page.setContent(modernClip().replace('>Show more</button>','>Show less</button>'));const result=await capture();expect(result.verification.status).toBe('needs_review');expect(await page.evaluate(()=>(window as unknown as {__clipClicks?:number}).__clipClicks)).toBeUndefined();
+ },20000);
+ it('invalidates a successful proof if the same mounted control clips again',async()=>{
+  await page.setContent(modernClip());const result=await page.evaluate(async()=>{const api=globalThis.HhsCompleteness;let regressed=false;const extracted=await new api.ChatGptAdapter().capture({document,sourceUrl:location.href,captureScreenshot:async portion=>{if(portion==='earliest_boundary'&&!regressed){regressed=true;document.querySelector<HTMLElement>('[data-search-result-target]')!.style.maxHeight='48px';document.querySelector('[data-user-message-bubble] button')!.setAttribute('aria-expanded','false');}return undefined;},onProgress:()=>{}});return {extracted,verification:api.verifyCapture(extracted)};});
+  expect(result.verification.status).toBe('needs_review');expect(result.extracted.loadResult.checks.find(c=>c.check_id==='content.not_truncated')?.status).toBe('fail');
+ },35000);
+
+ it('does not click an unrelated control elsewhere in the user bubble',async()=>{
+  await page.setContent(modernClip().replace('</p></div><button','</p></div><aside><button').replace('</button>','</button></aside>'));const result=await capture();expect(result.verification.status).toBe('needs_review');expect(await page.evaluate(()=>(window as unknown as {__clipClicks?:number}).__clipClicks)).toBeUndefined();
+ },20000);
+ it('supports the observed content-wrapper sibling relationship',async()=>{
+  await page.setContent(modernClip().replace('<div data-search-result-target','<section><div data-search-result-target').replace('</p></div><button','</p></div></section><button').replace('this.previousElementSibling.style.maxHeight','this.previousElementSibling.firstElementChild.style.maxHeight'));const result=await capture();expect(result.verification.status).toBe('complete');expect(result.extracted.platformMetadata.visual_expansion_verification).toMatchObject([{verified:true,preserved:true}]);
+ },20000);
+ it('keeps existing legacy collapsed-message expansion working',async()=>{
+  await page.setContent(html(pair().replace('<p>Synthetic original request.</p>','<div data-testid="collapsible-user-message-root" data-can-expand><p>Synthetic original request.</p><button onclick="this.remove()">Show more</button></div>')));const result=await capture();expect(result.verification.status).toBe('complete');expect(result.extracted.platformMetadata.collapsed_messages_expanded).toBe(1);
+ },20000);
+});

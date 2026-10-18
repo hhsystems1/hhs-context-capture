@@ -23,12 +23,12 @@ const STABLE_PASSES = 3;
 const MIN_SCROLL_PASSES = 200;
 const EMERGENCY_MAX_SCROLL_PASSES = 5_000;
 type TurnWitness = { users: Set<string>; assistants: Set<string>; pairs: Set<string> };
-type LayoutEvidence = { turns: Map<string, TurnWitness>; issues: Set<string>; truncationIndicators: Map<string, Record<string, unknown>> };
+type LayoutEvidence = { turns: Map<string, TurnWitness>; issues: Set<string>; truncationIndicators: Map<string, Record<string, unknown>>; expansions:VisualExpansionWitness[]; expansionControls:WeakSet<HTMLButtonElement> };
 type ObservedBranchIndicator = { key: string; current?: number; total?: number; message_id?: string; observed_at: string };
 
 export class ChatGptAdapter implements PlatformAdapter {
   readonly platform = "chatgpt";
-  readonly adapterVersion = "0.1.5";
+  readonly adapterVersion = "0.1.6";
 
   async detect(context: AdapterContext) {
     const url=new URL(context.sourceUrl);
@@ -58,7 +58,7 @@ export class ChatGptAdapter implements PlatformAdapter {
 
   async capture(context: AdapterContext): Promise<ExtractedConversation> {
     const accumulator = new MessageAccumulator();
-    const layoutEvidence: LayoutEvidence = { turns: new Map(), issues: new Set(), truncationIndicators: new Map() };
+    const layoutEvidence: LayoutEvidence = { turns: new Map(), issues: new Set(), truncationIndicators: new Map(), expansions:[], expansionControls:new WeakSet() };
     const evidence: EvidenceRecord[] = [];
     const warnings: string[] = [];
     const observedBranchIndicators = new Map<string, ObservedBranchIndicator>();
@@ -68,7 +68,7 @@ export class ChatGptAdapter implements PlatformAdapter {
 
     const scrollContainer = findScrollContainer(context.document);
     const scrollContainerObservation = describeElement(scrollContainer);
-    const initiallyExpanded = await expandCollapsedMessages(context.document);
+    const initiallyExpanded = await expandCollapsedMessages(context.document,layoutEvidence,evidence);
     if (initiallyExpanded > 0) {
       await addScreenshot(context, evidence, "uncertainty", { reason: "collapsed_content_expanded", count: initiallyExpanded });
       evidence.push(await captureDomEvidence(context.document, "uncertainty"));
@@ -89,6 +89,7 @@ export class ChatGptAdapter implements PlatformAdapter {
     const branches = reconcileObservedBranches(traversedBranches, observedBranchIndicators);
     const accumulated = accumulator.finalize();
     warnings.push(...coverage.warnings, ...accumulated.warnings);
+    await verifyExpansionPreservation(layoutEvidence,accumulated.messages);
     const attachments = extractAttachments(accumulated.messages);
     const citations = extractCitations(accumulated.messages);
     const artifacts = extractArtifacts(accumulated.messages);
@@ -151,6 +152,7 @@ export class ChatGptAdapter implements PlatformAdapter {
         collapsed_messages_expanded: initiallyExpanded + upward.expanded + downward.expanded,
         observed_branch_indicators: [...observedBranchIndicators.values()],
         truncation_indicators: truncationIndicators,
+        visual_expansion_verification:layoutEvidence.expansions,
         source_markdown_available: false,
         source_markdown_note: "ChatGPT rendered DOM does not expose original Markdown source; exact accessible rendered wording and structure were preserved.",
       },
@@ -159,7 +161,7 @@ export class ChatGptAdapter implements PlatformAdapter {
 }
 
 type BoundaryObservation = {top:number;height:number;client:number;messages:Array<{key:string;role:string;text_sha256?:string|undefined}>};
-type BoundaryWitness = {verified:boolean;before:BoundaryObservation;after:BoundaryObservation};
+type BoundaryWitness = {expanded:number;verified:boolean;before:BoundaryObservation;after:BoundaryObservation};
 type CoverageRound = {round:number;count:number;earliest:BoundaryWitness;latest:BoundaryWitness};
 
 function boundaryObservation(container:HTMLElement,messages:MessageObservation[]):BoundaryObservation {
@@ -171,18 +173,20 @@ function atScrollBoundary(container:HTMLElement,direction:-1|1):boolean {
   return direction<0?container.scrollTop<=tolerance:container.scrollHeight-container.clientHeight-container.scrollTop<=tolerance;
 }
 async function revalidateBoundary(container:HTMLElement,direction:-1|1,claimed:boolean,accumulator:MessageAccumulator,context:AdapterContext,branches:Map<string,ObservedBranchIndicator>,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<BoundaryWitness> {
+  const expandedBefore=await expandCollapsedMessages(context.document,layout,evidence);
   const observed=await observeViewport(context.document,layout);accumulator.observe(observed.messages);collectBranchIndicators(context.document,branches);
   const before=boundaryObservation(container,observed.messages);
-  if(!claimed)return {verified:false,before,after:before};
+  if(!claimed)return {expanded:expandedBefore,verified:false,before,after:before};
   const portion=direction<0?'earliest_boundary':'latest_boundary';
   await addScreenshot(context,evidence,portion);
   const dom=await captureDomEvidence(context.document,portion);
   await waitForQuietDom(context.document,350,2000);
+  const expandedAfter=await expandCollapsedMessages(context.document,layout,evidence);
   const settled=await observeViewport(context.document,layout);accumulator.observe(settled.messages);collectBranchIndicators(context.document,branches);
   const after=boundaryObservation(container,settled.messages);
   const verified=atScrollBoundary(container,direction)&&JSON.stringify(before)===JSON.stringify(after);
   dom.metadata={...dom.metadata,boundary_revalidated:verified};evidence.push(dom);
-  return {verified,before,after};
+  return {expanded:expandedBefore+expandedAfter,verified,before,after};
 }
 async function establishSourceCoverage(container:HTMLElement,accumulator:MessageAccumulator,context:AdapterContext,branches:Map<string,ObservedBranchIndicator>,layout:LayoutEvidence,evidence:EvidenceRecord[]) {
   const rounds:CoverageRound[]=[],warnings:string[]=[];
@@ -194,13 +198,13 @@ async function establishSourceCoverage(container:HTMLElement,accumulator:Message
   // A quiet pixel boundary is provisional until evidence reads and a second sweep agree.
   for(let round=1;round<=3;round++) {
     context.onProgress('Verifying accessible source coverage, sweep '+round+' of 3');
-    upward=await scrollUntilStable(container,-1,accumulator,context,branches,layout);
+    upward=await scrollUntilStable(container,-1,accumulator,context,branches,layout,evidence);
     const earliest=await revalidateBoundary(container,-1,upward.boundary,accumulator,context,branches,layout,evidence);
     upward.boundary=upward.boundary&&earliest.verified;upward.stable=upward.stable&&earliest.verified;
-    downward=await scrollUntilStable(container,1,accumulator,context,branches,layout);
+    downward=await scrollUntilStable(container,1,accumulator,context,branches,layout,evidence);
     const latest=await revalidateBoundary(container,1,downward.boundary,accumulator,context,branches,layout,evidence);
     downward.boundary=downward.boundary&&latest.verified;downward.stable=downward.stable&&latest.verified;
-    upPasses+=upward.passes;downPasses+=downward.passes;upExpanded+=upward.expanded;downExpanded+=downward.expanded;
+    upPasses+=upward.passes;downPasses+=downward.passes;upExpanded+=upward.expanded+earliest.expanded;downExpanded+=downward.expanded+latest.expanded;
     upwardMetrics.push(...upward.metrics.map(metric=>({...metric,coverage_round:round})));downwardMetrics.push(...downward.metrics.map(metric=>({...metric,coverage_round:round})));
     warnings.push(...upward.warnings,...downward.warnings);
     const current:CoverageRound={round,count:accumulator.size,earliest,latest},previous=rounds.at(-1);rounds.push(current);
@@ -213,7 +217,7 @@ async function establishSourceCoverage(container:HTMLElement,accumulator:Message
   return {coherent,rounds,warnings:unique(warnings),upward:{...upward,passes:upPasses,expanded:upExpanded,metrics:upwardMetrics},downward:{...downward,passes:downPasses,expanded:downExpanded,metrics:downwardMetrics}};
 }
 
-async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>, layoutEvidence: LayoutEvidence) {
+async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>, layoutEvidence: LayoutEvidence,evidence:EvidenceRecord[]) {
   let stablePasses = 0;
   let previousCount = accumulator.size;
   let previousScrollHeight = container.scrollHeight;
@@ -227,7 +231,7 @@ async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accu
     const before = container.scrollTop;
     container.scrollBy({ top: direction * scrollStep, behavior: "auto" });
     await waitForQuietDom(context.document, 350, 2_000);
-    const expandedThisPass = await expandCollapsedMessages(context.document);
+    const expandedThisPass = await expandCollapsedMessages(context.document,layoutEvidence,evidence);
     expanded += expandedThisPass;
     if (expandedThisPass > 0) await waitForQuietDom(context.document, 250, 1_500);
     const observed = await observeViewport(context.document, layoutEvidence);
@@ -693,18 +697,108 @@ function check(check_id: string, pass: boolean, message: string): VerificationCh
   return { check_id, status: pass ? "pass" : "fail", severity: "material", message, evidence: [] };
 }
 
-async function expandCollapsedMessages(document: Document): Promise<number> {
-  let expanded = 0;
-  const roots = [...document.querySelectorAll<HTMLElement>("[data-testid='collapsible-user-message-root'][data-can-expand]")];
-  for (const root of roots) {
-    const button = [...root.querySelectorAll<HTMLButtonElement>("button, [role='button']")].find((candidate) => /show more|expand/i.test(`${candidate.innerText} ${candidate.getAttribute("aria-label") ?? ""}`));
-    if (!button) continue;
-    button.click();
-    expanded += 1;
+type VisualClipSnapshot = {text_sha256:string;structure_sha256:string;text_chars:number;clipped:boolean;unavailable:boolean};
+type VisualExpansionWitness = {message_id:string;mode:'expanded'|'already_expanded';transition_verified:boolean;verified:boolean;preserved:boolean;before:VisualClipSnapshot;after?:VisualClipSnapshot;reason?:string;invalidated?:boolean;invalidated_reason?:string;evidence_ids:string[]};
+
+function sourceIsClipped(body:HTMLElement):boolean {
+  return [body,...body.querySelectorAll<HTMLElement>('*')].some(element=>{
+    const style=getComputedStyle(element);
+    return (/hidden|clip/.test(style.overflowY)||style.webkitLineClamp!=='none')&&element.scrollHeight>element.clientHeight+2;
+  });
+}
+
+async function visualClipSnapshot(body:HTMLElement):Promise<VisualClipSnapshot> {
+  const text=body.textContent??'';
+  const unavailable=!text.trim()||Boolean(body.closest('[aria-busy="true"]'))
+    ||(body.matches('[aria-busy="true"],[role="progressbar"],[data-state="loading"],.animate-spin,.motion-safe\\:animate-spin,img,video,audio,iframe,button,[role="button"]')||Boolean(body.querySelector('[aria-busy="true"],[role="progressbar"],[data-state="loading"],.animate-spin,.motion-safe\\:animate-spin,img,video,audio,iframe,button,[role="button"]')))
+    ||[body,...body.querySelectorAll<HTMLElement>('*')].some(element=>{
+      const style=getComputedStyle(element);
+      return Boolean(element.textContent?.trim())&&(element.hidden||element.getAttribute('aria-hidden')==='true'||style.display==='none'||style.visibility==='hidden');
+    });
+  return {text_sha256:await sha256(text),structure_sha256:await semanticStructureHash(sanitizedHtml(body)),text_chars:text.length,clipped:sourceIsClipped(body),unavailable};
+}
+
+async function preserveExpansionEvidence(element:HTMLElement,messageId:string,phase:'before'|'after'|'unresolved',evidence:EvidenceRecord[]):Promise<string> {
+  const html=sanitizedHtml(element),id=crypto.randomUUID();
+  evidence.push({evidence_id:id,kind:'sanitized_dom',portion:'truncation',captured_at:new Date().toISOString(),media_type:'text/html',sha256:await sha256(html),inline_data:html,metadata:{reason:'visual_expansion_'+phase,message_id:messageId,scope:'original_native_user_message'}});
+  return id;
+}
+
+
+async function retainUnresolvedExpansion(element:HTMLElement,messageId:string,reason:string,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<void> {
+  for(const proof of layout.expansions.filter(proof=>proof.message_id===messageId)){proof.invalidated=true;proof.invalidated_reason=reason;}
+  const indicator={kind:'unverified_expansion_content',message_id:messageId,reason},key=JSON.stringify(indicator);
+  if(!layout.truncationIndicators.has(key))layout.truncationIndicators.set(key,{...indicator,evidence_id:await preserveExpansionEvidence(element,messageId,'unresolved',evidence)});
+}
+
+async function expandCollapsedMessages(document:Document,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<number> {
+  let expanded=0;
+  // Preserve the established legacy path. Modern support is bound to a strict
+  // native user message, a separate loaded body and an explicit toggle state.
+  for(const root of document.querySelectorAll<HTMLElement>("[data-testid='collapsible-user-message-root'][data-can-expand]")) {
+    const button=[...root.querySelectorAll<HTMLButtonElement>("button, [role='button']")].find(candidate=>/show more|expand/i.test(`${candidate.innerText} ${candidate.getAttribute('aria-label')??''}`));
+    if(button){button.click();expanded++;}
   }
-  if (expanded > 0) await waitForQuietDom(document, 250, 1_500);
+  if(expanded>0)await waitForQuietDom(document,250,1500);
+  for(const node of inspectChatGptPage(document,true).nodes) {
+    if(node.role!=='user'||node.layout!=='business_turn'||!node.platformId||!node.element.matches('[data-user-message-bubble="true"]'))continue;
+    const controls=[...node.element.querySelectorAll<HTMLButtonElement>('button')].filter(button=>/^(Show more|Show less)$/.test(button.innerText.trim()));
+    const button=controls[0];
+    if(!controls.length)continue;
+    if(controls.length!==1||!button||node.platformId!==node.turnKey){
+      // Unknown Show more already has the established sticky material diagnostic.
+      // Retain an extra witness only for otherwise-uncovered Show less or lost trust.
+      if(controls.some(control=>control.innerText.trim()==='Show less')||layout.expansions.some(proof=>proof.message_id===node.platformId))await retainUnresolvedExpansion(node.element,node.platformId,'ambiguous_modern_control_or_binding',layout,evidence);
+      continue;
+    }
+    const bodies=node.element.querySelectorAll<HTMLElement>('[data-search-result-target]'),body=bodies[0];
+    const contentWrapper=button.previousElementSibling;
+    const state=button.getAttribute('aria-expanded'),collapsed=button.innerText.trim()==='Show more'&&state==='false';
+    const open=button.innerText.trim()==='Show less'&&state==='true';
+    if(bodies.length!==1||!body||!contentWrapper||!(contentWrapper===body||contentWrapper.contains(body))||body.contains(button)||button.hasAttribute('aria-controls')||(!collapsed&&!open)){await retainUnresolvedExpansion(node.element,node.platformId,'unproved_modern_expansion_contract',layout,evidence);continue;}
+    const before=await visualClipSnapshot(body);
+    if(layout.expansionControls.has(button)){
+      const prior=[...layout.expansions].reverse().find(proof=>proof.message_id===node.platformId&&proof.transition_verified&&!proof.invalidated);
+      if(!open||before.clipped||before.unavailable||!prior?.after||before.text_sha256!==prior.after.text_sha256||before.structure_sha256!==prior.after.structure_sha256)await retainUnresolvedExpansion(node.element,node.platformId,'expanded_state_regressed_or_changed',layout,evidence);
+      continue;
+    }
+    if(layout.expansions.some(proof=>proof.message_id===node.platformId&&(!proof.transition_verified||proof.invalidated)))continue;
+    layout.expansionControls.add(button);
+    const proof:VisualExpansionWitness={message_id:node.platformId,mode:collapsed?'expanded':'already_expanded',before,transition_verified:false,verified:false,preserved:false,evidence_ids:[await preserveExpansionEvidence(node.element,node.platformId,'before',evidence)]};
+    layout.expansions.push(proof);
+    if(before.unavailable||(collapsed&&!before.clipped)||(open&&before.clipped)) {proof.reason='source_body_unavailable_or_state_unproved';continue;}
+    if(collapsed){button.click();expanded++;}
+    await waitForQuietDom(document,350,2000);
+    const settled=await visualClipSnapshot(body);
+    await waitForQuietDom(document,350,2000);
+    const after=await visualClipSnapshot(body);proof.after=after;
+    const sameNativeNode=inspectChatGptPage(document,true).nodes.some(current=>current.role==='user'&&current.platformId===node.platformId&&current.element===node.element);
+    const sameContent=[settled,after].every(sample=>sample.text_sha256===before.text_sha256&&sample.structure_sha256===before.structure_sha256);
+    const expandedState=body.isConnected&&button.isConnected&&sameNativeNode&&button.getAttribute('aria-expanded')==='true'&&button.innerText.trim()==='Show less';
+    proof.transition_verified=expandedState&&sameContent&&![settled,after].some(sample=>sample.clipped||sample.unavailable);
+    if(!proof.transition_verified)proof.reason=!sameContent?'source_content_changed_during_expansion':'expansion_or_loaded_state_unresolved';
+    proof.evidence_ids.push(await preserveExpansionEvidence(node.element,node.platformId,'after',evidence));
+  }
   return expanded;
 }
+
+async function verifyExpansionPreservation(layout:LayoutEvidence,messages:CanonicalMessage[]):Promise<void> {
+  for(const proof of layout.expansions) {
+    if(proof.transition_verified&&proof.after) {
+      const message=messages.find(item=>item.platform_message_id===proof.message_id&&item.role==='user');
+      for(const representation of message?.representations.filter(item=>item.kind==='sanitized_html')??[]) {
+        const parsed=new DOMParser().parseFromString(representation.value,'text/html'),bodies=parsed.querySelectorAll<HTMLElement>('[data-search-result-target]'),body=bodies[0];
+        if(bodies.length===1&&body&&await sha256(body.textContent??'')===proof.after.text_sha256&&await semanticStructureHash(sanitizedHtml(body))===proof.after.structure_sha256){proof.preserved=true;break;}
+      }
+    }
+    proof.verified=proof.transition_verified&&proof.preserved&&!proof.invalidated;
+    if(!proof.verified) {
+      const indicator={kind:'unverified_expansion_content',message_id:proof.message_id,reason:proof.invalidated_reason??proof.reason??'verified_source_not_preserved'};
+      if(!layout.truncationIndicators.has(JSON.stringify(indicator)))layout.truncationIndicators.set(JSON.stringify(indicator),indicator);
+    }
+  }
+}
+
 
 function findTruncationIndicators(document: Document, messageNodes = inspectChatGptPage(document, true).nodes): Array<Record<string, unknown>> {
   const results: Array<Record<string, unknown>> = [];
