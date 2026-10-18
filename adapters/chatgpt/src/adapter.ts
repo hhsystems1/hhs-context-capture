@@ -22,11 +22,13 @@ import { preserveOriginalUserText } from './user-text-coverage.js';
 const STABLE_PASSES = 3;
 const MIN_SCROLL_PASSES = 200;
 const EMERGENCY_MAX_SCROLL_PASSES = 5_000;
+type TurnWitness = { users: Set<string>; assistants: Set<string>; pairs: Set<string> };
+type LayoutEvidence = { turns: Map<string, TurnWitness>; issues: Set<string>; truncationIndicators: Map<string, Record<string, unknown>> };
 type ObservedBranchIndicator = { key: string; current?: number; total?: number; message_id?: string; observed_at: string };
 
 export class ChatGptAdapter implements PlatformAdapter {
   readonly platform = "chatgpt";
-  readonly adapterVersion = "0.1.3";
+  readonly adapterVersion = "0.1.4";
 
   async detect(context: AdapterContext) {
     const url=new URL(context.sourceUrl);
@@ -56,6 +58,7 @@ export class ChatGptAdapter implements PlatformAdapter {
 
   async capture(context: AdapterContext): Promise<ExtractedConversation> {
     const accumulator = new MessageAccumulator();
+    const layoutEvidence: LayoutEvidence = { turns: new Map(), issues: new Set(), truncationIndicators: new Map() };
     const evidence: EvidenceRecord[] = [];
     const warnings: string[] = [];
     const observedBranchIndicators = new Map<string, ObservedBranchIndicator>();
@@ -70,28 +73,28 @@ export class ChatGptAdapter implements PlatformAdapter {
       await addScreenshot(context, evidence, "uncertainty", { reason: "collapsed_content_expanded", count: initiallyExpanded });
       evidence.push(await captureDomEvidence(context.document, "uncertainty"));
     }
-    const initial = await observeViewport(context.document);
+    const initial = await observeViewport(context.document, layoutEvidence);
     accumulator.observe(initial.messages);
     warnings.push(...initial.warnings);
     collectBranchIndicators(context.document, observedBranchIndicators);
     const initialCount = accumulator.size;
 
     context.onProgress("Loading earlier accessible messages");
-    const upward = await scrollUntilStable(scrollContainer, -1, accumulator, context, observedBranchIndicators);
+    const upward = await scrollUntilStable(scrollContainer, -1, accumulator, context, observedBranchIndicators, layoutEvidence);
     if (upward.boundary) {
       await addScreenshot(context, evidence, "earliest_boundary");
       evidence.push(await captureDomEvidence(context.document, "earliest_boundary"));
     }
 
     context.onProgress("Loading later accessible messages");
-    const downward = await scrollUntilStable(scrollContainer, 1, accumulator, context, observedBranchIndicators);
+    const downward = await scrollUntilStable(scrollContainer, 1, accumulator, context, observedBranchIndicators, layoutEvidence);
     if (downward.boundary) {
       await addScreenshot(context, evidence, "latest_boundary");
       evidence.push(await captureDomEvidence(context.document, "latest_boundary"));
     }
 
     context.onProgress("Inspecting existing response alternatives");
-    const traversedBranches = await traverseExistingBranches(context, accumulator, evidence);
+    const traversedBranches = await traverseExistingBranches(context, accumulator, evidence, layoutEvidence);
     collectBranchIndicators(context.document, observedBranchIndicators);
     const branches = reconcileObservedBranches(traversedBranches, observedBranchIndicators);
     const accumulated = accumulator.finalize();
@@ -103,19 +106,24 @@ export class ChatGptAdapter implements PlatformAdapter {
       await addScreenshot(context, evidence, "artifact", { artifact_count: artifacts.length });
       evidence.push(await captureDomEvidence(context.document, "artifact"));
     }
-    const truncationIndicators = findTruncationIndicators(context.document);
+    for (const indicator of findTruncationIndicators(context.document)) layoutEvidence.truncationIndicators.set(JSON.stringify(indicator), indicator);
+    const truncationIndicators = [...layoutEvidence.truncationIndicators.values()];
     if (truncationIndicators.length > 0) {
       await addScreenshot(context, evidence, "truncation");
       evidence.push(await captureDomEvidence(context.document, "truncation"));
     }
 
+    warnings.push(...[...layoutEvidence.issues].map(issue => "ChatGPT layout requires review: " + issue + "."));
+    const turnCoverage = summarizeTurnCoverage(layoutEvidence);
+    if (turnCoverage.unresolved > 0) warnings.push('ChatGPT turn coverage requires review: ' + turnCoverage.unresolved + ' observed turn(s) lack a single, ordered native pair across viewports.');
     const checks: VerificationCheck[] = [
-      check("layout.authorship_identity", !warnings.some(warning => warning.startsWith("ChatGPT layout requires review:")), "Every observed message layout had unambiguous authorship and source identity."),
+      check("layout.authorship_identity", layoutEvidence.issues.size === 0, "Every observed message layout had unambiguous authorship and source identity."),
+      check("layout.turn_coverage", turnCoverage.unresolved === 0, "Each observed modern turn was resolved to one source-observed ordered native pair; isolated or conflicting halves require review."),
       check("boundary.earliest", upward.boundary, "Earliest accessible boundary reached and stabilized."),
       check("boundary.latest", downward.boundary, "Latest accessible boundary reached and stabilized."),
       check("scroll.stabilized", upward.stable && downward.stable, "Scrolling stabilized in both directions."),
       check("count.stabilized", upward.stable && downward.stable, `Accumulated message count stabilized at ${accumulated.messages.length} (initially ${initialCount}).`),
-      check("content.not_truncated", truncationIndicators.length === 0, truncationIndicators.length === 0 ? "No visible truncation, incomplete-generation, or expand-content indicator remained." : `${truncationIndicators.length} truncation or incomplete-generation indicators remained after expansion attempts.`),
+      check("content.not_truncated", truncationIndicators.length === 0, truncationIndicators.length === 0 ? "No unresolved truncation, incomplete-generation, or expand-content indicator was observed after expansion attempts." : `${truncationIndicators.length} unresolved truncation, incomplete-generation, or expansion indicators were observed across viewports.`),
     ];
 
     return {
@@ -139,6 +147,7 @@ export class ChatGptAdapter implements PlatformAdapter {
         initial_message_count: initialCount,
         accumulated_message_count: accumulated.messages.length,
         virtualized_dom_accumulation: true,
+        turn_coverage: turnCoverage,
         scroll_container: scrollContainerObservation,
         upward_scroll_metrics: upward.metrics,
         downward_scroll_metrics: downward.metrics,
@@ -152,7 +161,7 @@ export class ChatGptAdapter implements PlatformAdapter {
   }
 }
 
-async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>) {
+async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>, layoutEvidence: LayoutEvidence) {
   let stablePasses = 0;
   let previousCount = accumulator.size;
   let previousScrollHeight = container.scrollHeight;
@@ -169,7 +178,7 @@ async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accu
     const expandedThisPass = await expandCollapsedMessages(context.document);
     expanded += expandedThisPass;
     if (expandedThisPass > 0) await waitForQuietDom(context.document, 250, 1_500);
-    const observed = await observeViewport(context.document);
+    const observed = await observeViewport(context.document, layoutEvidence);
     accumulator.observe(observed.messages);
     collectBranchIndicators(context.document, observedBranches);
     warnings.push(...observed.warnings);
@@ -197,12 +206,25 @@ function scrollPassBudget(scrollHeight: number, step: number): number {
   return Math.min(EMERGENCY_MAX_SCROLL_PASSES, Math.max(MIN_SCROLL_PASSES, distanceAware));
 }
 
-export async function observeViewport(document: Document): Promise<{ messages: MessageObservation[]; warnings: string[] }> {
+export async function observeViewport(document: Document, layoutEvidence?: LayoutEvidence): Promise<{ messages: MessageObservation[]; warnings: string[] }> {
   const warnings: string[] = [];
   const structure = inspectChatGptPage(document, true);
   const elements = structure.nodes;
-  warnings.push(...structure.summary.issues.map(issue => `ChatGPT layout requires review: ${issue}.`));
-  if (structure.summary.loading) warnings.push("ChatGPT layout requires review: generation_or_page_loading.");
+  const materialIssues = structure.summary.issues.filter(issue => issue !== 'incomplete_turn');
+  if (structure.summary.loading) materialIssues.push('generation_or_page_loading');
+  warnings.push(...materialIssues.map(issue => 'ChatGPT layout requires review: ' + issue + '.'));
+  if (structure.summary.issues.includes('incomplete_turn')) warnings.push('ChatGPT partial turn observed; accumulated turn coverage must resolve it.');
+  if (layoutEvidence) {
+    for (const indicator of findTruncationIndicators(document, structure.nodes)) layoutEvidence.truncationIndicators.set(JSON.stringify(indicator), indicator);
+    for (const issue of materialIssues) layoutEvidence.issues.add(issue);
+    for (const turn of structure.turns) {
+      const witness = layoutEvidence.turns.get(turn.key) ?? {users:new Set<string>(),assistants:new Set<string>(),pairs:new Set<string>()};
+      turn.users.forEach(id => witness.users.add(id));
+      turn.assistants.forEach(id => witness.assistants.add(id));
+      if (turn.pair) witness.pairs.add(JSON.stringify(turn.pair));
+      layoutEvidence.turns.set(turn.key, witness);
+    }
+  }
   const seenFallbacks = new Set<string>();
   const messages: MessageObservation[] = [];
   for (const [index, messageNode] of elements.entries()) {
@@ -224,10 +246,26 @@ export async function observeViewport(document: Document): Promise<{ messages: M
       content_blocks: await preserveOriginalUserText(await extractContentBlocks(element, locator, messageNode.layout === "business_turn"), representations, locator, role),
       evidence_locators: [locator],
       observed_at: new Date().toISOString(),
-      platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256, layout: messageNode.layout, role_source: messageNode.roleSource, identity_source: messageNode.identitySource },
+      platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256, layout: messageNode.layout, ...(messageNode.turnKey ? {turn_key:messageNode.turnKey} : {}), role_source: messageNode.roleSource, identity_source: messageNode.identitySource },
     });
   }
   return { messages, warnings };
+}
+
+function summarizeTurnCoverage(evidence: LayoutEvidence) {
+  // Verification witnesses only; MessageAccumulator remains the sole message/order accumulator.
+  const owners = new Map<string, Set<string>>();
+  for (const [key, turn] of evidence.turns) for (const id of [...turn.users, ...turn.assistants]) {
+    const turns = owners.get(id) ?? new Set<string>(); turns.add(key); owners.set(id, turns);
+  }
+  let resolved = 0;
+  for (const turn of evidence.turns.values()) {
+    const user = [...turn.users][0], assistant = [...turn.assistants][0];
+    if (turn.users.size === 1 && turn.assistants.size === 1 && user !== assistant
+      && turn.pairs.size === 1 && turn.pairs.has(JSON.stringify([user, assistant]))
+      && owners.get(user!)?.size === 1 && owners.get(assistant!)?.size === 1) resolved += 1;
+  }
+  return {observed:evidence.turns.size,resolved,unresolved:evidence.turns.size-resolved};
 }
 
 function findMessageElements(document: Document): HTMLElement[] {
@@ -372,7 +410,7 @@ async function addScreenshot(context: AdapterContext, evidence: EvidenceRecord[]
   if (screenshot) evidence.push(screenshot);
 }
 
-async function traverseExistingBranches(context: AdapterContext, accumulator: MessageAccumulator, evidence: EvidenceRecord[]): Promise<BranchRecord[]> {
+async function traverseExistingBranches(context: AdapterContext, accumulator: MessageAccumulator, evidence: EvidenceRecord[], layoutEvidence: LayoutEvidence): Promise<BranchRecord[]> {
   const groups = branchGroups(context.document);
   const branches: BranchRecord[] = [];
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
@@ -386,14 +424,14 @@ async function traverseExistingBranches(context: AdapterContext, accumulator: Me
       continue;
     }
     const observed = new Set<string>();
-    const initialViewport = await observeViewport(context.document);
+    const initialViewport = await observeViewport(context.document, layoutEvidence);
     const initialAlternative = annotateBranchObservation(context.document, initial, branch, initialViewport.messages);
     accumulator.observe(initialViewport.messages);
     observed.add(initialAlternative);
     let safe = true;
-    for (let index = initial.current; index > 1; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed)) && safe;
-    for (let index = 1; index < initial.total; index += 1) safe = (await clickBranchButton(context.document, groupIndex, "next", branch, accumulator, observed)) && safe;
-    for (let index = initial.total; index > initial.current; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed)) && safe;
+    for (let index = initial.current; index > 1; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed, layoutEvidence)) && safe;
+    for (let index = 1; index < initial.total; index += 1) safe = (await clickBranchButton(context.document, groupIndex, "next", branch, accumulator, observed, layoutEvidence)) && safe;
+    for (let index = initial.total; index > initial.current; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed, layoutEvidence)) && safe;
     const restored = branchGroups(context.document)[groupIndex]?.current === initial.current;
     branch.restored_initial_state = restored;
     branch.alternative_message_ids = [...observed];
@@ -474,7 +512,7 @@ function reconcileObservedBranches(traversed: BranchRecord[], observed: Map<stri
   return results;
 }
 
-async function clickBranchButton(document: Document, groupIndex: number, direction: "previous" | "next", branch: BranchRecord, accumulator: MessageAccumulator, observed: Set<string>): Promise<boolean> {
+async function clickBranchButton(document: Document, groupIndex: number, direction: "previous" | "next", branch: BranchRecord, accumulator: MessageAccumulator, observed: Set<string>, layoutEvidence: LayoutEvidence): Promise<boolean> {
   const button = branchGroups(document)[groupIndex]?.[direction];
   if (!button || button.disabled) {
     branch.navigation_log.push({ at: new Date().toISOString(), action: direction, result: "Control unavailable or disabled." });
@@ -482,7 +520,7 @@ async function clickBranchButton(document: Document, groupIndex: number, directi
   }
   button.click();
   await waitForQuietDom(document, 400, 3_000);
-  const viewport = await observeViewport(document);
+  const viewport = await observeViewport(document, layoutEvidence);
   const refreshed = branchGroups(document)[groupIndex];
   if (refreshed) observed.add(annotateBranchObservation(document, refreshed, branch, viewport.messages));
   accumulator.observe(viewport.messages);
@@ -616,15 +654,13 @@ async function expandCollapsedMessages(document: Document): Promise<number> {
   return expanded;
 }
 
-function findTruncationIndicators(document: Document): Array<Record<string, unknown>> {
-  const messageRoots = findMessageElements(document);
+function findTruncationIndicators(document: Document, messageNodes = inspectChatGptPage(document, true).nodes): Array<Record<string, unknown>> {
   const results: Array<Record<string, unknown>> = [];
-  for (const root of messageRoots) {
-    const messageId = root.getAttribute("data-message-id") ?? root.querySelector("[data-message-id]")?.getAttribute("data-message-id") ?? undefined;
+  for (const {element:root,platformId:messageId} of messageNodes) {
     for (const element of root.querySelectorAll<HTMLElement>("button, [role='button']")) {
       const label = `${element.innerText} ${element.getAttribute("aria-label") ?? ""}`.trim();
       const insideCollapsibleUserMessage = Boolean(element.closest("[data-testid='collapsible-user-message-root'][data-can-expand]"));
-      const kind = /continue generating|resume generating/i.test(label) ? "incomplete_generation" : insideCollapsibleUserMessage && /show more|expand/i.test(label) ? "collapsed_user_message" : undefined;
+      const kind = /continue generating|resume generating/i.test(label) ? "incomplete_generation" : insideCollapsibleUserMessage && /show more|expand/i.test(label) ? "collapsed_user_message" : /^(show more|expand)(?:\s|$)/i.test(label) ? "unverified_expansion_control" : undefined;
       if (kind) results.push({ kind, ...(messageId ? { message_id: messageId } : {}), label, aria_label: element.getAttribute("aria-label"), data_testid: element.getAttribute("data-testid") });
     }
   }
