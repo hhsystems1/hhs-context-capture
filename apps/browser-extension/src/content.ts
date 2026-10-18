@@ -1,3 +1,4 @@
+import {inspectCaptureRuntime,sameCaptureRuntime,type CaptureRuntime} from './capture-runtime.js';
 import { captureDiagnosticError, captureFailure, captureStep, safeCaptureFailure } from "@hhs/capture-operations";
 import { resolveDiscoveryAdapter } from "./discovery/registry.js";
 import { ChatGptDomSidebarPort, ChatGptSidebarInventoryAdapter, hashInventoryEvidence } from "@hhs/adapter-chatgpt/inventory";
@@ -10,8 +11,19 @@ import type { ComparisonRequestPayload, ComparisonResponsePayload } from "./disc
 const contentScope = globalThis as typeof globalThis & { __hhsContextCaptureRegistered?: boolean };
 if (!contentScope.__hhsContextCaptureRegistered) {
   contentScope.__hhsContextCaptureRegistered = true;
+  const runtimeInstanceId = crypto.randomUUID();
   chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+    if (typeof message==='object'&&message!==null&&(message as {type?:string}).type==='HHS_INSPECT_CAPTURE_RUNTIME') {
+      try { sendResponse({ok:true,runtime:inspectCaptureRuntime(location.hostname,runtimeInstanceId)}); }
+      catch { sendResponse({ok:false,error:'capture_runtime_unavailable'}); }
+      return false;
+    }
     if (!isCaptureRequest(message) && !isInventoryRequest(message) && !isPrepareRecaptureRequest(message) && !isConfirmedRecaptureRequest(message) && !isObserveIdentityRequest(message) && !isDiscoverSiteRequest(message)) return false;
+    if (isCaptureRequest(message)||isConfirmedRecaptureRequest(message)) {
+      let matches=false;
+      try { matches=sameCaptureRuntime((message as {expectedRuntime?:unknown}).expectedRuntime,inspectCaptureRuntime(location.hostname,runtimeInstanceId)); } catch { /* Invalidated/unsupported runtime fails closed. */ }
+      if(!matches){const diagnostic=safeCaptureFailure(captureFailure('extension_channel','runtime_version_mismatch'),'extension_channel');sendResponse({ok:false,error:diagnostic.safe_error_summary,diagnostic});return false;}
+    }
     const reportProgress = (progress: string) => chrome.runtime.sendMessage({ type: "HHS_CAPTURE_PROGRESS", progress }).catch(() => undefined);
     if (isDiscoverSiteRequest(message)) {
       discoverSite(reportProgress).then(
@@ -45,7 +57,7 @@ if (!contentScope.__hhsContextCaptureRegistered) {
       return true;
     }
     if (isConfirmedRecaptureRequest(message)) {
-      runConfirmedRecapture(message.intentId, message.operation, reportProgress).then(
+      runConfirmedRecapture(message.intentId, message.operation, reportProgress, inspectCaptureRuntime(location.hostname,runtimeInstanceId)).then(
         (result) => sendResponse({ ok: true, recapture: result }),
         (error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }),
       );
@@ -53,7 +65,7 @@ if (!contentScope.__hhsContextCaptureRegistered) {
     }
     const operation = message.operation;
     emitOperationEvent(operation, "capture_started", "extension_content", { stage: "capture_started" }).then(() =>
-      captureConversation(reportProgress)).then(async (bundle) => {
+      captureConversation(reportProgress, inspectCaptureRuntime(location.hostname,runtimeInstanceId))).then(async (bundle) => {
       const observedConversation = `conversation-${(await sha256Text(bundle.conversation.conversation_id)).slice(0, 24)}`;
       if (observedConversation !== operation.expectedConversationReference) {
         await emitOperationEvent({ ...operation, eventSequence: operation.eventSequence + 1 }, "identity_mismatch", "extension_content", {
@@ -158,12 +170,12 @@ async function prepareRecapture(): Promise<{ intent: Record<string, unknown> }> 
   return { intent: response };
 }
 
-async function runConfirmedRecapture(intentId: string, operation: OperationContext, onProgress: (message: string) => void): Promise<Record<string, unknown>> {
+async function runConfirmedRecapture(intentId: string, operation: OperationContext, onProgress: (message: string) => void, runtime: CaptureRuntime): Promise<Record<string, unknown>> {
   const active = await activeIdentity();
   await collectorRequest(`recapture/intents/${encodeURIComponent(intentId)}/verify`, active);
   await collectorRequest(`recapture/intents/${encodeURIComponent(intentId)}/confirm`, { platform_id: active.platform_id, opaque_account_reference: active.opaque_account_reference, confirmed: true });
   await emitOperationEvent(operation, "capture_started", "extension_content", { stage: "capture_started" });
-  const bundle = await captureConversation(onProgress);
+  const bundle = await captureConversation(onProgress,runtime);
   const observedConversation = `conversation-${(await sha256Text(bundle.conversation.conversation_id)).slice(0, 24)}`;
   if (bundle.conversation.conversation_id !== active.conversation_id || observedConversation !== operation.expectedConversationReference) {
     await emitOperationEvent({ ...operation, eventSequence: operation.eventSequence + 1 }, "identity_mismatch", "extension_content", {
@@ -217,10 +229,11 @@ async function existingOpaqueAccountReference(): Promise<string> {
   return stored.opaqueAccountReference;
 }
 
-async function captureConversation(onProgress: (message: string) => void): Promise<CaptureBundle> {
+async function captureConversation(onProgress: (message: string) => void, runtime:CaptureRuntime): Promise<CaptureBundle> {
   const resolution = resolveDiscoveryAdapter(new URL(location.href).hostname);
   if (!resolution.supported || !resolution.registration.capture) throw captureFailure("page_detection", "unsupported_page");
   const adapter = resolution.registration.capture.create();
+  if(adapter.adapterVersion!==runtime.adapter_version)throw captureFailure('extension_channel','runtime_version_mismatch');
   const startedAt = new Date().toISOString();
   const context = {
     document,
@@ -254,7 +267,7 @@ async function captureConversation(onProgress: (message: string) => void): Promi
     tool_events: extracted.toolEvents,
     evidence: extracted.evidence,
     verification: { ruleset_version: "0.1.0", ...verification },
-    platform_metadata: extracted.platformMetadata,
+    platform_metadata: {...extracted.platformMetadata,capture_runtime:runtime},
   };
 }
 
@@ -273,8 +286,8 @@ async function sha256DataUrl(dataUrl: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function isCaptureRequest(value: unknown): value is { type: "HHS_CAPTURE_CURRENT"; operation: OperationContext } {
-  if (typeof value !== "object" || value === null || (value as { type?: string }).type !== "HHS_CAPTURE_CURRENT") return false;
+function isCaptureRequest(value: unknown): value is { type: "HHS_CAPTURE_CURRENT_VERIFIED"; operation: OperationContext } {
+  if (typeof value !== "object" || value === null || (value as { type?: string }).type !== "HHS_CAPTURE_CURRENT_VERIFIED") return false;
   const operation = (value as { operation?: Partial<OperationContext> }).operation;
   return typeof operation?.operationId === "string" && typeof operation.correlationId === "string" && Number.isSafeInteger(operation.eventSequence);
 }
@@ -287,8 +300,8 @@ function isPrepareRecaptureRequest(value: unknown): value is { type: "HHS_PREPAR
   return typeof value === "object" && value !== null && (value as { type?: string }).type === "HHS_PREPARE_RECAPTURE";
 }
 
-function isConfirmedRecaptureRequest(value: unknown): value is { type: "HHS_CONFIRMED_RECAPTURE"; intentId: string; operation: OperationContext } {
-  if (typeof value !== "object" || value === null || (value as { type?: string }).type !== "HHS_CONFIRMED_RECAPTURE" || typeof (value as { intentId?: unknown }).intentId !== "string") return false;
+function isConfirmedRecaptureRequest(value: unknown): value is { type: "HHS_CONFIRMED_RECAPTURE_VERIFIED"; intentId: string; operation: OperationContext } {
+  if (typeof value !== "object" || value === null || (value as { type?: string }).type !== "HHS_CONFIRMED_RECAPTURE_VERIFIED" || typeof (value as { intentId?: unknown }).intentId !== "string") return false;
   const operation = (value as { operation?: Partial<OperationContext> }).operation;
   return typeof operation?.operationId === "string" && typeof operation.correlationId === "string"
     && Number.isSafeInteger(operation.eventSequence) && typeof operation.expectedConversationReference === "string";

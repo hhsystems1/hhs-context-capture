@@ -1,3 +1,4 @@
+import {CAPTURE_BUNDLE_VERSION,expectedCaptureRuntime,parseCaptureRuntime,runtimeMatches,type CaptureRuntime} from './capture-runtime.js';
 import { resolveDiscoveryAdapter } from "./discovery/registry.js";
 import { inspectRenderedPage } from "./discovery/page.js";
 import { captureDiagnosticError, safeCaptureFailure } from "@hhs/capture-operations";
@@ -16,6 +17,7 @@ const confirmRecaptureButton = document.querySelector<HTMLButtonElement>("#confi
 const status = document.querySelector<HTMLElement>("#status")!;
 
 let pageInspectionReady = false;
+let verifiedRuntime: CaptureRuntime | undefined;
 let pairingVerified = false;
 let actionBusy = false;
 void restoreState();
@@ -76,6 +78,7 @@ confirmRecaptureButton.addEventListener("click", async () => {
   let operation: OperationContext | undefined;
   try {
     const tabId = await activeChatGptTab("The manually selected ChatGPT conversation must remain open.");
+    const runtime = await requireVerifiedRuntime(tabId);
     const identityResult = await sendPageRequest<IdentityReceipt>(tabId, { type: "HHS_OBSERVE_CAPTURE_IDENTITY" });
     if (!identityResult.ok || !identityResult.identity) throw new Error("Recapture identity could not be observed safely.");
     const operationId = `operation-${crypto.randomUUID()}`;
@@ -97,7 +100,7 @@ confirmRecaptureButton.addEventListener("click", async () => {
     await appendEvent(operation, "capture_requested", "extension_popup", { stage: "capture_requested" });
     operation.eventSequence++;
     setStatus("Creating one immutable recapture. Keep this exact tab active...");
-    const result = await sendPageRequest<ConfirmedRecaptureReceipt>(tabId, { type: "HHS_CONFIRMED_RECAPTURE", intentId: pendingRecaptureIntent, operation });
+    const result = await sendPageRequest<ConfirmedRecaptureReceipt>(tabId, { type: "HHS_CONFIRMED_RECAPTURE_VERIFIED", intentId: pendingRecaptureIntent, operation, expectedRuntime:runtime });
     if (!result.ok || !result.recapture) throw new Error(result.error ?? "Recapture failed.");
     await chrome.storage.local.remove("pendingRecaptureIntent");
     const report = await collectorApi<{ operation: OperationReport }>(`operations/${encodeURIComponent(operationId)}`, "GET");
@@ -117,6 +120,7 @@ captureButton.addEventListener("click", async () => {
     await inspectCurrentPage();
     if (!pageInspectionReady) return setStatus("This page requires review or is still loading. No capture started.", true);
     const tabId = await activeChatGptTab("Open a ChatGPT conversation in the active tab before capturing.");
+    const runtime = await requireVerifiedRuntime(tabId);
     const identityResult = await sendPageRequest<IdentityReceipt>(tabId, { type: "HHS_OBSERVE_CAPTURE_IDENTITY" });
     if (!identityResult.ok || !identityResult.identity) throw new Error("Capture identity could not be observed safely.");
     const operationId = `operation-${crypto.randomUUID()}`;
@@ -143,7 +147,7 @@ captureButton.addEventListener("click", async () => {
     await appendEvent(operation, "capture_requested", "extension_popup", { stage: "capture_requested" });
     operation.eventSequence++;
     setStatus("Capturing. Keep this ChatGPT tab active...");
-    const result = await sendPageRequest<CaptureReceipt>(tabId, { type: "HHS_CAPTURE_CURRENT", operation });
+    const result = await sendPageRequest<CaptureReceipt>(tabId, { type: "HHS_CAPTURE_CURRENT_VERIFIED", operation, expectedRuntime:runtime });
     if (!result.ok || !result.archive) throw captureDiagnosticError(result,"extension_channel");
     const report = await collectorApi<{ operation: OperationReport }>(`operations/${encodeURIComponent(operationId)}`, "GET");
     await rememberOperation(report.operation);
@@ -289,7 +293,7 @@ async function enablePairedActions(): Promise<void> {
   captureButton.disabled = disabled || !pageInspectionReady;
   inventoryButton.disabled = disabled;
   prepareRecaptureButton.disabled = disabled;
-  confirmRecaptureButton.disabled = disabled || typeof pendingRecaptureIntent !== "string";
+  confirmRecaptureButton.disabled = disabled || !verifiedRuntime || typeof pendingRecaptureIntent !== "string";
   // Dry discovery writes nothing and never contacts the collector, so it needs no pairing.
   discoverButton.disabled = actionBusy;
 }
@@ -429,9 +433,28 @@ async function sha256Text(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+
+/** A direct read-only handshake: never injects a replacement listener or writes an operation. */
+async function inspectListenerRuntime(tabId:number,host:string) {
+ const expected=expectedCaptureRuntime(host,chrome.runtime.id);
+ let observed:CaptureRuntime|undefined;
+ try { const reply=await chrome.tabs.sendMessage(tabId,{type:'HHS_INSPECT_CAPTURE_RUNTIME'}) as {ok?:boolean;runtime?:unknown}|undefined;
+  if(reply?.ok)observed=parseCaptureRuntime(reply.runtime);
+  const verified=runtimeMatches(observed,expected)&&chrome.runtime.getManifest().version===CAPTURE_BUNDLE_VERSION;
+  return {expected,popup_manifest_version:chrome.runtime.getManifest().version,observed:observed??null,verified};
+ } catch { return {expected,popup_manifest_version:chrome.runtime.getManifest().version,observed:null,verified:false}; }
+}
+async function requireVerifiedRuntime(tabId:number):Promise<CaptureRuntime> {
+ const [tab]=await chrome.tabs.query({active:true,currentWindow:true});
+ if(tab?.id!==tabId||!tab.url)throw Error('Active tab changed before runtime verification.');
+ const assessment=await inspectListenerRuntime(tabId,new URL(tab.url).hostname);
+ if(!assessment.verified||!assessment.observed){verifiedRuntime=undefined;pageInspectionReady=false;throw Error('Capture runtime version mismatch. Reload the extension and refresh the conversation; no capture operation was started.');}
+ verifiedRuntime=assessment.observed;return assessment.observed;
+}
+
 /** Read-only current-page selection; never runs sidebar traversal or starts capture. */
 async function inspectCurrentPage(): Promise<void> {
-  pageInspectionReady=false;captureButton.disabled=true;
+  pageInspectionReady=false;verifiedRuntime=undefined;captureButton.disabled=true;
   const panel=document.querySelector<HTMLElement>('#page-inspection');
   const summary=document.querySelector<HTMLElement>('#page-status');
   try {
@@ -441,6 +464,7 @@ async function inspectCurrentPage(): Promise<void> {
     const page=observation?.result;if(!page||page.host!==new URL(tab.url).hostname)throw Error('inspection_unavailable');
     const resolution=resolveDiscoveryAdapter(page.host);
     let assessment;
+    let runtimeAssessment: Awaited<ReturnType<typeof inspectListenerRuntime>> | undefined;
     if(resolution.supported&&resolution.registration.capture&&page.conversation_path){
       for(let pass=0;pass<7;pass++){
         const [probe]=await chrome.scripting.executeScript({target:{tabId:tab.id},func:resolution.registration.capture.inspect});
@@ -448,12 +472,14 @@ async function inspectCurrentPage(): Promise<void> {
         if(assessment?.ready||assessment&&assessment.messages>0&&!assessment.loading)break;
         if(pass<6)await new Promise(resolve=>setTimeout(resolve,250));
       }
-      pageInspectionReady=assessment?.ready===true;
+      runtimeAssessment=await inspectListenerRuntime(tab.id,page.host);
+      verifiedRuntime=runtimeAssessment.verified&&runtimeAssessment.observed?runtimeAssessment.observed:undefined;
+      pageInspectionReady=assessment?.ready===true&&runtimeAssessment.verified;
     }
     const adapter=resolution.supported?resolution.registration.capture?.id:undefined;
-    const state=pageInspectionReady?'Recognized; ready for an authorized capture.':adapter&&page.conversation_path?'Not ready: loading, changed layout or evidence needs review.':'No verified extraction adapter for this page.';
+    const state=pageInspectionReady?'Recognized; ready for an authorized capture.':adapter&&page.conversation_path?runtimeAssessment&&!runtimeAssessment.verified?'Blocked: capture runtime is missing or differs from this build. Reload the extension, then refresh this tab.':'Not ready: loading, changed layout or evidence needs review.':'No verified extraction adapter for this page.';
     if(summary)summary.textContent=page.host+' · '+page.kind+' · '+state;
-    if(panel)panel.textContent=JSON.stringify({page,adapter:adapter??null,assessment:assessment??null,capture_started:false},null,2);
+    if(panel)panel.textContent=JSON.stringify({page,adapter:adapter??null,assessment:assessment??null,runtime:runtimeAssessment??null,capture_started:false},null,2);
   }catch{
     if(summary)summary.textContent='Page inspection unavailable. Open a normal website and reopen this popup.';
     if(panel)panel.textContent='No page content was read or stored by this check.';
