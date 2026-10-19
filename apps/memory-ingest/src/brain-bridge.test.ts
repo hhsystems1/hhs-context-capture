@@ -3,7 +3,7 @@ import type http from "node:http";
 import { describe, it, expect } from "vitest";
 import { parseClientTokens } from "./query-service.js";
 import { createIntegrationService, loadIntegrationConfig, parseReconcileInput, reconcileAndPromoteFromClient } from "./brain-integration-service.js";
-import { createReviewService, loadReviewConfig } from "./brain-review-service.js";
+import { createReviewService, loadReviewConfig, assertPersonalReviewSnapshots } from "./brain-review-service.js";
 import { parseBrainGrants, type BridgeConfig } from "./brain-bridge-http.js";
 import type { DbClient } from "./db.js";
 import { sha256 } from "@hhs/memory-schema";
@@ -79,4 +79,13 @@ describe("trusted brain integration and dedicated review bridges", () => {
     expect((await request(server, "/memory/integration/reconcile", body)).status).toBe(404);
     server.close();
   });
+});
+
+it('Personal message review uses verified receipt snapshots, not the metadata-free resolution DTO',()=>{
+ const resolved={observation_id:'obs',provenance_edge_id:'edge',representation_sha256:'a'.repeat(64),text_value:'Original user declaration'};
+ const snapshot={provenance_edge_id:resolved.provenance_edge_id,role:'user',source_metadata:{source_family:'rivryn_chat'}};
+ expect(()=>assertPersonalReviewSnapshots(grant,grant.destinationWorkspaceId,[snapshot])).not.toThrow();
+ expect(()=>assertPersonalReviewSnapshots(grant,grant.destinationWorkspaceId,[resolved])).toThrow();
+ expect(()=>assertPersonalReviewSnapshots(grant,grant.destinationWorkspaceId,[{...snapshot,role:'assistant'}])).toThrow();
+ expect(()=>assertPersonalReviewSnapshots(grant,grant.destinationWorkspaceId,[{...snapshot,source_metadata:{source_family:'other'}}])).toThrow();
 });

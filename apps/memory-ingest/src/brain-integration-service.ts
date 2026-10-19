@@ -1,3 +1,4 @@
+import { parseCoreChatMessage, proposeCoreChatPreference } from './core-chat-preference.js';
 import { pathToFileURL } from "node:url";
 import { sha256 } from "@hhs/memory-schema";
 import { createPool, transaction, type DbClient } from "./db.js";
@@ -59,6 +60,9 @@ export async function reconcileAndPromote(grant: BrainGrant, input: ReconcileInp
 }
 export function createIntegrationService(config: BridgeConfig, run = reconcileAndPromote) {
   return bridgeServer(config, async (method, route, body) => {
+    if(method === 'POST' && route === '/memory/integration/remember') {
+      const grant=grantFor(config,body);return proposeCoreChatPreference(grant,parseCoreChatMessage(body,grant.targetRef));
+    }
     if (method !== "POST" || route !== "/memory/integration/reconcile") throw new BridgeError(404, "unknown_route");
     const input = parseReconcileInput(body);
     return run(grantFor(config, body), input);

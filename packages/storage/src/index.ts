@@ -370,3 +370,16 @@ async function readExistingInventory(finalPath: string, inventory: InventoryRun)
     throw error;
   }
 }
+
+
+/** Immutable application evidence in the EXISTING approved archive. One native
+ * message only; this never claims a complete conversation/browser capture. */
+export async function archiveApplicationEvidence(snapshot: Record<string, unknown>): Promise<{locator:string;sha256:string}> {
+  const root=approvedArchiveRoot();assertArchiveBoundaries(root);
+  const body=stableJson(snapshot),hash=sha256(body);
+  const directory=containedPath(root,'application-evidence','rivryn-chat',hash);
+  await mkdir(directory,{recursive:true});const file=containedPath(directory,'source.json');
+  try {await writeExclusive(file,body);} catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error;}
+  const stored=await readFile(file,'utf8');if(stored!==body||sha256(stored)!==hash)throw new Error('Application evidence integrity mismatch.');
+  return {locator:'hhs-archive://application-evidence/rivryn-chat/'+hash+'/source.json',sha256:hash};
+}

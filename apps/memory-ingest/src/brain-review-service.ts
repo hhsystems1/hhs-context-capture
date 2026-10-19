@@ -12,6 +12,11 @@ export function loadReviewConfig(env: Record<string, string | undefined>) {
     assertLocalDatabaseUrl(env.MEMORY_REVIEW_DATABASE_URL ?? "").username !== "memory_v1_review_login") throw new Error("Review requires existing report/reviewer logins.");
   return bridgeConfig(env, "MEMORY_CONTEXT_REVIEW", 54435);
 }
+// resolvePromotionEvidence returns only identities/text. Role/family live in the
+// receipt snapshots it has just hash-verified; never read them from its DTO.
+export function assertPersonalReviewSnapshots(grant:BrainGrant,sourceWorkspace:string,snapshots:Array<Record<string,unknown>>) {
+  if(sourceWorkspace===grant.destinationWorkspaceId && (!snapshots.length||snapshots.some(item=>(item.source_metadata as Record<string,unknown>)?.source_family!=='rivryn_chat'||item.role!=='user')))throw new BridgeError(403,'scope_denied');
+}
 export async function inspectCandidate(grant: BrainGrant, candidateId?: string) {
   const pool = createPool("reader");
   try {
@@ -25,11 +30,17 @@ export async function inspectCandidate(grant: BrainGrant, candidateId?: string) 
       }
       const detail = await showCandidateFromClient(client, grant.destinationWorkspaceId, candidateId);
       if (!detail.promotion_receipt) throw new BridgeError(404, "candidate_not_found");
-      await client.query("select set_config('memory_v1.workspace_id',$1,true)", [grant.sourceWorkspaceId]);
-      const resolved = await resolvePromotionEvidenceFromClient(client, grant.sourceWorkspaceId, detail.promotion_receipt);
+      const destination=(detail.promotion_receipt.promoted_value as Record<string,unknown>)?.destination as Record<string,unknown>;
+      if(destination?.brain_type!=='personal'||destination.workspace_id!==grant.destinationWorkspaceId||destination.target_ref!==grant.targetRef)throw new BridgeError(403,'scope_denied');
+      const receiptSources=detail.promotion_receipt.source_lineage as Array<Record<string,unknown>>;
+      const sourceWorkspace=receiptSources[0]?.source_workspace_id;
+      if(receiptSources.length!==1 || ![grant.sourceWorkspaceId,grant.destinationWorkspaceId].includes(String(sourceWorkspace)))throw new BridgeError(403,'scope_denied');
+      await client.query("select set_config('memory_v1.workspace_id',$1,true)", [sourceWorkspace]);
+      const resolved = await resolvePromotionEvidenceFromClient(client, String(sourceWorkspace), detail.promotion_receipt);
       const lineage = detail.promotion_receipt.source_lineage as Array<Record<string, unknown>>;
       const snapshots = lineage.flatMap(source => (source.observations as Array<Record<string, unknown>>)
         .flatMap(observation => observation.evidence as Array<Record<string, unknown>>));
+      assertPersonalReviewSnapshots(grant,String(sourceWorkspace),snapshots);
       const value = detail.candidate.proposed_value as Record<string, unknown>;
       return { view: "candidate", knowledge_candidate_id: candidateId, kind: detail.candidate.kind,
         statement: value.statement, authority: value.authority, temporal_status: value.temporal_status,
@@ -41,6 +52,7 @@ export async function inspectCandidate(grant: BrainGrant, candidateId?: string) 
           return { observation_id: item.observation_id, provenance_edge_id: item.provenance_edge_id,
             source_conversation_id: (snapshot.source_metadata as Record<string, unknown>).source_conversation_id, message_id: snapshot.message_id,
             role: snapshot.role, sequence: snapshot.sequence, representation_sha256: item.representation_sha256,
+            ...((snapshot.source_metadata as Record<string,unknown>).source_family==='rivryn_chat' ? {source_message_id:snapshot.source_message_id,source_created_at:(snapshot.source_metadata as Record<string,unknown>).source_observed_at} : {}),
             excerpt: text.slice(0, 2400), full_length: text.length, truncated: text.length > 2400, verification: "hash_matched" };
         }), evidence_truncated: resolved.length > 50 };
     });

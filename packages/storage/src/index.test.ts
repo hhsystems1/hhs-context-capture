@@ -5,7 +5,7 @@ import {
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  ArchiveCaptureError, approvedArchiveRoot, archiveCapture, assertArchiveBoundaries, catalogPathFor,
+  ArchiveCaptureError, archiveApplicationEvidence, approvedArchiveRoot, archiveCapture, assertArchiveBoundaries, catalogPathFor,
   type ArchiveFileSystem
 } from "./index.js";
 import { realisticCaptureBundle, realisticLargeCaptureBundle } from "./test-fixtures.js";
@@ -232,3 +232,19 @@ async function findDirectoriesNamed(root: string, pattern: RegExp): Promise<stri
   await visit(root);
   return output;
 }
+
+describe('application evidence in the existing immutable archive', () => {
+  it('preserves and verifies exact native evidence, replays idempotently and refuses corruption', async () => {
+    const snapshot={source:'rivryn_chat',message_id:'synthetic-native-user-message',role:'user',content:'Conversational example.'};
+    const first=await archiveApplicationEvidence(snapshot), replay=await archiveApplicationEvidence(snapshot);
+    expect(replay).toEqual(first);
+    const file=path.join(archiveRoot,'application-evidence','rivryn-chat',first.sha256,'source.json');
+    expect(digest(await readFile(file))).toBe(first.sha256);
+    expect(JSON.parse(await readFile(file,'utf8'))).toEqual(snapshot);
+    const changed=await archiveApplicationEvidence({...snapshot,content:'A different immutable snapshot.'});
+    expect(changed.sha256).not.toBe(first.sha256);
+    await writeFile(file,'corrupt fixture');
+    await expect(archiveApplicationEvidence(snapshot)).rejects.toThrow('Application evidence integrity mismatch');
+    expect(await readFile(file,'utf8')).toBe('corrupt fixture');
+  });
+});
