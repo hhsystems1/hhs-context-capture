@@ -92,3 +92,11 @@ describe("surrounding original user context", () => {
     expect(result).toMatchObject({ evidence: [{ role: "assistant" }], conversation_context: [{ role: "user", position: "before" }] });
   });
 });
+
+describe("original source dates",()=>{
+ it("returns only original source dates, never storage or analysis time",()=>{
+  expect(sourceEvidence({...edge,source_created_at:new Date('2025-03-02T04:05:06Z'),source_updated_at:'2025-03-03T04:05:06Z',created_at:'2026-01-01'})).toMatchObject({source_created_at:'2025-03-02T04:05:06.000Z',source_updated_at:'2025-03-03T04:05:06.000Z'});
+  expect(sourceEvidence({...edge,created_at:'2026-01-01',source_created_at:'not a date'})).toMatchObject({source_created_at:null,source_updated_at:null});
+  expect(HISTORY_EVIDENCE_SQL).toContain('m.source_created_at,m.source_updated_at');expect(HISTORY_CONTEXT_SQL).toContain('m.source_created_at,m.source_updated_at');
+ });
+});

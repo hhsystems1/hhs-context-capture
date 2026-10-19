@@ -86,6 +86,12 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
     next_cursor: result.rows.length > PAGE_SIZE ? observations.at(-1)!.observation_id : null };
 }
 
+function sourceDate(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : typeof value === "string" ? new Date(value) : null;
+  return date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
 function sourceExcerpt(row: Record<string, unknown>) {
   const text = row.text_value;
   if (typeof text !== "string" || sha256(text) !== row.representation_sha256 || row.verification_status !== "complete") {
@@ -93,6 +99,7 @@ function sourceExcerpt(row: Record<string, unknown>) {
   }
   return {
     source_conversation_id: String(row.source_conversation_id),
+    source_created_at: sourceDate(row.source_created_at), source_updated_at: sourceDate(row.source_updated_at),
     message_id: String(row.message_id), sequence: Number(row.sequence), role: String(row.role), active_path: row.active_path === true,
     source_version_id: row.source_version_id === null ? null : String(row.source_version_id),
     capture_version_id: row.capture_version_id === null ? null : String(row.capture_version_id),
@@ -120,6 +127,7 @@ export const HISTORY_CONTEXT_SQL = `with anchors as (
 select a.message_id anchor_message_id,
   case when m.sequence<a.sequence then 'before' else 'after' end position,
   c.source_conversation_id,m.message_id,m.sequence,m.role,m.active_path,m.source_version_id,m.capture_version_id,
+  m.source_created_at,m.source_updated_at,
   coalesce(sv.verification_status,cv.verification_status) verification_status,
   rep->>'representation_kind' representation_kind,rep->>'sha256' representation_sha256,rep->>'value' text_value
 from memory_v1.messages m
@@ -146,6 +154,7 @@ order by m.sequence,m.message_id limit $4`;
 // prepareReconciliationInputFromClient. Only verified excerpts leave this read boundary.
 export const HISTORY_EVIDENCE_SQL = `select p.provenance_edge_id,p.relation,p.representation_kind,p.representation_sha256,
   p.source_version_id,p.capture_version_id,c.source_conversation_id,m.message_id,m.sequence,m.role,m.active_path,
+  m.source_created_at,m.source_updated_at,
   coalesce(sv.verification_status,cv.verification_status) verification_status,
   (select rep->>'value' from jsonb_array_elements(b.representations) rep
     where rep->>'representation_kind'=p.representation_kind and rep->>'sha256'=p.representation_sha256 limit 1) text_value
