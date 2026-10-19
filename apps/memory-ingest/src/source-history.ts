@@ -73,9 +73,11 @@ export async function readSourceHistoryFromClient(client: DbClient, workspace: s
     order by observation_id limit $4`, [workspace, row.conversation_id, input.cursor ?? null, PAGE_SIZE + 1]);
   const rows = result.rows.slice(0, PAGE_SIZE);
   const trusted = rows.length ? await prepareReconciliationInputFromClient(client, workspace, rows.map(item => String(item.observation_id))) : null;
+  const links = rows.length ? await client.query(HISTORY_LINKS_SQL, [workspace, rows.map(row=>String(row.observation_id))]) : {rows:[]};
   const observations = (trusted?.observations ?? []).map((observation, index) => ({
     observation_id: observation.observation_id, pipeline_version: observation.pipeline_version,
     observation_kind: observation.observation_kind, statement: observation.statement,
+    ...sourceObservationLinks(links.rows, observation.observation_id),
     attribution: observation.attribution, evidence_roles: observation.evidence_roles,
     user_evidence_supported: hasSupportingUserEvidence([{ observation_id: observation.observation_id, relation: "supports" }], [observation]),
     created_at: observation.created_at, record_sha256: observation.record_sha256,
@@ -170,3 +172,15 @@ export const HISTORY_EVIDENCE_SQL = `select p.provenance_edge_id,p.relation,p.re
   where p.workspace_id=$1 and p.target_record_id=$2 and p.pipeline_version=$3 and p.target_record_type='observation'
     and ($4::text is null or p.provenance_edge_id > $4)
   order by p.provenance_edge_id limit $5`;
+
+// Existing relationship records remain proposed links, not approved conclusions.
+export const HISTORY_LINKS_SQL = `select l.observation_link_id,l.from_observation_id,l.to_observation_id,l.link_kind
+  from memory_v1.observation_links l
+  join memory_v1.observations a on a.workspace_id=l.workspace_id and a.observation_id=l.from_observation_id
+  join memory_v1.observations b on b.workspace_id=l.workspace_id and b.observation_id=l.to_observation_id
+  where l.workspace_id=$1 and (l.from_observation_id=any($2::text[]) or l.to_observation_id=any($2::text[]))
+  order by l.observation_link_id limit 2001`;
+export function sourceObservationLinks(rows:Record<string,unknown>[],observation:string){
+  const relevant=rows.slice(0,2000).filter(row=>row.from_observation_id===observation||row.to_observation_id===observation);
+  return {links:relevant.slice(0,40).map(row=>({id:String(row.observation_link_id),from:String(row.from_observation_id),to:String(row.to_observation_id),kind:String(row.link_kind)})),links_truncated:relevant.length>40,links_page_truncated:rows.length>2000};
+}

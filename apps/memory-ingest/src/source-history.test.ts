@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sha256 } from "@hhs/memory-schema";
 import type { DbClient } from "./db.js";
-import { HISTORY_CONVERSATIONS_SQL, HISTORY_EVIDENCE_SQL, readSourceHistoryFromClient, sourceEvidence, sourceConversationContext, HISTORY_CONTEXT_SQL, SourceHistoryNotFound } from "./source-history.js";
+import { HISTORY_CONVERSATIONS_SQL, HISTORY_LINKS_SQL, sourceObservationLinks, HISTORY_EVIDENCE_SQL, readSourceHistoryFromClient, sourceEvidence, sourceConversationContext, HISTORY_CONTEXT_SQL, SourceHistoryNotFound } from "./source-history.js";
 
 const workspace = "proof-workspace-synthetic";
 const text = "An original user statement.";
@@ -99,4 +99,19 @@ describe("original source dates",()=>{
   expect(sourceEvidence({...edge,created_at:'2026-01-01',source_created_at:'not a date'})).toMatchObject({source_created_at:null,source_updated_at:null});
   expect(HISTORY_EVIDENCE_SQL).toContain('m.source_created_at,m.source_updated_at');expect(HISTORY_CONTEXT_SQL).toContain('m.source_created_at,m.source_updated_at');
  });
+});
+
+describe('existing relationship projection for Personal inquiry',()=>{
+ it('retains source-scoped endpoints and relationship kinds without exposing payloads',()=>{
+  const result=sourceObservationLinks([{observation_link_id:'link_1',from_observation_id:'observation_1',to_observation_id:'observation_2',link_kind:'elaborates',payload:{private:'not returned'}},{observation_link_id:'link_2',from_observation_id:'foreign_a',to_observation_id:'foreign_b',link_kind:'related'}],'observation_1');
+  expect(result).toEqual({links:[{id:'link_1',from:'observation_1',to:'observation_2',kind:'elaborates'}],links_truncated:false,links_page_truncated:false});expect(HISTORY_LINKS_SQL).toContain('l.workspace_id=$1');expect(HISTORY_LINKS_SQL).toContain('a.workspace_id=l.workspace_id');expect(HISTORY_LINKS_SQL).toContain('b.workspace_id=l.workspace_id');
+ });
+ it('reports bounded/truncated relationship coverage instead of claiming the full graph',()=>{
+  const rows=Array.from({length:41},(_,i)=>({observation_link_id:'link_'+i,from_observation_id:'observation_1',to_observation_id:'other_'+i,link_kind:'related'}));expect(sourceObservationLinks(rows,'observation_1').links).toHaveLength(40);expect(sourceObservationLinks(rows,'observation_1').links_truncated).toBe(true);
+ });
+});
+
+it('distinguishes a globally bounded relationship page from truncation of this observation',()=>{
+ const rows=Array.from({length:2001},(_,i)=>({observation_link_id:'link_'+i,from_observation_id:'elsewhere',to_observation_id:'other',link_kind:'related'}));
+ expect(sourceObservationLinks(rows,'observation_1')).toEqual({links:[],links_truncated:false,links_page_truncated:true});
 });
