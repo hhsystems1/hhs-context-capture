@@ -10,7 +10,7 @@ import { assertLocalDatabaseUrl } from "./config.js";
 import { loadReconstructionInventory } from "./reconstruction-inventory.js";
 import { quarantineDetails } from "./reconstruction-diagnostics.js";
 import { reconstructionProgress } from './reconstruction-progress.js';
-import { readAuditStatus } from '../../../scripts/reconstruction-audit-status.mjs';
+import { readAuditStatus, acknowledgeAuditReview, type AuditReviewInput, type AuditReviewReceipt } from '../../../scripts/reconstruction-audit-status.mjs';
 
 export const LOOPBACK_HOST = "127.0.0.1";
 const ROOT = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -27,6 +27,7 @@ export interface OperationsDeps {
   diagnostics?(workspace: string, quarantined: unknown[], operation?: string): unknown[];
   progress?(workspace: string, operation: string, receipt: Record<string, unknown>): unknown;
   audit?(workspace: string, operation: string): { phase: string } | undefined;
+  review?(workspace: string, input: AuditReviewInput): AuditReviewReceipt;
   operations(workspace: string): Operation[];
   save(operation: Operation): void;
   acquire(operation: Operation): void;
@@ -139,7 +140,7 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       const caller = auth ? config.clients.find(c => timingSafeEqual(c.digest, hash(auth[1]!))) : undefined;
       if (!caller) return json(401, { error: "invalid_or_missing_token" });
       const route = /^\/memory\/workspaces\/(workspace_[0-9a-f]{32})\/reconstruction\/(status|start|resume)$/.exec(request.url ?? "");
-      const sourceRoute = /^\/memory\/sources\/([a-z0-9][a-z0-9_-]{0,63})\/reconstruction\/(status|start|resume)$/.exec(request.url ?? "");
+      const sourceRoute = /^\/memory\/sources\/([a-z0-9][a-z0-9_-]{0,63})\/reconstruction\/(status|start|resume|review)$/.exec(request.url ?? "");
       const intent = (route ?? sourceRoute)?.[2];
       if (!intent || (intent === "status" ? request.method !== "GET" : request.method !== "POST")) return json(404, { error: "unknown_route" });
       if (sourceRoute) {
@@ -156,6 +157,26 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       const chunks: Buffer[] = []; let size = 0;
       for await (const chunk of request) { size += chunk.length; if (size > 4096) throw new OperationsError(413, "body_too_large"); chunks.push(chunk); }
       let body: unknown; try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new OperationsError(400, "invalid_body"); }
+      if (intent === 'review') {
+        if (!source || !deps.review) throw new OperationsError(409, 'review_unavailable');
+        const parsed = parseAuditReviewInput(body);
+        const prior = await status(workspace);
+        if (active.has(workspace) || prior.operation_id !== parsed.operation_id || prior.process_termination !== 'exited'
+          || !['completed', 'partial'].includes(String(prior.state))) throw new OperationsError(409, 'review_changed_or_blocked');
+        const owned = deps.operations(workspace).find(item => item.operation_id === parsed.operation_id);
+        if (!owned || owned.termination !== 'exited') throw new OperationsError(409, 'review_changed_or_blocked');
+        deps.acquire(owned);
+        try {
+          // Recheck after acquiring the SAME exclusion used by reconstruction.
+          const latest = latestOperation(deps.operations(workspace));
+          if (latest?.operation_id !== parsed.operation_id) throw new OperationsError(409, 'review_changed_or_blocked');
+          return json(200, { workspace_id: workspace, ...deps.review(workspace, parsed) });
+        } catch (error) {
+          if (error instanceof OperationsError) throw error;
+          if (error instanceof Error && ['review_changed_or_blocked', 'review_conflict'].includes(error.message)) throw new OperationsError(409, error.message);
+          throw error;
+        } finally { deps.release(owned); }
+      }
       const input = parseLaunchInput(body);
       if (active.has(workspace)) return json(409, { error: "operation_active", workspace_id: workspace, operation_id: active.get(workspace)!.operation_id });
       // Verify reporting is available before authorizing execution. Never infer zeros.
@@ -195,6 +216,20 @@ export function createContextOperationsService(config: OperationsConfig, deps: O
       return json(503, { ...(workspace ? { workspace_id: workspace } : {}), state: "unavailable", available: false, error: "operations_unavailable" });
     }
   });
+}
+
+function latestOperation(operations: Operation[]) {
+  return latest(operations, operation => operation.started_at, operation => operation.operation_id);
+}
+export function parseAuditReviewInput(value: unknown): AuditReviewInput {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new OperationsError(400, 'invalid_body');
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => !['operation_id','revision','reviewer_ref','rationale','acknowledge_limitations'].includes(key))
+    || typeof input.operation_id !== 'string' || !OPERATION.test(input.operation_id)
+    || typeof input.revision !== 'string' || !/^[0-9a-f]{64}$/.test(input.revision)
+    || typeof input.reviewer_ref !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.reviewer_ref)
+    || input.acknowledge_limitations !== true || typeof input.rationale !== 'string' || input.rationale.trim().length < 10 || input.rationale.length > 1000) throw new OperationsError(400, 'invalid_body');
+  return input as unknown as AuditReviewInput;
 }
 
 // These records establish execution identity only; batch receipts and inventory remain authoritative.
@@ -262,6 +297,7 @@ export async function startFromEnvironment(): Promise<http.Server> {
     ...localExecutionDeps(ROOT), status: reader.status,
     progress: (workspace, operation, receipt) => reconstructionProgress(ROOT, workspace, operation, receipt),
     audit: (workspace, operation) => readAuditStatus(ROOT, workspace, operation),
+    review: (workspace, input) => acknowledgeAuditReview(ROOT, workspace, input),
     diagnostics: (workspace, quarantined, operation) => quarantineDetails(ROOT, workspace, quarantined, operation),
     launch: (executable, args, options) => {
       const env = { ...process.env };

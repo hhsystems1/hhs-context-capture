@@ -1,10 +1,11 @@
+import {readCompletions,readRelated} from './analysis-completions.js';
 import { sha256 } from "@hhs/memory-schema";
 import { createPool, readOnlyTransaction, type DbClient } from "./db.js";
 import { prepareReconciliationInputFromClient, hasSupportingUserEvidence } from "./reconciliation.js";
 
 // Read models over existing immutable observations/provenance. No new queue,
 // ontology, evidence store, reconciliation or approval authority.
-export interface HistoryInput { conversation?: string; observation?: string; cursor?: string; focus?: string }
+export interface HistoryInput { conversation?: string; observation?: string; cursor?: string; focus?: string; completions?: string; related?: string }
 export class SourceHistoryNotFound extends Error {}
 const PAGE_SIZE = 50;
 const EXCERPT_LIMIT = 2400;
@@ -29,6 +30,8 @@ export async function readSourceHistory(workspace: string, input: HistoryInput) 
 export async function readSourceHistoryFromClient(client: DbClient, workspace: string, input: HistoryInput) {
   await client.query("set local statement_timeout = 5000");
   await client.query("set local lock_timeout = 2000");
+  if(input.completions)return readCompletions(client,workspace,input.cursor);
+  if(input.related)return readRelated(client,workspace,input.related);
   if (!input.conversation) {
     const result = await client.query(HISTORY_CONVERSATIONS_SQL, [workspace, input.cursor ?? null, PAGE_SIZE + 1, input.focus ?? null]);
     const conversations = result.rows.slice(0, PAGE_SIZE).map(row => ({

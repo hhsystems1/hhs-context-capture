@@ -6,11 +6,55 @@ import pg from "pg";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { publishAuditStatus, readAuditStatus, acknowledgeAuditReview } from '../../../scripts/reconstruction-audit-status.mjs';
 import { CANONICAL_INVENTORY_SQL, EXPECTED_CLEAN_CORPUS_SIZE } from "./reconstruction-inventory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContextOperationsService, createOperationsStatusReader, startFromEnvironment, loadOperationsConfig, localExecutionDeps, parseLaunchInput, type Operation, type OperationsDeps } from "./context-operations-service.js";
 const TOKEN = "test-only-operations-token-".repeat(3);
 const W = `workspace_${"a".repeat(32)}`;
+describe('Personal cached-recovery review over the existing Operations boundary', () => {
+  const source = { sourceRef: 'test-history', workspaceId: 'historical-fixture', label: 'History', clients: ['hhs-core'] };
+  function reviewedFixture() {
+    const current = setup(loadOperationsConfig({ ...env, MEMORY_CONTEXT_SOURCE_COLLECTIONS: JSON.stringify([source]) }));
+    const operation: Operation = { workspace: source.workspaceId, operation_id: 'operation_' + 'd'.repeat(32), started_at: '2026-10-20T13:00:00Z', finished_at: '2026-10-20T13:01:00Z', termination: 'exited', exit_code: 0 };
+    current.deps.save(operation); putReceipt(current.root, operation.operation_id, 'completed', { workspace: source.workspaceId });
+    const directory = path.join(current.root, '.runtime/reconstruction/cached-recovery', operation.operation_id); fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'audit.json'), JSON.stringify({ schema_version: 'hhs-cached-recovery-audit/1', operation_id: operation.operation_id,
+      source: 'source_1', phase: 'review_required', original_generator_verified: false, all_current_evidence_matched: true, replay_new_rows: 0,
+      new_user_authority_risks: 0, missing_provenance: 0, changed_existing_runtime_files: 0, artifact_flags: [], all_findings_trusted_validated: 3,
+      all_findings_persisted_match: 3, prior_user_authority_risks: 106, remaining_user_authority_risks: 106, prior_exact_duplicate_groups: 0, remaining_exact_duplicate_groups: 0 }));
+    fs.writeFileSync(path.join(directory, 'lineage.json'), JSON.stringify({ operation_id: operation.operation_id, source: 'source_1', deferred_links: 2,
+      original: { original_input_sha256: 'b'.repeat(64), original_output_sha256: 'c'.repeat(64), generating_model_provenance: 'unverified' } }));
+    publishAuditStatus(current.root, { workspace: source.workspaceId, operation_id: operation.operation_id, phase: 'review_required', continuation: 'paused', updated_at: '2026-10-20T13:02:00Z', checked_findings: 3, sampled_findings: 3, advisory_issues: 2, blocking_issues: 0 });
+    current.deps.audit = (workspace, id) => readAuditStatus(current.root, workspace, id);
+    current.deps.review = (workspace, input) => acknowledgeAuditReview(current.root, workspace, input);
+    const revision = readAuditStatus(current.root, source.workspaceId, operation.operation_id)!.review!.revision;
+    return { ...current, operation, input: { operation_id: operation.operation_id, revision, reviewer_ref: '11111111-1111-4111-8111-111111111111', rationale: 'I accept these limitations for private historical exploration.', acknowledge_limitations: true } };
+  }
+  it('records a scoped, replay-safe review without launching processing', async () => {
+    const f = reviewedFixture();
+    const result = await request(f.server, 'review', { source: source.sourceRef, body: JSON.stringify(f.input) });
+    expect(result).toMatchObject({ code: 200, body: { operation_id: f.operation.operation_id, continuation: 'paused', replay: false, source_ref: source.sourceRef } });
+    expect((await request(f.server, 'review', { source: source.sourceRef, body: JSON.stringify(f.input) })).body.replay).toBe(true);
+    expect(f.deps.launch).not.toHaveBeenCalled();
+    expect((await request(f.server, 'status', { source: source.sourceRef })).body.audit).toMatchObject({ phase: 'reviewed', continuation: 'paused' });
+    expect(fs.existsSync(path.join(f.root, '.runtime/reconstruction/context-operations/execution.lock'))).toBe(false);
+  });
+  it('rejects unauthorized aliases, stale operations, invalid payloads and concurrent execution', async () => {
+    const f = reviewedFixture();
+    expect((await request(f.server, 'review', { source: 'other-history', body: JSON.stringify(f.input) })).code).toBe(404);
+    expect((await request(f.server, 'review', { body: JSON.stringify(f.input) })).code).toBe(404);
+    for (const patch of [{ revision: [f.input.revision] }, { acknowledge_limitations: false }, { rationale: 'short' }, { limit: 5 }]) {
+      expect((await request(f.server, 'review', { source: source.sourceRef, body: JSON.stringify({ ...f.input, ...patch }) })).code).toBe(400);
+    }
+    expect((await request(f.server, 'review', { source: source.sourceRef, body: JSON.stringify({ ...f.input, operation_id: 'operation_' + 'e'.repeat(32) }) })).code).toBe(409);
+    f.deps.acquire(f.operation);
+    expect((await request(f.server, 'review', { source: source.sourceRef, body: JSON.stringify(f.input) })).body.error).toBe('execution_active_or_unresolved');
+    f.deps.release(f.operation);
+    expect(f.deps.launch).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(f.root, '.runtime/reconstruction/audit-receipts/reviews'))).toBe(false);
+  });
+});
 const env = { MEMORY_REPORT_DATABASE_URL: "postgresql://memory_v1_report_login:test@127.0.0.1:55022/postgres", MEMORY_INGEST_DATABASE_URL: "postgresql://memory_v1_ingest_login:test@127.0.0.1:55022/postgres", MEMORY_CONTEXT_OPERATIONS_TOKENS: `hhs-core:${TOKEN}` };
 const config = loadOperationsConfig(env);
 const summary = { memory: { messages: 7, blocks: 8, proposed: 2, approved: 1, secret: TOKEN }, reconstruction: Object.fromEntries(["total_clean_conversations", "discovery_processed", "unprocessed", "awaiting_reconciliation", "observations_awaiting_reconciliation", "reconciled", "evidence_issues", "zero_evidence", "needs_review", "other_evidence_issues", "batches_total", "batches_complete", "batches_partial", "remaining_conversations", "next_batch"].map(key => [key, key === "next_batch" ? null : 1])) };
