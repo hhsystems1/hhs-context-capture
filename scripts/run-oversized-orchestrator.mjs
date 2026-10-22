@@ -95,7 +95,8 @@ function chunkFailureCategory(directory, number) {
   if (fs.existsSync(base + "-openrouter-raw.json") && read(base + "-openrouter-raw.json").choices?.[0]?.finish_reason === "length") return "model_output_truncated";
   if (fs.existsSync(base + "-error.json")) {
     const error = read(base + "-error.json");
-    if (["model_output_truncated", "malformed_model_json", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable"].includes(error.category)) return error.category;
+    if (error.category === 'provider_error' && [502, 503, 504].includes(error.provider_error_code ?? error.http_status)) return 'provider_unavailable';
+    if (["model_output_truncated", "malformed_model_json", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable", "incomplete_response"].includes(error.category)) return error.category;
     if (error.message === "Model response could not be repaired as JSON.") return "malformed_model_json";
     return "reconstruction_failed"; // An unrecognized provider/runtime error is not evidence validation.
   }

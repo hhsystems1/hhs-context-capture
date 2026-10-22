@@ -28,3 +28,6 @@ events.jsonl
 # Local transfer bundles and Windows-path archive directories.
 *.tgz
 /C:*/
+
+# Synthetic storage-test evidence is never repository source.
+/.test-runtime/

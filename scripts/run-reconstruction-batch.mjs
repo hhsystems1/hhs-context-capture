@@ -1,3 +1,4 @@
+import { readStandardProviderFailure } from "./reconstruction-provider.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -131,7 +132,11 @@ for (const candidate of candidates) {
       source_conversation_id: candidate.source_conversation_id,
       title: candidate.title,
       reason: String(error),
-      ...(oversizedFailure(candidate) ? { failure_code: oversizedFailure(candidate) } : {})
+      ...(receipt.current_source?.mode === 'standard' && /^Error: .+ exited with status 7$/.test(String(error))
+        ? readStandardProviderFailure(path.join(ROOT, PRIORITY_RUNS), { workspace: WORKSPACE,
+          source_conversation_id: candidate.source_conversation_id, priority_rank: priorityRank(candidate), operation_id: OPERATION_ID,
+          started_at: new Date(sourceStartedAt).toISOString(), finished_at: new Date().toISOString() }) ?? {}
+        : oversizedFailure(candidate) ? { failure_code: oversizedFailure(candidate) } : {})
     };
     receipt.quarantined.push(item);
     console.error("QUARANTINED:", item.reason);
@@ -194,7 +199,8 @@ function processStandard(candidate) {
         checked(process.execPath, [
           "scripts/run-next-priority-nemotron.mjs",
           "--workspace", WORKSPACE,
-          "--conversation", candidate.source_conversation_id
+          "--conversation", candidate.source_conversation_id,
+          ...(OPERATION_ID ? ["--operation-id", OPERATION_ID] : [])
         ]);
       } catch (error) {
         archiveStandardAttempt(
@@ -357,7 +363,7 @@ function oversizedFailure(candidate) {
   if (!fs.existsSync(file)) return undefined;
   const failure = read(file);
   if (failure.workspace !== WORKSPACE || failure.operation_id !== OPERATION_ID || failure.source_conversation_id !== candidate.source_conversation_id) return undefined;
-  return ["model_output_truncated", "malformed_model_json", "evidence_validation", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable"].includes(failure.failure_code) ? failure.failure_code : undefined;
+  return ["model_output_truncated", "malformed_model_json", "evidence_validation", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable", "incomplete_response"].includes(failure.failure_code) ? failure.failure_code : undefined;
 }
 
 function sourceStage(stage) {
@@ -456,10 +462,17 @@ function inventoryJson() {
   ]).stdout);
 }
 
+function sourceEvidenceHold(reason) {
+  return /(?:^|\n)Error: Original user text is not fully represented by content blocks; repair source evidence before discovery\.(?:\n|$)/.test(reason)
+  && /at assertBrowserUserTextCoverage \(/.test(reason) && /at prepareDiscoveryExchangeFromClient \(/.test(reason)
+  && !/provider_error|request_timeout|HTTP[ :]+[45]\d\d|ECONN\w+|AbortError/i.test(reason);
+}
+
 function quarantinedSources() {
   const directory = path.join(ROOT, ".runtime/reconstruction/batch-receipts");
   if (!fs.existsSync(directory)) return new Set();
-  const sources = new Set();
+  const sources = new Set(), temporary = new Map();
+  const transient = new Set(['request_timeout', 'source_deadline', 'rate_limited', 'provider_unavailable', 'incomplete_response']);
   for (const name of fs.readdirSync(directory).filter(name => name.endsWith(".json"))) {
     const prior = read(path.join(directory, name));
     if (prior.workspace !== WORKSPACE || !prior.finished_at || prior.status === "running") continue;
@@ -470,11 +483,19 @@ function quarantinedSources() {
     for (const item of prior.quarantined) {
       if (!item || typeof item.source_conversation_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(item.source_conversation_id)
         || typeof item.reason !== "string" || !item.reason.trim()) throw new Error(`Invalid preserved quarantine entry: ${name}`);
+      if (['evidence_validation', 'model_output_truncated', 'malformed_model_json'].includes(item.failure_code)) sources.add(item.source_conversation_id);
+      // Two distinct terminal operations exhaust automatic retries for this source.
+      // Keep the source unprocessed and its evidence intact; explicit targeted repair remains available.
+      if (transient.has(item.failure_code) && /^operation_[0-9a-f]{32}$/.test(prior.operation_id ?? '')) {
+        const operations = temporary.get(item.source_conversation_id) ?? new Set();
+        operations.add(prior.operation_id); temporary.set(item.source_conversation_id, operations);
+        if (operations.size >= 2) sources.add(item.source_conversation_id);
+      }
       // Content/identity failures need review. Preserve the existing automatic
       // artifact replay for transient generation or database-persistence errors.
       // The existing priority entrypoint also reports trusted-validation failure
       // through exit 10; older terminal receipts preserve that numeric outcome.
-      if (/standard validation failed after \d+ attempts|exited with status 10$|prepared_source_identity_mismatch|Discovery exchange does not match current trusted database evidence/.test(item.reason)) {
+      if (sourceEvidenceHold(item.reason) || /standard validation failed after \d+ attempts|exited with status 10$|prepared_source_identity_mismatch|Discovery exchange does not match current trusted database evidence/.test(item.reason)) {
         sources.add(item.source_conversation_id);
       }
     }

@@ -39,3 +39,9 @@ describe('operation-scoped audit visibility', () => {
     expect(auditStatusFromSession('workspace_a', operation, {}, { operation_id: operation, sources: [], semantic: null }).phase).toBe('no_saved_findings');
   });
 });
+
+it('bounded provider cooldown stays observable as automatic without inventing findings',()=>{
+ const operation='operation_'+'d'.repeat(32),state={status:'cooling_down'},audit={operation_id:operation,next_batch_allowed:true,sources:[],semantic:null};
+ expect(auditStatusFromSession('workspace_a',operation,state,audit)).toMatchObject({phase:'no_saved_findings',continuation:'automatic',checked_findings:0});
+ expect(auditStatusFromSession('workspace_a',operation,{...state,single_batch:true},audit).continuation).toBe('paused');
+});

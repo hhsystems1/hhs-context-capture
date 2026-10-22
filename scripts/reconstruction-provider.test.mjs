@@ -143,3 +143,62 @@ describe("bounded reconstruction requests", () => {
     for (const value of ["0", "-1", "900001", "abc"]) expect(() => providerRequestSignal({ HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS: value })).toThrow();
   });
 });
+
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { readStandardProviderFailure, standardProviderFailureCode } from './reconstruction-provider.mjs';
+describe('evidence-correlated standard provider recovery', () => {
+  const unavailable = { category: 'provider_error', http_status: 404, provider_error_code: 404 };
+  it('classifies the preserved 404 plus fallback-timeout pattern without claiming its root cause', () => {
+    expect(standardProviderFailureCode([unavailable, { category: 'request_timeout' }])).toBe('request_timeout');
+    expect(standardProviderFailureCode([unavailable])).toBe('provider_unavailable');
+    expect(standardProviderFailureCode([{ category: 'provider_error', http_status: 200, provider_error_code: 503 }])).toBe('provider_unavailable');
+  });
+  it('never masks a hard denial, cost or unknown result behind a recoverable failure', () => {
+    for (const [row, expected] of [
+      [{ category: 'provider_auth' }, 'provider_auth'], [{ category: 'provider_policy' }, 'provider_policy'],
+      [{ category: 'provider_error', http_status: 200, provider_error_code: 402 }, 'provider_credit'],
+      [{ category: 'request_timeout', http_status: 403 }, 'provider_auth'],
+      [{ category: 'provider_error', http_status: 404, provider_error_code: 400 }, undefined],
+      [{ category: 'request_failed' }, undefined], [{ category: 'content_received' }, undefined],
+      [{ category: 'provider_error', http_status: 500 }, undefined]
+    ]) expect(standardProviderFailureCode([unavailable, row])).toBe(expected);
+    expect(standardProviderFailureCode([])).toBeUndefined();
+  });
+  function fixture(fn) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hhs-standard-provider-'));
+    const stamp = Date.now() - 5000;
+    const identity = { workspace: 'owner-workspace', source_conversation_id: 'source-one', priority_rank: 1,
+      operation_id: 'operation_' + 'a'.repeat(32), started_at: new Date(stamp - 1000).toISOString(), finished_at: new Date(stamp + 4000).toISOString() };
+    const report = { schema_version: 'hhs-provider-attempts/1', workspace: identity.workspace, source_conversation_id: identity.source_conversation_id,
+      operation_id: identity.operation_id, attempts: [
+        { ...unavailable, model: 'nvidia/nemotron-3-super-120b-a12b:free', attempt: 1, at: new Date(stamp + 100).toISOString() },
+        { category: 'request_timeout', model: 'nvidia/nemotron-3-ultra-550b-a55b:free', attempt: 1, at: new Date(stamp + 200).toISOString() }
+      ] };
+    const file = path.join(directory, `priority-0001-source-one-${stamp}-123-provider-attempts.json`);
+    const put = () => fs.writeFileSync(file, JSON.stringify(report));
+    try { fn({ directory, identity, report, file, put }); } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  }
+  it('retains the exact diagnostics and accepts legacy evidence only by explicit bounded time correlation', () => fixture(({ directory, identity, report, file, put }) => {
+    put(); const before = fs.readFileSync(file);
+    expect(readStandardProviderFailure(directory, identity)).toMatchObject({ failure_code: 'request_timeout', provider_failure_evidence: [path.basename(file)] });
+    expect(fs.readFileSync(file)).toEqual(before);
+    delete report.operation_id; put();
+    expect(readStandardProviderFailure(directory, identity)).toBeUndefined();
+    expect(readStandardProviderFailure(directory, { ...identity, allowLegacy: true })).toMatchObject({ failure_code: 'request_timeout' });
+  }));
+  it.each(['workspace', 'source', 'operation', 'time', 'model', 'duplicate-model', 'malformed', 'ambiguous-files'])('rejects %s correlation failures', kind => fixture(({ directory, identity, report, file, put }) => {
+    if (kind === 'workspace') report.workspace = 'another-user';
+    if (kind === 'source') report.source_conversation_id = 'another-source';
+    if (kind === 'operation') report.operation_id = 'operation_' + 'b'.repeat(32);
+    if (kind === 'time') report.attempts[1].at = '2020-01-01T00:00:00Z';
+    if (kind === 'model') report.attempts[1].model = 'unauthorized-model';
+    if (kind === 'duplicate-model') report.attempts[1].model = report.attempts[0].model;
+    put();
+    if (kind === 'malformed') fs.writeFileSync(file, '{');
+    if (kind === 'ambiguous-files') for (const pid of [124, 125]) fs.copyFileSync(file, file.replace('-123-', `-${pid}-`));
+    expect(readStandardProviderFailure(directory, { ...identity, allowLegacy: true })).toBeUndefined();
+  }));
+});

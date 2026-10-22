@@ -13,7 +13,7 @@
     "build": "npm run build -ws --if-present",
     "build:extension": "node scripts/build-extension.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=2",
     "lint": "eslint .",
     "check": "npm run typecheck && npm test && npm run build && npm run lint",
     "collector": "tsx --env-file=.env.memory-v1.local apps/local-collector/src/server.ts",

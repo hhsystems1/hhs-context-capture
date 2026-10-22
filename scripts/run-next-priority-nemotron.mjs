@@ -11,6 +11,8 @@ const RUNS_DIR = ".runtime/reconstruction/priority-runs";
 
 const WORKSPACE = flag("workspace");
 const PROVIDER = "openrouter";
+const OPERATION_ID = flag("operation-id");
+if (process.argv.includes("--operation-id") && !/^operation_[0-9a-f]{32}$/.test(OPERATION_ID ?? "")) throw new Error("Invalid --operation-id.");
 
 function priorityRank(item) {
   const rank = item.unprocessed_queue_rank ?? item.overall_priority_rank;
@@ -341,7 +343,7 @@ function recordProviderAttempt(model, attempt, outcome) {
   providerAttempts.push({ model, attempt, at: new Date().toISOString(), ...outcome });
   fs.writeFileSync(providerAuditPath, JSON.stringify({
     schema_version: "hhs-provider-attempts/1", workspace: WORKSPACE,
-    source_conversation_id: next.source_conversation_id, attempts: providerAttempts
+    source_conversation_id: next.source_conversation_id, ...(OPERATION_ID ? { operation_id: OPERATION_ID } : {}), attempts: providerAttempts
   }, null, 2) + "\n");
 }
 

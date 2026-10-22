@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 // Bound connection and response-body reads without changing the model policy.
 export function providerRequestSignal(env = process.env) {
   const milliseconds = Number(env.HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS ?? 180000);
@@ -201,4 +204,60 @@ export function providerFailureCategory(status, message) {
   if (status === 401 || status === 403) return 'provider_auth';
   if (status === 402) return 'provider_credit';
   return 'provider_error';
+}
+
+// Correlate safe native diagnostics; never infer recovery from exception prose.
+// Old reports without operation IDs require an explicitly permitted, exact batch
+// time window. Global Operations exclusion prevents overlapping source workers.
+export function readStandardProviderFailure(directory, identity) {
+  const { workspace, source_conversation_id: source, priority_rank: rank, operation_id: operation } = identity;
+  const start = Date.parse(identity.started_at), end = Date.parse(identity.finished_at);
+  if (!workspace || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(source ?? '') || !Number.isInteger(rank) || rank < 1
+    || !/^operation_[0-9a-f]{32}$/.test(operation ?? '') || !Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined;
+  const prefix = `priority-${String(rank).padStart(4, '0')}-${source}-`;
+  const files = fs.existsSync(directory) ? fs.readdirSync(directory).filter(name => name.startsWith(prefix) && name.endsWith('-provider-attempts.json')) : [];
+  const reports = [];
+  for (const name of files) {
+    const match = name.slice(prefix.length).match(/^(\d{13})-[1-9]\d*-provider-attempts\.json$/);
+    if (!match || Number(match[1]) < start || Number(match[1]) > end) continue;
+    const file = path.join(directory, name);
+    if (!fs.lstatSync(file).isFile() || fs.lstatSync(file).isSymbolicLink()) return undefined;
+    let report; try { report = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
+    if (report.schema_version !== 'hhs-provider-attempts/1' || report.workspace !== workspace || report.source_conversation_id !== source
+      || (report.operation_id !== operation && !(identity.allowLegacy && report.operation_id === undefined))
+      || !Array.isArray(report.attempts) || !report.attempts.length || report.attempts.length > 2) return undefined;
+    let previous = Number(match[1]);
+    for (const attempt of report.attempts) {
+      const at = Date.parse(attempt.at);
+      if (!Number.isFinite(at) || at < previous || at > end || attempt.attempt !== 1
+        || !['nvidia/nemotron-3-super-120b-a12b:free', 'nvidia/nemotron-3-ultra-550b-a55b:free'].includes(attempt.model)) return undefined;
+      previous = at;
+    }
+    if (new Set(report.attempts.map(row => row.model)).size !== report.attempts.length) return undefined;
+    reports.push({ name, attempts: report.attempts });
+  }
+  if (!reports.length || reports.length > 2) return undefined;
+  const failure_code = standardProviderFailureCode(reports.flatMap(row => row.attempts));
+  return failure_code ? { failure_code, provider_failure_evidence: reports.map(row => row.name).sort() } : undefined;
+}
+export function standardProviderFailureCode(attempts) {
+  if (!Array.isArray(attempts) || !attempts.length) return undefined;
+  const codes = attempts.map(row => {
+    // A transport success cannot conceal an embedded hard denial or cost.
+    const statuses = [row.http_status, row.provider_error_code];
+    if (row.category === 'provider_policy') return 'provider_policy';
+    if (row.category === 'provider_auth' || statuses.some(status => [401, 403].includes(status))) return 'provider_auth';
+    if (row.category === 'provider_credit' || statuses.includes(402)) return 'provider_credit';
+    if (statuses.some(status => status !== undefined && (!Number.isInteger(status)
+      || (status >= 400 && ![404, 429, 502, 503, 504].includes(status))))) return undefined;
+    if (['request_timeout', 'source_deadline', 'rate_limited', 'incomplete_response'].includes(row.category)) return row.category;
+    // 404 establishes an unavailable requested route, not its underlying cause.
+    // Recovery remains finite; no request/configuration or provider policy changes.
+    if (row.category === 'provider_error' && statuses.some(status => [404, 502, 503, 504].includes(status))) return 'provider_unavailable';
+    return undefined;
+  });
+  const hard = codes.find(code => ['provider_policy', 'provider_auth', 'provider_credit'].includes(code));
+  if (hard) return hard;
+  if (codes.some(code => code === undefined)) return undefined;
+  return ['source_deadline', 'request_timeout', 'rate_limited', 'incomplete_response', 'provider_unavailable'].find(code => codes.includes(code));
 }

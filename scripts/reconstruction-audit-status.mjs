@@ -14,7 +14,7 @@ export function auditStatusFromSession(workspace, operation, state, audit) {
     : state.status === 'auditing' ? state.current_stage === 'coherence_review' ? 'coherence' : 'validating'
     : state.status === 'paused_for_audit' ? 'failed' : 'pending';
   return { workspace, operation_id: operation, phase, updated_at: new Date().toISOString(),
-    continuation: !state.audit_only && !state.single_batch && ['waiting_for_batch', 'auditing', 'launching_next_batch'].includes(state.status) && (!audit || audit.next_batch_allowed) ? 'automatic' : 'paused',
+    continuation: !state.audit_only && !state.single_batch && ['waiting_for_batch', 'auditing', 'launching_next_batch', 'cooling_down'].includes(state.status) && (!audit || audit.next_batch_allowed) ? 'automatic' : 'paused',
     checked_findings: checkedFindings,
     sampled_findings: audit?.semantic?.sample_count ?? 0,
     advisory_issues: issues.filter(issue => issue.severity === 'advisory').length,

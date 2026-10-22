@@ -21,7 +21,7 @@ const SOURCE = "synthetic-source";
 const WORKSPACE = "synthetic-workspace";
 const MODEL = "synthetic-model";
 const roots: string[] = [];
-const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
+const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, readStandardProviderFailure } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function root(): string { const value = fs.mkdtempSync(path.join(os.tmpdir(), "hhs-runner-unit-")); roots.push(value); return value; }
 function put(directory: string, file: string, value: unknown): void {
@@ -107,7 +107,7 @@ async function run(directory: string, script: string, args: string[], spawnSync:
     await vm.runInNewContext(`(async () => { ${source} })()`, {
       fs: localFs, path, spawnSync, jsonrepair, process: fakeProcess, Buffer, fetch,
       providerRequestSignal: () => providerRequestSignal(fakeProcess.env),
-      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION,
+      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, readStandardProviderFailure,
       mkdir: (file: string, options: any) => mkdir(resolve(file), options),
       readFile: (file: string, options: any) => readFile(resolve(file), options),
       writeFile: (file: string, value: any, options: any) => writeFile(resolve(file), value, options),
@@ -205,7 +205,7 @@ describe("existing standard reconstruction runner retry/resume", () => {
     expect(deadline).toBeLessThanOrEqual(Date.now() + 40 * 60 * 1000);
     expect(get(directory, `${runDir}/chunk-001-model.json`)).toEqual(receipt());
   });
-  it.each(["Error: standard validation failed after 3 attempts: unknown evidence reference", "Error: /usr/bin/node exited with status 10"])("normal continuation preserves terminal content failures (%s)", async (reason) => {
+  it.each(["Error: standard validation failed after 3 attempts: unknown evidence reference", "Error: /usr/bin/node exited with status 10", "Error: Original user text is not fully represented by content blocks; repair source evidence before discovery.\n    at assertBrowserUserTextCoverage (/fixture/understanding-discovery.ts:784:13)\n    at prepareDiscoveryExchangeFromClient (/fixture/understanding-discovery.ts:235:5)"])("normal continuation preserves terminal content failures (%s)", async (reason) => {
     const directory = root(); priority(directory); standardArtifacts(directory);
     const heldPath = ".runtime/reconstruction/batch-receipts/batch-2026-01-01.json";
     const held = { schema_version: "hhs-reconstruction-batch/0.1.0", workspace: WORKSPACE,
@@ -221,6 +221,19 @@ describe("existing standard reconstruction runner retry/resume", () => {
     expect(batchReceipt(directory)).toMatchObject({ status: "completed", selected: 0, skipped_quarantined_count: 1 });
     expect(get(directory, heldPath)).toEqual(held);
     expect(fs.readFileSync(path.join(directory, `${BASE}-output.json`), "utf8")).toBe(preserved);
+  });
+
+  it.each(["Error: Original user text is not fully represented by content blocks; repair source evidence before discovery.","Error: Original user text is not fully represented by content blocks; repair source evidence before discovery.\n    at assertBrowserUserTextCoverage (/fixture/understanding-discovery.ts:784:13)\n    at prepareDiscoveryExchangeFromClient (/fixture/understanding-discovery.ts:235:5)\nError: provider_error HTTP 503","Error: request_timeout"])("does not silently quarantine unknown or provider failures (%s)", async reason => {
+    const directory=root();priority(directory);standardArtifacts(directory);
+    put(directory,".runtime/reconstruction/batch-receipts/batch-2026-01-01.json",{schema_version:"hhs-reconstruction-batch/0.1.0",workspace:WORKSPACE,status:"failed",finished_at:"2026-01-01T00:00:00.000Z",completed:[],quarantined:[{source_conversation_id:SOURCE,reason}]});
+    let writes=0;
+    await run(directory,"run-reconstruction-batch.mjs",BATCH_ARGS,(_command,args)=>{
+      if(args.includes("scripts/reconstruction-inventory.ts"))return inventory();
+      if(args.includes("validate"))return validate(directory,args);
+      if(args.includes("persist")){writes++;return persistResult();}
+      throw new Error("Unexpected model generation");
+    });
+    expect(writes).toBe(1);
   });
 
   it("explicit targeted retry, other-workspace and unfinished receipts do not silently hold an eligible source", async () => {
@@ -1006,7 +1019,7 @@ describe("operation-specific oversized failure categories", () => {
     await expect(run(directory, "run-oversized-orchestrator.mjs", [...orchestratorArgs(directory), "--operation-id", operation], spawn)).rejects.toThrow(/exit 7/);
     expect(get(directory, "failure-" + operation + ".json")).toMatchObject({
       workspace: WORKSPACE, operation_id: operation, source_conversation_id: SOURCE,
-      failure_code: category === "incomplete_response" ? "reconstruction_failed" : category
+      failure_code: category
     });
     expect(fs.existsSync(path.join(directory, "chunk-001-output.json"))).toBe(false);
   });
@@ -1019,4 +1032,70 @@ it("reports a rejected cached output as current evidence validation, not an olde
   const spawn: Spawn = (_command, args) => { expect(args).toContain("validate"); return result(1); };
   await expect(run(directory, "run-oversized-orchestrator.mjs", [...orchestratorArgs(directory), "--operation-id", operation], spawn)).rejects.toThrow(/Validation failed/);
   expect(get(directory, "failure-" + operation + ".json").failure_code).toBe("evidence_validation");
+});
+
+describe('bounded source retry holds',()=>{
+ it.each(['request_timeout','source_deadline','rate_limited','provider_unavailable','incomplete_response'])('two distinct %s operations defer a source without changing its evidence',async failure_code=>{
+   const directory=root();priority(directory);standardArtifacts(directory);const before=fs.readFileSync(path.join(directory,BASE+'-input.json'),'utf8');
+   for(const suffix of ['a','b'])put(directory,'.runtime/reconstruction/batch-receipts/'+suffix+'.json',{schema_version:'hhs-reconstruction-batch/0.1.0',workspace:WORKSPACE,operation_id:'operation_'+suffix.repeat(32),status:'failed',finished_at:'2026-01-01T00:00:00Z',completed:[],quarantined:[{source_conversation_id:SOURCE,reason:'exit 1',failure_code}]});
+   await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,(_command,args)=>{if(args.includes('scripts/reconstruction-inventory.ts'))return inventory();throw Error('Held source must not run');});
+   expect(batchReceipt(directory)).toMatchObject({selected:0,skipped_quarantined_count:1});expect(fs.readFileSync(path.join(directory,BASE+'-input.json'),'utf8')).toBe(before);
+ });
+ it.each(['one','duplicate','auth','other-workspace'])('does not derive a source retry hold from %s',async mode=>{
+   const directory=root();priority(directory);standardArtifacts(directory);
+   for(const [index,suffix]of ['a','b'].entries()){if(mode==='one'&&index)continue;put(directory,'.runtime/reconstruction/batch-receipts/'+suffix+'.json',{schema_version:'hhs-reconstruction-batch/0.1.0',workspace:mode==='other-workspace'?'other':WORKSPACE,operation_id:'operation_'+(mode==='duplicate'?'a':suffix).repeat(32),status:'failed',finished_at:'2026-01-01T00:00:00Z',completed:[],quarantined:[{source_conversation_id:SOURCE,reason:'exit 1',failure_code:mode==='auth'?'provider_auth':'request_timeout'}]});}
+   let writes=0;await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,(_command,args)=>{if(args.includes('scripts/reconstruction-inventory.ts'))return inventory();if(args.includes('validate'))return validate(directory,args);if(args.includes('persist')){writes++;return persistResult();}throw Error('Unexpected model request');});expect(writes).toBe(1);
+ });
+ it.each([502,503,504,401,402,403])('classifies preserved provider HTTP %s without weakening hard failures',async code=>{
+   const directory=root();oversized(directory,1);const operation='operation_'+'c'.repeat(32);
+   await expect(run(directory,'run-oversized-orchestrator.mjs',[...orchestratorArgs(directory),'--operation-id',operation],(_command,args)=>{if(args.includes('scripts/run-oversized-chunk-nemotron.mjs')){put(directory,'chunk-001-attempt-001-error.json',{category:'provider_error',http_status:code,provider_error_code:code});return result(7);}throw Error('Unexpected work');})).rejects.toThrow(/stopped with exit/);
+   expect(get(directory,'failure-'+operation+'.json').failure_code).toBe([502,503,504].includes(code)?'provider_unavailable':'reconstruction_failed');
+ });
+});
+
+describe('typed content holds preserve other eligible work',()=>{
+ it.each(['evidence_validation','model_output_truncated','malformed_model_json'])('holds exhausted %s output without regenerating or persisting it',async failure_code=>{
+  const directory=root();priority(directory);standardArtifacts(directory);put(directory,'.runtime/reconstruction/batch-receipts/batch-2026-01-01-held.json',{schema_version:'hhs-reconstruction-batch/0.1.0',workspace:WORKSPACE,status:'failed',finished_at:'2026-01-01T00:00:00Z',completed:[],quarantined:[{source_conversation_id:SOURCE,reason:'exit 1',failure_code}]});
+  await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,(_cmd,args)=>{if(args.includes('scripts/reconstruction-inventory.ts'))return inventory();throw Error('Held source must not run');});expect(batchReceipt(directory)).toMatchObject({selected:0,skipped_quarantined_count:1});
+ });
+ it('processes a healthy second source while leaving the failed source and receipt unchanged',async()=>{
+  const directory=root();priority(directory);standardArtifacts(directory);const second='healthy-source',held={schema_version:'hhs-reconstruction-batch/0.1.0',workspace:WORKSPACE,status:'failed',finished_at:'2026-01-01T00:00:00Z',completed:[],quarantined:[{source_conversation_id:SOURCE,reason:'exit 1',failure_code:'evidence_validation'}]};
+  put(directory,'.runtime/reconstruction/batch-receipts/batch-2026-01-01-held.json',held);const index=get(directory,'.runtime/reconstruction/business-priority-index-v1.json');index.conversations.push({...index.conversations[0],source_conversation_id:second,unprocessed_queue_rank:2});put(directory,'.runtime/reconstruction/business-priority-index-v1.json',index);
+  const input=exchange('healthy');input.selection[0]!.source_conversation_id=second;input.evidence[0]!.source_conversation_id=second;input.evidence_sha256=sha256(input.evidence);const candidate=output(input);candidate.observations[0]!.source_conversation_id=second;const base='.runtime/reconstruction/priority-runs/priority-0002-'+second;put(directory,base+'-input.json',input);put(directory,base+'-output.json',candidate);put(directory,base+'-openrouter-raw.json',{model:MODEL});
+  let writes=0;await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,(_cmd,args)=>{if(args.includes('scripts/reconstruction-inventory.ts'))return result(0,{workspace_id:WORKSPACE,conversations:[SOURCE,second].map(id=>({source_conversation_id:id,source_version_id:'version',capture_version_id:null,discovery_status:'unprocessed'}))});if(args.includes('validate'))return validate(directory,args);if(args.includes('persist')){writes++;return persistResult();}throw Error('No model call expected');});
+  expect(writes).toBe(1);expect(batchReceipt(directory)).toMatchObject({selected:1,skipped_quarantined_count:1,completed:[{source_conversation_id:second}]});expect(get(directory,'.runtime/reconstruction/batch-receipts/batch-2026-01-01-held.json')).toEqual(held);expect(get(directory,BASE+'-output.json')).toEqual(output());
+ });
+});
+
+
+describe('standard provider terminal failure propagation', () => {
+  it('correlates safe native diagnostics to the owned operation and preserves failed attempts', async () => {
+    const directory = root(); priority(directory);
+    const operation = 'operation_' + 'a'.repeat(32);
+    let generated = 0;
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes('scripts/reconstruction-inventory.ts')) return inventory();
+      if (args.includes('scripts/run-next-priority-nemotron.mjs')) {
+        expect(argument(args, 'operation-id')).toBe(operation);
+        generated++;
+        const stamp = Date.now();
+        put(directory, `${BASE}-${stamp}-${123 + generated}-provider-attempts.json`, {
+          schema_version: 'hhs-provider-attempts/1', workspace: WORKSPACE, source_conversation_id: SOURCE,
+          operation_id: operation, attempts: [
+            { model: 'nvidia/nemotron-3-super-120b-a12b:free', attempt: 1, at: new Date(stamp).toISOString(), category: 'provider_error', http_status: 404, provider_error_code: 404 },
+            { model: 'nvidia/nemotron-3-ultra-550b-a55b:free', attempt: 1, at: new Date(stamp).toISOString(), category: 'request_timeout' }
+          ]
+        });
+        put(directory, `${BASE}-input.json`, exchange()); return result(7);
+      }
+      throw new Error('No persistence or unrelated subprocess authorized');
+    };
+    expect((await run(directory, 'run-reconstruction-batch.mjs', [...BATCH_ARGS, '--limit', '5', '--operation-id', operation], spawn)).code).toBe(2);
+    expect(generated).toBe(2);
+    const failed = batchReceipt(directory).quarantined[0];
+    expect(failed.failure_code).toBe('request_timeout');
+    expect(failed.provider_failure_evidence).toHaveLength(2);
+    expect(fs.readdirSync(path.join(directory, '.runtime/reconstruction/priority-runs/failed-attempts/priority-0001-synthetic-source'))).toHaveLength(2);
+    for (const name of failed.provider_failure_evidence) expect(fs.existsSync(path.join(directory, '.runtime/reconstruction/priority-runs', name))).toBe(true);
+  });
 });
