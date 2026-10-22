@@ -21,7 +21,7 @@ const SOURCE = "synthetic-source";
 const WORKSPACE = "synthetic-workspace";
 const MODEL = "synthetic-model";
 const roots: string[] = [];
-const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, readStandardProviderFailure } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
+const { modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, providerRequestSignal, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, readStandardProviderFailure, standardProviderFailureCode } = await import(path.resolve("scripts/reconstruction-provider.mjs"));
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function root(): string { const value = fs.mkdtempSync(path.join(os.tmpdir(), "hhs-runner-unit-")); roots.push(value); return value; }
 function put(directory: string, file: string, value: unknown): void {
@@ -107,7 +107,7 @@ async function run(directory: string, script: string, args: string[], spawnSync:
     await vm.runInNewContext(`(async () => { ${source} })()`, {
       fs: localFs, path, spawnSync, jsonrepair, process: fakeProcess, Buffer, fetch,
       providerRequestSignal: () => providerRequestSignal(fakeProcess.env),
-      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, readStandardProviderFailure,
+      modelDiscoveryExchange, restoreModelEvidenceRefs, providerFailureCategory, requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, readStandardProviderFailure, standardProviderFailureCode,
       mkdir: (file: string, options: any) => mkdir(resolve(file), options),
       readFile: (file: string, options: any) => readFile(resolve(file), options),
       writeFile: (file: string, value: any, options: any) => writeFile(resolve(file), value, options),
@@ -1097,5 +1097,78 @@ describe('standard provider terminal failure propagation', () => {
     expect(failed.provider_failure_evidence).toHaveLength(2);
     expect(fs.readdirSync(path.join(directory, '.runtime/reconstruction/priority-runs/failed-attempts/priority-0001-synthetic-source'))).toHaveLength(2);
     for (const name of failed.provider_failure_evidence) expect(fs.existsSync(path.join(directory, '.runtime/reconstruction/priority-runs', name))).toBe(true);
+  });
+});
+
+
+describe('current-operation oversized linker failure propagation', () => {
+  it.each([
+    [{ category: 'provider_error', http_status: 200, provider_error_code: 503 }, 'provider_unavailable'],
+    [{ category: 'request_timeout' }, 'request_timeout'],
+    [{ category: 'provider_error', http_status: 401 }, 'provider_auth'],
+    [{ category: 'provider_error', http_status: 402 }, 'provider_credit'],
+    [{ category: 'provider_error', http_status: 403 }, 'provider_auth'],
+    [{ category: 'provider_policy' }, 'provider_policy'],
+    [{ category: 'request_failed' }, 'reconstruction_failed'],
+    [{ category: 'provider_error', http_status: 400 }, 'reconstruction_failed'],
+    [{ category: 'provider_error', http_status: 200, provider_error_code: 503, attempts: [{ category: 'provider_auth' }, { category: 'provider_error', provider_error_code: 503 }] }, 'provider_auth']
+  ])('preserves typed linker failure %j without persisting or regenerating validated chunks', async (diagnostic, expected) => {
+    const directory = root(); oversized(directory, 1); completeChunk(directory, '001');
+    const operation = 'operation_' + 'a'.repeat(32);
+    const chunkBefore = fs.readFileSync(path.join(directory, 'chunk-001-output.json'));
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes('validate')) return validate(directory, args);
+      if (args.includes('scripts/run-oversized-linker-nemotron.mjs')) {
+        put(directory, 'parent-link-attempt-001-request.json', { request_version: LINKING_REQUEST_VERSION });
+        put(directory, 'parent-link-attempt-001-error.json', diagnostic); return result(7);
+      }
+      throw Error('No chunk regeneration or persistence permitted');
+    };
+    await expect(run(directory, 'run-oversized-orchestrator.mjs', [...orchestratorArgs(directory), '--operation-id', operation], spawn)).rejects.toThrow(/Linker stopped/);
+    expect(get(directory, 'failure-' + operation + '.json').failure_code).toBe(expected);
+    expect(fs.readFileSync(path.join(directory, 'chunk-001-output.json'))).toEqual(chunkBefore);
+    expect(fs.existsSync(path.join(directory, 'parent-output.json'))).toBe(false);
+  });
+  it('does not use an older linker 503 to explain a new failure without diagnostics', async () => {
+    const directory = root(); oversized(directory, 1); completeChunk(directory, '001');
+    put(directory, 'parent-link-attempt-001-error.json', { category: 'provider_error', provider_error_code: 503 });
+    const operation = 'operation_' + 'b'.repeat(32);
+    const spawn: Spawn = (_command, args) => args.includes('validate') ? validate(directory, args) : result(7);
+    await expect(run(directory, 'run-oversized-orchestrator.mjs', [...orchestratorArgs(directory), '--operation-id', operation], spawn)).rejects.toThrow();
+    expect(get(directory, 'failure-' + operation + '.json').failure_code).toBe('reconstruction_failed');
+  });
+  it('resumes the same validated chunks after a failed linker, preserving the original failed operation', async () => {
+    const directory = root(); oversized(directory, 1); completeChunk(directory, '001');
+    const operation = 'operation_' + 'c'.repeat(32);
+    const chunk = fs.readFileSync(path.join(directory, 'chunk-001-output.json'));
+    let fail = true, calls = 0;
+    const spawn: Spawn = (_command, args) => {
+      if (args.includes('validate')) return validate(directory, args);
+      if (args.includes('scripts/run-oversized-linker-nemotron.mjs')) {
+        calls++;
+        if (fail) { put(directory, 'parent-link-attempt-001-error.json', { category: 'provider_error', http_status: 200, provider_error_code: 503 }); return result(7); }
+        completeParent(directory); return result();
+      }
+      throw Error('Validated chunks must be reused');
+    };
+    await expect(run(directory, 'run-oversized-orchestrator.mjs', [...orchestratorArgs(directory), '--operation-id', operation], spawn)).rejects.toThrow();
+    const failed = fs.readFileSync(path.join(directory, 'failure-' + operation + '.json'));
+    fail = false;
+    expect((await run(directory, 'run-oversized-orchestrator.mjs', [...orchestratorArgs(directory), '--operation-id', 'operation_' + 'd'.repeat(32)], spawn)).code).toBe(0);
+    expect(calls).toBe(2);
+    expect(fs.readFileSync(path.join(directory, 'failure-' + operation + '.json'))).toEqual(failed);
+    expect(fs.readFileSync(path.join(directory, 'chunk-001-output.json'))).toEqual(chunk);
+  });
+  it.each([401, 402, 403])('the linker stops after hard HTTP %s without a fallback, while preserving safe attempt metadata', async status => {
+    const directory = root(); oversized(directory, 1); completeChunk(directory, '001');
+    put(directory, 'parent-deterministic-merged-output.json', output(get(directory, 'parent-input.json')));
+    let calls = 0;
+    const fetch = async () => { calls++; return { ok: false, status, json: async () => ({ error: { code: status, message: 'private echoed source' } }) }; };
+    expect((await run(directory, 'run-oversized-linker-nemotron.mjs', ['--run-dir', directory], () => { throw Error('No validation after provider denial'); }, fetch)).code).toBe(7);
+    expect(calls).toBe(1);
+    const diagnostic = get(directory, 'parent-link-attempt-001-error.json');
+    expect(diagnostic.attempts).toHaveLength(1);
+    expect(JSON.stringify(diagnostic)).not.toContain('private echoed source');
+    expect(get(directory, 'parent-link-attempt-001-provider-attempts.json').attempts).toHaveLength(1);
   });
 });

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION } from "./reconstruction-provider.mjs";
+import { requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, standardProviderFailureCode } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -93,14 +93,19 @@ const userPrompt =
   });
 
 let result;
+const providerAttempts = [];
 for (const model of MODELS) {
   result = await callModel(model, systemPrompt, userPrompt);
-  if (result.ok) break;
+  if (result.ok) { providerAttempts.push({ model, category: 'content_received' }); break; }
+  providerAttempts.push({ model, ...result.error });
+  if (['provider_auth', 'provider_credit', 'provider_policy'].includes(standardProviderFailureCode([result.error]))) break;
   console.log("Moving on from " + model + ".");
 }
 
+fs.writeFileSync(attemptBase + '-provider-attempts.json', JSON.stringify({ attempts: providerAttempts }, null, 2) + '\n', { flag: 'wx' });
+
 if (!result?.ok) {
-  fs.writeFileSync(attemptBase + '-error.json', JSON.stringify(result?.error ?? { category: 'provider_error' }, null, 2) + '\n', { flag: 'wx' });
+  fs.writeFileSync(attemptBase + '-error.json', JSON.stringify({ ...(result?.error ?? { category: 'provider_error' }), attempts: providerAttempts }, null, 2) + '\n', { flag: 'wx' });
   console.error("STOP: all linker models failed.");
   process.exit(7);
 }

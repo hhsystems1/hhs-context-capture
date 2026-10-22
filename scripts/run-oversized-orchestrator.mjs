@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { LINKING_REQUEST_VERSION } from './reconstruction-provider.mjs';
+import { LINKING_REQUEST_VERSION, standardProviderFailureCode } from './reconstruction-provider.mjs';
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -217,10 +217,19 @@ function finalize(directory) {
   }
   validate(parentInput, merged);
   for (let index = linkerAttempts(directory); index < MAX_ATTEMPTS; index += 1) {
+    const existingErrors = new Set(fs.readdirSync(directory).filter(name => /^parent-link-attempt-\d+-error\.json$/.test(name)));
     const result = run(process.execPath, [
       "scripts/run-oversized-linker-nemotron.mjs", "--run-dir", directory
     ]);
     if (result.status === 0 && resumeValidatedOutput(directory, "parent", parentInput)) return;
+    // Classify only diagnostics created by this call. A stale provider error
+    // cannot turn a later spawn/validation/unknown failure into a safe retry.
+    const freshErrors = fs.readdirSync(directory).filter(name => /^parent-link-attempt-\d+-error\.json$/.test(name) && !existingErrors.has(name));
+    stopCategory = "reconstruction_failed";
+    if (freshErrors.length === 1) {
+      const failure = read(path.join(directory, freshErrors[0]));
+      stopCategory = standardProviderFailureCode(failure.attempts ?? [failure]) ?? "reconstruction_failed";
+    }
     if (![8, 9].includes(result.status)) throw new Error(`Linker stopped with exit ${result.status}.`);
   }
   throw new Error("Linker attempt limit reached.");
