@@ -132,7 +132,9 @@ for (const candidate of candidates) {
       source_conversation_id: candidate.source_conversation_id,
       title: candidate.title,
       reason: String(error),
-      ...(receipt.current_source?.mode === 'standard' && /^Error: .+ exited with status 7$/.test(String(error))
+      ...(receipt.current_source?.mode === 'standard' && /^Error: .+ exited with status 14$/.test(String(error))
+        ? { failure_code: 'evidence_validation', failure_detail: 'original_user_text_gap' }
+        : receipt.current_source?.mode === 'standard' && /^Error: .+ exited with status 7$/.test(String(error))
         ? readStandardProviderFailure(path.join(ROOT, PRIORITY_RUNS), { workspace: WORKSPACE,
           source_conversation_id: candidate.source_conversation_id, priority_rank: priorityRank(candidate), operation_id: OPERATION_ID,
           started_at: new Date(sourceStartedAt).toISOString(), finished_at: new Date().toISOString() }) ?? {}
@@ -210,6 +212,9 @@ function processStandard(candidate) {
           `generation failed: ${String(error)}`
         );
 
+        // Retrying cannot recreate absent original user evidence. The batch
+        // records a typed hold, keeps this source unprocessed and advances.
+        if (/^Error: .+ exited with status 14$/.test(String(error))) throw error;
         if (attempt === STANDARD_MAX_ATTEMPTS) throw error;
 
         console.error(

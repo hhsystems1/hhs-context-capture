@@ -139,6 +139,50 @@ function persistResult(replay = false): Result { return result(0, { observations
 const BATCH_ARGS = ["--workspace", WORKSPACE];
 
 describe("existing standard reconstruction runner retry/resume", () => {
+  const browserGap = 'Error: Original user text is not fully represented by content blocks; repair source evidence before discovery.\n    at assertBrowserUserTextCoverage (/fixture/understanding-discovery.ts:784:13)\n    at prepareDiscoveryExchangeFromClient (/fixture/understanding-discovery.ts:235:5)';
+  it('a proven original-user-content export gap stops before any model request with a distinct source-hold exit', async () => {
+    const directory=root();priority(directory);let exports=0;
+    const spawn:Spawn=(_command,args)=>{
+      if(args.includes('scripts/reconstruction-inventory.ts'))return inventory();
+      if(args.includes('export')){exports++;return{status:1,stdout:'',stderr:browserGap};}
+      throw Error('No further command is allowed after the original-evidence gap');
+    };
+    expect((await run(directory,'run-next-priority-nemotron.mjs',['--workspace',WORKSPACE],spawn)).code).toBe(14);
+    expect(exports).toBe(1);expect(fs.existsSync(path.join(directory,BASE+'-input.json'))).toBe(false);
+  });
+  it.each([browserGap.split('\n')[0]!,browserGap+'\nError: provider_error HTTP 503',browserGap+'\nError: Database authorization failed.',browserGap+'\nTypeError: unrelated internal failure','Error: Unknown export failure.'])('unknown or mixed export errors retain the hard generic exit (%s)',async reason=>{
+    const directory=root();priority(directory);
+    const spawn:Spawn=(_command,args)=>args.includes('scripts/reconstruction-inventory.ts')?inventory():{status:1,stdout:'',stderr:reason};
+    expect((await run(directory,'run-next-priority-nemotron.mjs',['--workspace',WORKSPACE],spawn)).code).toBe(4);
+  });
+  it('a typed export hold preserves the failed attempt, avoids automatic repetition, and lets another source finish',async()=>{
+    const directory=root();priority(directory);
+    const p=get(directory,'.runtime/reconstruction/business-priority-index-v1.json');p.conversations.push({...p.conversations[0],source_conversation_id:'healthy-source',unprocessed_queue_rank:2});put(directory,'.runtime/reconstruction/business-priority-index-v1.json',p);
+    const held=JSON.stringify({note:'preserved older failed export'});put(directory,'.runtime/reconstruction/priority-runs/failed-attempts/old/attempt.json',JSON.parse(held));
+    let blockedCalls=0,persisted=0;
+    const spawn:Spawn=(_command,args)=>{
+      if(args.includes('scripts/reconstruction-inventory.ts')){const v=JSON.parse(inventory().stdout);v.conversations.push({...v.conversations[0],source_conversation_id:'healthy-source'});return result(0,v);}
+      if(args.includes('scripts/run-next-priority-nemotron.mjs')){
+        if(argument(args,'conversation')===SOURCE){blockedCalls++;return result(14);}
+        const input=exchange('healthy');input.selection[0]!.source_conversation_id='healthy-source';input.evidence[0]!.source_conversation_id='healthy-source';input.evidence_sha256=sha256(input.evidence);const candidate=output(input);candidate.observations[0]!.source_conversation_id='healthy-source';
+        const base='.runtime/reconstruction/priority-runs/priority-0002-healthy-source';put(directory,base+'-input.json',input);put(directory,base+'-output.json',candidate);put(directory,base+'-openrouter-raw.json',{model:MODEL});return result();
+      }
+      if(args.includes('validate'))return validate(directory,args);
+      if(args.includes('persist')){persisted++;return persistResult();}
+      throw Error('Unexpected command');
+    };
+    expect((await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,spawn)).code).toBe(2);
+    const r=batchReceipt(directory);expect(r.selected).toBe(2);expect(r.completed).toHaveLength(1);expect(r.quarantined[0]).toMatchObject({source_conversation_id:SOURCE,failure_code:'evidence_validation',failure_detail:'original_user_text_gap'});expect(blockedCalls).toBe(1);expect(persisted).toBe(1);
+    expect(get(directory,'.runtime/reconstruction/priority-runs/failed-attempts/old/attempt.json')).toEqual(JSON.parse(held));
+    const attempts=fs.readdirSync(path.join(directory,'.runtime/reconstruction/priority-runs/failed-attempts/priority-0001-synthetic-source'));expect(attempts).toHaveLength(1);
+    // On normal continuation the held source is not selected again.
+    expect((await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,spawn)).code).toBe(0);expect(blockedCalls).toBe(1);
+  });
+  it('a bare export exit 4 is not promoted into a source-evidence hold',async()=>{
+    const directory=root();priority(directory);let calls=0;
+    const spawn:Spawn=(_command,args)=>{if(args.includes('scripts/reconstruction-inventory.ts'))return inventory();if(args.includes('scripts/run-next-priority-nemotron.mjs')){calls++;return result(4);}throw Error('No other command');};
+    expect((await run(directory,'run-reconstruction-batch.mjs',BATCH_ARGS,spawn)).code).toBe(2);expect(calls).toBe(2);expect(batchReceipt(directory).quarantined[0].failure_code).toBeUndefined();
+  });
   it("routes metadata-heavy low-estimate sources through the existing resumable chunk path", async () => {
     const directory = root(); priority(directory);
     const runDir = '.runtime/reconstruction/oversized-runs/priority-0001-synthetic-source';

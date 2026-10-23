@@ -160,6 +160,14 @@ const exported = spawnSync(
 if (exported.status !== 0) {
   console.error("STOP: trusted HHS export failed.");
   console.error(exported.stderr);
+  // This exact trusted pre-generation guard is a source hold, not an outage.
+  // Bare exit 4, other validation errors and mixed/provider failures stay unknown.
+  const reason = String(exported.stderr ?? "");
+  const errorHeaders = reason.match(/^(?:[A-Za-z][A-Za-z0-9_.]*Error|Error): .+$/gm) ?? [];
+  if (/(?:^|\n)Error: Original user text is not fully represented by content blocks; repair source evidence before discovery\.(?:\n|$)/.test(reason)
+    && errorHeaders.length === 1
+    && /at assertBrowserUserTextCoverage \(/.test(reason) && /at prepareDiscoveryExchangeFromClient \(/.test(reason)
+    && !/provider_error|request_timeout|HTTP[ :]+[45]\d\d|ECONN\w+|AbortError/i.test(reason)) process.exit(14);
   process.exit(4);
 }
 
