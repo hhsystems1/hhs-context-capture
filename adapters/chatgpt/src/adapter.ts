@@ -4,7 +4,6 @@ import type {
   CanonicalMessage,
   ContentBlock,
   EvidenceRecord,
-  MessageRole,
   PreservedRepresentation,
   VerificationCheck,
 } from "@hhs/canonical-schema";
@@ -17,28 +16,40 @@ import {
   type PlatformAdapter,
 } from "@hhs/capture-engine";
 
-const MESSAGE_SELECTORS = ["[data-message-author-role]", "article[data-testid^='conversation-turn-']"];
+import { inspectChatGptPage } from './structure.js';
+import { preserveOriginalUserText } from './user-text-coverage.js';
+
 const STABLE_PASSES = 3;
 const MIN_SCROLL_PASSES = 200;
 const EMERGENCY_MAX_SCROLL_PASSES = 5_000;
+type TurnWitness = { users: Set<string>; assistants: Set<string>; pairs: Set<string> };
+type LayoutEvidence = { turns: Map<string, TurnWitness>; issues: Set<string>; truncationIndicators: Map<string, Record<string, unknown>>; expansions:VisualExpansionWitness[]; expansionControls:WeakSet<HTMLButtonElement> };
 type ObservedBranchIndicator = { key: string; current?: number; total?: number; message_id?: string; observed_at: string };
 
 export class ChatGptAdapter implements PlatformAdapter {
   readonly platform = "chatgpt";
-  readonly adapterVersion = "0.1.2";
+  readonly adapterVersion = "0.1.6";
 
   async detect(context: AdapterContext) {
-    const supportedHost = /(^|\.)(chatgpt\.com|chat\.openai\.com)$/.test(location.hostname);
-    const hasConversation = findMessageElements(context.document).length > 0;
-    return { detected: supportedHost && hasConversation, platform: this.platform, confidence: supportedHost && hasConversation ? "high" as const : "low" as const, reasons: [supportedHost ? "Supported ChatGPT host." : "Unsupported host.", hasConversation ? "Conversation turns found." : "No conversation turns found."] };
+    const url=new URL(context.sourceUrl);
+    const supportedHost=/^(chatgpt\.com|chat\.openai\.com)$/.test(url.hostname);
+    const conversationPath=/^\/(?:g\/[^/]+\/)?c\/[^/?#]+/.test(url.pathname);
+    let structure=inspectChatGptPage(context.document);
+    if(supportedHost&&conversationPath)for(let pass=0;pass<6&&(structure.loading||structure.messages===0);pass++){
+      context.signal?.throwIfAborted();await new Promise(resolve=>setTimeout(resolve,250));structure=inspectChatGptPage(context.document);
+    }
+    const detected=supportedHost&&conversationPath&&structure.ready;
+    const reason=!supportedHost||!conversationPath?'unsupported_page':structure.loading?'page_loading':structure.issues.length?'page_requires_review':'conversation_not_rendered';
+    return {detected,platform:this.platform,confidence:detected?'high' as const:'low' as const,reasons:[supportedHost?'Supported ChatGPT host.':'Unsupported host.',detected?'Recognized message structure; completeness not established.':reason],structure,...(!detected?{reason}:{})};
   }
 
   async identifyConversation(context: AdapterContext): Promise<ConversationIdentity> {
     const url = new URL(context.sourceUrl);
     const match = url.pathname.match(/\/c\/([^/?#]+)/);
+    if (!match?.[1]) throw new Error("A native ChatGPT conversation identity is required.");
     const title = context.document.title.replace(/\s*[-–|]\s*ChatGPT\s*$/i, "");
     return {
-      conversationId: match?.[1] ?? `local-${await sha256(`${url.origin}${url.pathname}|${title}`)}`,
+      conversationId: match[1],
       ...(match?.[1] ? { platformConversationId: match[1] } : {}),
       title,
       sourceUrl: `${url.origin}${url.pathname}`,
@@ -47,6 +58,7 @@ export class ChatGptAdapter implements PlatformAdapter {
 
   async capture(context: AdapterContext): Promise<ExtractedConversation> {
     const accumulator = new MessageAccumulator();
+    const layoutEvidence: LayoutEvidence = { turns: new Map(), issues: new Set(), truncationIndicators: new Map(), expansions:[], expansionControls:new WeakSet() };
     const evidence: EvidenceRecord[] = [];
     const warnings: string[] = [];
     const observedBranchIndicators = new Map<string, ObservedBranchIndicator>();
@@ -56,36 +68,28 @@ export class ChatGptAdapter implements PlatformAdapter {
 
     const scrollContainer = findScrollContainer(context.document);
     const scrollContainerObservation = describeElement(scrollContainer);
-    const initiallyExpanded = await expandCollapsedMessages(context.document);
+    const initiallyExpanded = await expandCollapsedMessages(context.document,layoutEvidence,evidence);
     if (initiallyExpanded > 0) {
       await addScreenshot(context, evidence, "uncertainty", { reason: "collapsed_content_expanded", count: initiallyExpanded });
       evidence.push(await captureDomEvidence(context.document, "uncertainty"));
     }
-    const initial = await observeViewport(context.document);
+    const initial = await observeViewport(context.document, layoutEvidence);
     accumulator.observe(initial.messages);
+    warnings.push(...initial.warnings);
     collectBranchIndicators(context.document, observedBranchIndicators);
     const initialCount = accumulator.size;
 
-    context.onProgress("Loading earlier accessible messages");
-    const upward = await scrollUntilStable(scrollContainer, -1, accumulator, context, observedBranchIndicators);
-    if (upward.boundary) {
-      await addScreenshot(context, evidence, "earliest_boundary");
-      evidence.push(await captureDomEvidence(context.document, "earliest_boundary"));
-    }
-
-    context.onProgress("Loading later accessible messages");
-    const downward = await scrollUntilStable(scrollContainer, 1, accumulator, context, observedBranchIndicators);
-    if (downward.boundary) {
-      await addScreenshot(context, evidence, "latest_boundary");
-      evidence.push(await captureDomEvidence(context.document, "latest_boundary"));
-    }
+    const coverage = await establishSourceCoverage(scrollContainer, accumulator, context, observedBranchIndicators, layoutEvidence, evidence);
+    const {upward, downward} = coverage;
+    const activePathNativeIds = accumulator.finalize().messages.flatMap(message => message.platform_message_id ? [message.platform_message_id] : []);
 
     context.onProgress("Inspecting existing response alternatives");
-    const traversedBranches = await traverseExistingBranches(context, accumulator, evidence);
+    const traversedBranches = await traverseExistingBranches(context, accumulator, evidence, layoutEvidence);
     collectBranchIndicators(context.document, observedBranchIndicators);
     const branches = reconcileObservedBranches(traversedBranches, observedBranchIndicators);
     const accumulated = accumulator.finalize();
-    warnings.push(...upward.warnings, ...downward.warnings, ...accumulated.warnings);
+    warnings.push(...coverage.warnings, ...accumulated.warnings);
+    await verifyExpansionPreservation(layoutEvidence,accumulated.messages);
     const attachments = extractAttachments(accumulated.messages);
     const citations = extractCitations(accumulated.messages);
     const artifacts = extractArtifacts(accumulated.messages);
@@ -93,18 +97,25 @@ export class ChatGptAdapter implements PlatformAdapter {
       await addScreenshot(context, evidence, "artifact", { artifact_count: artifacts.length });
       evidence.push(await captureDomEvidence(context.document, "artifact"));
     }
-    const truncationIndicators = findTruncationIndicators(context.document);
+    for (const indicator of findTruncationIndicators(context.document)) layoutEvidence.truncationIndicators.set(JSON.stringify(indicator), indicator);
+    const truncationIndicators = [...layoutEvidence.truncationIndicators.values()];
     if (truncationIndicators.length > 0) {
       await addScreenshot(context, evidence, "truncation");
       evidence.push(await captureDomEvidence(context.document, "truncation"));
     }
 
+    warnings.push(...[...layoutEvidence.issues].map(issue => "ChatGPT layout requires review: " + issue + "."));
+    const turnCoverage = summarizeTurnCoverage(layoutEvidence);
+    if (turnCoverage.unresolved > 0) warnings.push('ChatGPT turn coverage requires review: ' + turnCoverage.unresolved + ' observed turn(s) lack a single, ordered native pair across viewports.');
     const checks: VerificationCheck[] = [
+      check("layout.authorship_identity", layoutEvidence.issues.size === 0, "Every observed message layout had unambiguous authorship and source identity."),
+      check("layout.turn_coverage", turnCoverage.unresolved === 0, "Each observed modern turn was resolved to one source-observed ordered native pair; isolated or conflicting halves require review."),
+      check("source.coverage_coherent", coverage.coherent, "Two consecutive accessible-source sweeps retained the same message set and revalidated both native boundary observations after evidence reads; unknown source history remains unestablished."),
       check("boundary.earliest", upward.boundary, "Earliest accessible boundary reached and stabilized."),
       check("boundary.latest", downward.boundary, "Latest accessible boundary reached and stabilized."),
       check("scroll.stabilized", upward.stable && downward.stable, "Scrolling stabilized in both directions."),
       check("count.stabilized", upward.stable && downward.stable, `Accumulated message count stabilized at ${accumulated.messages.length} (initially ${initialCount}).`),
-      check("content.not_truncated", truncationIndicators.length === 0, truncationIndicators.length === 0 ? "No visible truncation, incomplete-generation, or expand-content indicator remained." : `${truncationIndicators.length} truncation or incomplete-generation indicators remained after expansion attempts.`),
+      check("content.not_truncated", truncationIndicators.length === 0, truncationIndicators.length === 0 ? "No unresolved truncation, incomplete-generation, or expand-content indicator was observed after expansion attempts." : `${truncationIndicators.length} unresolved truncation, incomplete-generation, or expansion indicators were observed across viewports.`),
     ];
 
     return {
@@ -128,12 +139,20 @@ export class ChatGptAdapter implements PlatformAdapter {
         initial_message_count: initialCount,
         accumulated_message_count: accumulated.messages.length,
         virtualized_dom_accumulation: true,
+        turn_coverage: turnCoverage,
+        source_coverage_baseline: {
+          scope: 'accessible_rendered_conversation', authority: 'observations_only', source_history_completeness: 'not_established',
+          initial_native_message_ids: initial.messages.flatMap(message => message.platform_message_id ? [message.platform_message_id] : []),
+          active_path_native_message_ids: activePathNativeIds, coherent: coverage.coherent,
+          rounds: coverage.rounds, branch_coverage: 'verified_separately',
+        },
         scroll_container: scrollContainerObservation,
         upward_scroll_metrics: upward.metrics,
         downward_scroll_metrics: downward.metrics,
         collapsed_messages_expanded: initiallyExpanded + upward.expanded + downward.expanded,
         observed_branch_indicators: [...observedBranchIndicators.values()],
         truncation_indicators: truncationIndicators,
+        visual_expansion_verification:layoutEvidence.expansions,
         source_markdown_available: false,
         source_markdown_note: "ChatGPT rendered DOM does not expose original Markdown source; exact accessible rendered wording and structure were preserved.",
       },
@@ -141,7 +160,64 @@ export class ChatGptAdapter implements PlatformAdapter {
   }
 }
 
-async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>) {
+type BoundaryObservation = {top:number;height:number;client:number;messages:Array<{key:string;role:string;text_sha256?:string|undefined}>};
+type BoundaryWitness = {expanded:number;verified:boolean;before:BoundaryObservation;after:BoundaryObservation};
+type CoverageRound = {round:number;count:number;earliest:BoundaryWitness;latest:BoundaryWitness};
+
+function boundaryObservation(container:HTMLElement,messages:MessageObservation[]):BoundaryObservation {
+  return {top:container.scrollTop,height:container.scrollHeight,client:container.clientHeight,
+    messages:messages.map(message=>({key:message.observation_key,role:message.role,text_sha256:message.representations.find(rep=>rep.kind==='canonical_text')?.sha256}))};
+}
+function atScrollBoundary(container:HTMLElement,direction:-1|1):boolean {
+  const tolerance=Math.max(4,Math.min(64,container.clientHeight*0.02));
+  return direction<0?container.scrollTop<=tolerance:container.scrollHeight-container.clientHeight-container.scrollTop<=tolerance;
+}
+async function revalidateBoundary(container:HTMLElement,direction:-1|1,claimed:boolean,accumulator:MessageAccumulator,context:AdapterContext,branches:Map<string,ObservedBranchIndicator>,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<BoundaryWitness> {
+  const expandedBefore=await expandCollapsedMessages(context.document,layout,evidence);
+  const observed=await observeViewport(context.document,layout);accumulator.observe(observed.messages);collectBranchIndicators(context.document,branches);
+  const before=boundaryObservation(container,observed.messages);
+  if(!claimed)return {expanded:expandedBefore,verified:false,before,after:before};
+  const portion=direction<0?'earliest_boundary':'latest_boundary';
+  await addScreenshot(context,evidence,portion);
+  const dom=await captureDomEvidence(context.document,portion);
+  await waitForQuietDom(context.document,350,2000);
+  const expandedAfter=await expandCollapsedMessages(context.document,layout,evidence);
+  const settled=await observeViewport(context.document,layout);accumulator.observe(settled.messages);collectBranchIndicators(context.document,branches);
+  const after=boundaryObservation(container,settled.messages);
+  const verified=atScrollBoundary(container,direction)&&JSON.stringify(before)===JSON.stringify(after);
+  dom.metadata={...dom.metadata,boundary_revalidated:verified};evidence.push(dom);
+  return {expanded:expandedBefore+expandedAfter,verified,before,after};
+}
+async function establishSourceCoverage(container:HTMLElement,accumulator:MessageAccumulator,context:AdapterContext,branches:Map<string,ObservedBranchIndicator>,layout:LayoutEvidence,evidence:EvidenceRecord[]) {
+  const rounds:CoverageRound[]=[],warnings:string[]=[];
+  let coherent=false;
+  let upward!:Awaited<ReturnType<typeof scrollUntilStable>>,downward!:Awaited<ReturnType<typeof scrollUntilStable>>;
+  const upwardMetrics:Array<Record<string,unknown>>=[],downwardMetrics:Array<Record<string,unknown>>=[];
+  let upPasses=0,downPasses=0,upExpanded=0,downExpanded=0;
+  // A bounded confirmation of the existing scan, not a second message accumulator.
+  // A quiet pixel boundary is provisional until evidence reads and a second sweep agree.
+  for(let round=1;round<=3;round++) {
+    context.onProgress('Verifying accessible source coverage, sweep '+round+' of 3');
+    upward=await scrollUntilStable(container,-1,accumulator,context,branches,layout,evidence);
+    const earliest=await revalidateBoundary(container,-1,upward.boundary,accumulator,context,branches,layout,evidence);
+    upward.boundary=upward.boundary&&earliest.verified;upward.stable=upward.stable&&earliest.verified;
+    downward=await scrollUntilStable(container,1,accumulator,context,branches,layout,evidence);
+    const latest=await revalidateBoundary(container,1,downward.boundary,accumulator,context,branches,layout,evidence);
+    downward.boundary=downward.boundary&&latest.verified;downward.stable=downward.stable&&latest.verified;
+    upPasses+=upward.passes;downPasses+=downward.passes;upExpanded+=upward.expanded+earliest.expanded;downExpanded+=downward.expanded+latest.expanded;
+    upwardMetrics.push(...upward.metrics.map(metric=>({...metric,coverage_round:round})));downwardMetrics.push(...downward.metrics.map(metric=>({...metric,coverage_round:round})));
+    warnings.push(...upward.warnings,...downward.warnings);
+    const current:CoverageRound={round,count:accumulator.size,earliest,latest},previous=rounds.at(-1);rounds.push(current);
+    coherent=Boolean(previous&&previous.earliest.verified&&previous.latest.verified&&earliest.verified&&latest.verified
+      &&previous.count===current.count&&JSON.stringify(previous.earliest.after)===JSON.stringify(earliest.after)
+      &&JSON.stringify(previous.latest.after)===JSON.stringify(latest.after));
+    if(coherent)break;
+  }
+  if(!coherent)warnings.push('Accessible-source coverage remained provisional after three bounded sweeps; no complete history claim is supported.');
+  return {coherent,rounds,warnings:unique(warnings),upward:{...upward,passes:upPasses,expanded:upExpanded,metrics:upwardMetrics},downward:{...downward,passes:downPasses,expanded:downExpanded,metrics:downwardMetrics}};
+}
+
+async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accumulator: MessageAccumulator, context: AdapterContext, observedBranches: Map<string, ObservedBranchIndicator>, layoutEvidence: LayoutEvidence,evidence:EvidenceRecord[]) {
   let stablePasses = 0;
   let previousCount = accumulator.size;
   let previousScrollHeight = container.scrollHeight;
@@ -155,10 +231,10 @@ async function scrollUntilStable(container: HTMLElement, direction: -1 | 1, accu
     const before = container.scrollTop;
     container.scrollBy({ top: direction * scrollStep, behavior: "auto" });
     await waitForQuietDom(context.document, 350, 2_000);
-    const expandedThisPass = await expandCollapsedMessages(context.document);
+    const expandedThisPass = await expandCollapsedMessages(context.document,layoutEvidence,evidence);
     expanded += expandedThisPass;
     if (expandedThisPass > 0) await waitForQuietDom(context.document, 250, 1_500);
-    const observed = await observeViewport(context.document);
+    const observed = await observeViewport(context.document, layoutEvidence);
     accumulator.observe(observed.messages);
     collectBranchIndicators(context.document, observedBranches);
     warnings.push(...observed.warnings);
@@ -186,14 +262,29 @@ function scrollPassBudget(scrollHeight: number, step: number): number {
   return Math.min(EMERGENCY_MAX_SCROLL_PASSES, Math.max(MIN_SCROLL_PASSES, distanceAware));
 }
 
-async function observeViewport(document: Document): Promise<{ messages: MessageObservation[]; warnings: string[] }> {
+export async function observeViewport(document: Document, layoutEvidence?: LayoutEvidence): Promise<{ messages: MessageObservation[]; warnings: string[] }> {
   const warnings: string[] = [];
-  const elements = findMessageElements(document);
+  const structure = inspectChatGptPage(document, true);
+  const elements = structure.nodes;
+  const materialIssues = structure.summary.issues.filter(issue => issue !== 'incomplete_turn');
+  if (structure.summary.loading) materialIssues.push('generation_or_page_loading');
+  warnings.push(...materialIssues.map(issue => 'ChatGPT layout requires review: ' + issue + '.'));
+  if (structure.summary.issues.includes('incomplete_turn')) warnings.push('ChatGPT partial turn observed; accumulated turn coverage must resolve it.');
+  if (layoutEvidence) {
+    for (const indicator of findTruncationIndicators(document, structure.nodes)) layoutEvidence.truncationIndicators.set(JSON.stringify(indicator), indicator);
+    for (const issue of materialIssues) layoutEvidence.issues.add(issue);
+    for (const turn of structure.turns) {
+      const witness = layoutEvidence.turns.get(turn.key) ?? {users:new Set<string>(),assistants:new Set<string>(),pairs:new Set<string>()};
+      turn.users.forEach(id => witness.users.add(id));
+      turn.assistants.forEach(id => witness.assistants.add(id));
+      if (turn.pair) witness.pairs.add(JSON.stringify(turn.pair));
+      layoutEvidence.turns.set(turn.key, witness);
+    }
+  }
   const seenFallbacks = new Set<string>();
   const messages: MessageObservation[] = [];
-  for (const [index, element] of elements.entries()) {
-    const role = determineRole(element);
-    const platformId = element.getAttribute("data-message-id") ?? element.querySelector("[data-message-id]")?.getAttribute("data-message-id") ?? undefined;
+  for (const [index, messageNode] of elements.entries()) {
+    const { element, role, platformId } = messageNode;
     const locator = platformId ? `chatgpt:message:${platformId}` : `chatgpt:viewport:${index}`;
     const representations = await representationsFor(element, locator);
     const semanticStructureSha256 = await semanticStructureHash(representations.find((item) => item.kind === "sanitized_html")?.value ?? "");
@@ -208,32 +299,33 @@ async function observeViewport(document: Document): Promise<{ messages: MessageO
       ...(platformId ? { platform_message_id: platformId } : {}),
       role,
       representations,
-      content_blocks: await extractContentBlocks(element, locator),
+      content_blocks: await preserveOriginalUserText(await extractContentBlocks(element, locator, messageNode.layout === "business_turn"), representations, locator, role),
       evidence_locators: [locator],
       observed_at: new Date().toISOString(),
-      platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256 },
+      platform_metadata: { dom_index_at_observation: index, stable_platform_id_available: Boolean(platformId), semantic_structure_sha256: semanticStructureSha256, layout: messageNode.layout, ...(messageNode.turnKey ? {turn_key:messageNode.turnKey} : {}), role_source: messageNode.roleSource, identity_source: messageNode.identitySource },
     });
   }
   return { messages, warnings };
 }
 
-function findMessageElements(document: Document): HTMLElement[] {
-  for (const selector of MESSAGE_SELECTORS) {
-    const found = [...document.querySelectorAll<HTMLElement>(selector)];
-    if (found.length > 0) {
-      return found.filter((element) => !found.some((candidate) => candidate !== element && candidate.contains(element)));
-    }
+function summarizeTurnCoverage(evidence: LayoutEvidence) {
+  // Verification witnesses only; MessageAccumulator remains the sole message/order accumulator.
+  const owners = new Map<string, Set<string>>();
+  for (const [key, turn] of evidence.turns) for (const id of [...turn.users, ...turn.assistants]) {
+    const turns = owners.get(id) ?? new Set<string>(); turns.add(key); owners.set(id, turns);
   }
-  return [];
+  let resolved = 0;
+  for (const turn of evidence.turns.values()) {
+    const user = [...turn.users][0], assistant = [...turn.assistants][0];
+    if (turn.users.size === 1 && turn.assistants.size === 1 && user !== assistant
+      && turn.pairs.size === 1 && turn.pairs.has(JSON.stringify([user, assistant]))
+      && owners.get(user!)?.size === 1 && owners.get(assistant!)?.size === 1) resolved += 1;
+  }
+  return {observed:evidence.turns.size,resolved,unresolved:evidence.turns.size-resolved};
 }
 
-function determineRole(element: HTMLElement): MessageRole {
-  const role = element.getAttribute("data-message-author-role") ?? element.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role");
-  if (role === "user" || role === "assistant" || role === "tool") return role;
-  const testId = element.getAttribute("data-testid") ?? "";
-  if (/user/i.test(testId)) return "user";
-  if (/assistant/i.test(testId)) return "assistant";
-  return "unknown";
+function findMessageElements(document: Document): HTMLElement[] {
+  return inspectChatGptPage(document, true).nodes.map(node => node.element);
 }
 
 async function representationsFor(element: HTMLElement, locator: string): Promise<PreservedRepresentation[]> {
@@ -253,8 +345,8 @@ async function representation(kind: PreservedRepresentation["kind"], value: stri
   return { kind, value, sha256: await sha256(value), extraction_method: extractionMethod, evidence_locator: locator };
 }
 
-async function extractContentBlocks(message: HTMLElement, locator: string): Promise<ContentBlock[]> {
-  const root = message.querySelector<HTMLElement>(".markdown, [class*='markdown'], [data-message-content]") ?? message;
+async function extractContentBlocks(message: HTMLElement, locator: string, fullMessage = false): Promise<ContentBlock[]> {
+  const root = fullMessage ? message : message.querySelector<HTMLElement>(".markdown, [class*='markdown'], [data-message-content]") ?? message;
   const candidates = [...root.querySelectorAll<HTMLElement>("p,h1,h2,h3,h4,h5,h6,pre,ul,ol,blockquote,table,a,img,figure")]
     .filter((element) => !element.parentElement?.closest("p,h1,h2,h3,h4,h5,h6,pre,ul,ol,blockquote,table,a,figure") || element.parentElement?.closest("p,h1,h2,h3,h4,h5,h6,pre,ul,ol,blockquote,table,a,figure") === element);
   const blocks: ContentBlock[] = [];
@@ -374,7 +466,7 @@ async function addScreenshot(context: AdapterContext, evidence: EvidenceRecord[]
   if (screenshot) evidence.push(screenshot);
 }
 
-async function traverseExistingBranches(context: AdapterContext, accumulator: MessageAccumulator, evidence: EvidenceRecord[]): Promise<BranchRecord[]> {
+async function traverseExistingBranches(context: AdapterContext, accumulator: MessageAccumulator, evidence: EvidenceRecord[], layoutEvidence: LayoutEvidence): Promise<BranchRecord[]> {
   const groups = branchGroups(context.document);
   const branches: BranchRecord[] = [];
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
@@ -388,14 +480,14 @@ async function traverseExistingBranches(context: AdapterContext, accumulator: Me
       continue;
     }
     const observed = new Set<string>();
-    const initialViewport = await observeViewport(context.document);
+    const initialViewport = await observeViewport(context.document, layoutEvidence);
     const initialAlternative = annotateBranchObservation(context.document, initial, branch, initialViewport.messages);
     accumulator.observe(initialViewport.messages);
     observed.add(initialAlternative);
     let safe = true;
-    for (let index = initial.current; index > 1; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed)) && safe;
-    for (let index = 1; index < initial.total; index += 1) safe = (await clickBranchButton(context.document, groupIndex, "next", branch, accumulator, observed)) && safe;
-    for (let index = initial.total; index > initial.current; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed)) && safe;
+    for (let index = initial.current; index > 1; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed, layoutEvidence)) && safe;
+    for (let index = 1; index < initial.total; index += 1) safe = (await clickBranchButton(context.document, groupIndex, "next", branch, accumulator, observed, layoutEvidence)) && safe;
+    for (let index = initial.total; index > initial.current; index -= 1) safe = (await clickBranchButton(context.document, groupIndex, "previous", branch, accumulator, observed, layoutEvidence)) && safe;
     const restored = branchGroups(context.document)[groupIndex]?.current === initial.current;
     branch.restored_initial_state = restored;
     branch.alternative_message_ids = [...observed];
@@ -476,7 +568,7 @@ function reconcileObservedBranches(traversed: BranchRecord[], observed: Map<stri
   return results;
 }
 
-async function clickBranchButton(document: Document, groupIndex: number, direction: "previous" | "next", branch: BranchRecord, accumulator: MessageAccumulator, observed: Set<string>): Promise<boolean> {
+async function clickBranchButton(document: Document, groupIndex: number, direction: "previous" | "next", branch: BranchRecord, accumulator: MessageAccumulator, observed: Set<string>, layoutEvidence: LayoutEvidence): Promise<boolean> {
   const button = branchGroups(document)[groupIndex]?.[direction];
   if (!button || button.disabled) {
     branch.navigation_log.push({ at: new Date().toISOString(), action: direction, result: "Control unavailable or disabled." });
@@ -484,7 +576,7 @@ async function clickBranchButton(document: Document, groupIndex: number, directi
   }
   button.click();
   await waitForQuietDom(document, 400, 3_000);
-  const viewport = await observeViewport(document);
+  const viewport = await observeViewport(document, layoutEvidence);
   const refreshed = branchGroups(document)[groupIndex];
   if (refreshed) observed.add(annotateBranchObservation(document, refreshed, branch, viewport.messages));
   accumulator.observe(viewport.messages);
@@ -605,28 +697,116 @@ function check(check_id: string, pass: boolean, message: string): VerificationCh
   return { check_id, status: pass ? "pass" : "fail", severity: "material", message, evidence: [] };
 }
 
-async function expandCollapsedMessages(document: Document): Promise<number> {
-  let expanded = 0;
-  const roots = [...document.querySelectorAll<HTMLElement>("[data-testid='collapsible-user-message-root'][data-can-expand]")];
-  for (const root of roots) {
-    const button = [...root.querySelectorAll<HTMLButtonElement>("button, [role='button']")].find((candidate) => /show more|expand/i.test(`${candidate.innerText} ${candidate.getAttribute("aria-label") ?? ""}`));
-    if (!button) continue;
-    button.click();
-    expanded += 1;
+type VisualClipSnapshot = {text_sha256:string;structure_sha256:string;text_chars:number;clipped:boolean;unavailable:boolean};
+type VisualExpansionWitness = {message_id:string;mode:'expanded'|'already_expanded';transition_verified:boolean;verified:boolean;preserved:boolean;before:VisualClipSnapshot;after?:VisualClipSnapshot;reason?:string;invalidated?:boolean;invalidated_reason?:string;evidence_ids:string[]};
+
+function sourceIsClipped(body:HTMLElement):boolean {
+  return [body,...body.querySelectorAll<HTMLElement>('*')].some(element=>{
+    const style=getComputedStyle(element);
+    return (/hidden|clip/.test(style.overflowY)||style.webkitLineClamp!=='none')&&element.scrollHeight>element.clientHeight+2;
+  });
+}
+
+async function visualClipSnapshot(body:HTMLElement):Promise<VisualClipSnapshot> {
+  const text=body.textContent??'';
+  const unavailable=!text.trim()||Boolean(body.closest('[aria-busy="true"]'))
+    ||(body.matches('[aria-busy="true"],[role="progressbar"],[data-state="loading"],.animate-spin,.motion-safe\\:animate-spin,img,video,audio,iframe,button,[role="button"]')||Boolean(body.querySelector('[aria-busy="true"],[role="progressbar"],[data-state="loading"],.animate-spin,.motion-safe\\:animate-spin,img,video,audio,iframe,button,[role="button"]')))
+    ||[body,...body.querySelectorAll<HTMLElement>('*')].some(element=>{
+      const style=getComputedStyle(element);
+      return Boolean(element.textContent?.trim())&&(element.hidden||element.getAttribute('aria-hidden')==='true'||style.display==='none'||style.visibility==='hidden');
+    });
+  return {text_sha256:await sha256(text),structure_sha256:await semanticStructureHash(sanitizedHtml(body)),text_chars:text.length,clipped:sourceIsClipped(body),unavailable};
+}
+
+async function preserveExpansionEvidence(element:HTMLElement,messageId:string,phase:'before'|'after'|'unresolved',evidence:EvidenceRecord[]):Promise<string> {
+  const html=sanitizedHtml(element),id=crypto.randomUUID();
+  evidence.push({evidence_id:id,kind:'sanitized_dom',portion:'truncation',captured_at:new Date().toISOString(),media_type:'text/html',sha256:await sha256(html),inline_data:html,metadata:{reason:'visual_expansion_'+phase,message_id:messageId,scope:'original_native_user_message'}});
+  return id;
+}
+
+
+async function retainUnresolvedExpansion(element:HTMLElement,messageId:string,reason:string,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<void> {
+  for(const proof of layout.expansions.filter(proof=>proof.message_id===messageId)){proof.invalidated=true;proof.invalidated_reason=reason;}
+  const indicator={kind:'unverified_expansion_content',message_id:messageId,reason},key=JSON.stringify(indicator);
+  if(!layout.truncationIndicators.has(key))layout.truncationIndicators.set(key,{...indicator,evidence_id:await preserveExpansionEvidence(element,messageId,'unresolved',evidence)});
+}
+
+async function expandCollapsedMessages(document:Document,layout:LayoutEvidence,evidence:EvidenceRecord[]):Promise<number> {
+  let expanded=0;
+  // Preserve the established legacy path. Modern support is bound to a strict
+  // native user message, a separate loaded body and an explicit toggle state.
+  for(const root of document.querySelectorAll<HTMLElement>("[data-testid='collapsible-user-message-root'][data-can-expand]")) {
+    const button=[...root.querySelectorAll<HTMLButtonElement>("button, [role='button']")].find(candidate=>/show more|expand/i.test(`${candidate.innerText} ${candidate.getAttribute('aria-label')??''}`));
+    if(button){button.click();expanded++;}
   }
-  if (expanded > 0) await waitForQuietDom(document, 250, 1_500);
+  if(expanded>0)await waitForQuietDom(document,250,1500);
+  for(const node of inspectChatGptPage(document,true).nodes) {
+    if(node.role!=='user'||node.layout!=='business_turn'||!node.platformId||!node.element.matches('[data-user-message-bubble="true"]'))continue;
+    const controls=[...node.element.querySelectorAll<HTMLButtonElement>('button')].filter(button=>/^(Show more|Show less)$/.test(button.innerText.trim()));
+    const button=controls[0];
+    if(!controls.length)continue;
+    if(controls.length!==1||!button||node.platformId!==node.turnKey){
+      // Unknown Show more already has the established sticky material diagnostic.
+      // Retain an extra witness only for otherwise-uncovered Show less or lost trust.
+      if(controls.some(control=>control.innerText.trim()==='Show less')||layout.expansions.some(proof=>proof.message_id===node.platformId))await retainUnresolvedExpansion(node.element,node.platformId,'ambiguous_modern_control_or_binding',layout,evidence);
+      continue;
+    }
+    const bodies=node.element.querySelectorAll<HTMLElement>('[data-search-result-target]'),body=bodies[0];
+    const contentWrapper=button.previousElementSibling;
+    const state=button.getAttribute('aria-expanded'),collapsed=button.innerText.trim()==='Show more'&&state==='false';
+    const open=button.innerText.trim()==='Show less'&&state==='true';
+    if(bodies.length!==1||!body||!contentWrapper||!(contentWrapper===body||contentWrapper.contains(body))||body.contains(button)||button.hasAttribute('aria-controls')||(!collapsed&&!open)){await retainUnresolvedExpansion(node.element,node.platformId,'unproved_modern_expansion_contract',layout,evidence);continue;}
+    const before=await visualClipSnapshot(body);
+    if(layout.expansionControls.has(button)){
+      const prior=[...layout.expansions].reverse().find(proof=>proof.message_id===node.platformId&&proof.transition_verified&&!proof.invalidated);
+      if(!open||before.clipped||before.unavailable||!prior?.after||before.text_sha256!==prior.after.text_sha256||before.structure_sha256!==prior.after.structure_sha256)await retainUnresolvedExpansion(node.element,node.platformId,'expanded_state_regressed_or_changed',layout,evidence);
+      continue;
+    }
+    if(layout.expansions.some(proof=>proof.message_id===node.platformId&&(!proof.transition_verified||proof.invalidated)))continue;
+    layout.expansionControls.add(button);
+    const proof:VisualExpansionWitness={message_id:node.platformId,mode:collapsed?'expanded':'already_expanded',before,transition_verified:false,verified:false,preserved:false,evidence_ids:[await preserveExpansionEvidence(node.element,node.platformId,'before',evidence)]};
+    layout.expansions.push(proof);
+    if(before.unavailable||(collapsed&&!before.clipped)||(open&&before.clipped)) {proof.reason='source_body_unavailable_or_state_unproved';continue;}
+    if(collapsed){button.click();expanded++;}
+    await waitForQuietDom(document,350,2000);
+    const settled=await visualClipSnapshot(body);
+    await waitForQuietDom(document,350,2000);
+    const after=await visualClipSnapshot(body);proof.after=after;
+    const sameNativeNode=inspectChatGptPage(document,true).nodes.some(current=>current.role==='user'&&current.platformId===node.platformId&&current.element===node.element);
+    const sameContent=[settled,after].every(sample=>sample.text_sha256===before.text_sha256&&sample.structure_sha256===before.structure_sha256);
+    const expandedState=body.isConnected&&button.isConnected&&sameNativeNode&&button.getAttribute('aria-expanded')==='true'&&button.innerText.trim()==='Show less';
+    proof.transition_verified=expandedState&&sameContent&&![settled,after].some(sample=>sample.clipped||sample.unavailable);
+    if(!proof.transition_verified)proof.reason=!sameContent?'source_content_changed_during_expansion':'expansion_or_loaded_state_unresolved';
+    proof.evidence_ids.push(await preserveExpansionEvidence(node.element,node.platformId,'after',evidence));
+  }
   return expanded;
 }
 
-function findTruncationIndicators(document: Document): Array<Record<string, unknown>> {
-  const messageRoots = findMessageElements(document);
+async function verifyExpansionPreservation(layout:LayoutEvidence,messages:CanonicalMessage[]):Promise<void> {
+  for(const proof of layout.expansions) {
+    if(proof.transition_verified&&proof.after) {
+      const message=messages.find(item=>item.platform_message_id===proof.message_id&&item.role==='user');
+      for(const representation of message?.representations.filter(item=>item.kind==='sanitized_html')??[]) {
+        const parsed=new DOMParser().parseFromString(representation.value,'text/html'),bodies=parsed.querySelectorAll<HTMLElement>('[data-search-result-target]'),body=bodies[0];
+        if(bodies.length===1&&body&&await sha256(body.textContent??'')===proof.after.text_sha256&&await semanticStructureHash(sanitizedHtml(body))===proof.after.structure_sha256){proof.preserved=true;break;}
+      }
+    }
+    proof.verified=proof.transition_verified&&proof.preserved&&!proof.invalidated;
+    if(!proof.verified) {
+      const indicator={kind:'unverified_expansion_content',message_id:proof.message_id,reason:proof.invalidated_reason??proof.reason??'verified_source_not_preserved'};
+      if(!layout.truncationIndicators.has(JSON.stringify(indicator)))layout.truncationIndicators.set(JSON.stringify(indicator),indicator);
+    }
+  }
+}
+
+
+function findTruncationIndicators(document: Document, messageNodes = inspectChatGptPage(document, true).nodes): Array<Record<string, unknown>> {
   const results: Array<Record<string, unknown>> = [];
-  for (const root of messageRoots) {
-    const messageId = root.getAttribute("data-message-id") ?? root.querySelector("[data-message-id]")?.getAttribute("data-message-id") ?? undefined;
+  for (const {element:root,platformId:messageId} of messageNodes) {
     for (const element of root.querySelectorAll<HTMLElement>("button, [role='button']")) {
       const label = `${element.innerText} ${element.getAttribute("aria-label") ?? ""}`.trim();
       const insideCollapsibleUserMessage = Boolean(element.closest("[data-testid='collapsible-user-message-root'][data-can-expand]"));
-      const kind = /continue generating|resume generating/i.test(label) ? "incomplete_generation" : insideCollapsibleUserMessage && /show more|expand/i.test(label) ? "collapsed_user_message" : undefined;
+      const kind = /continue generating|resume generating/i.test(label) ? "incomplete_generation" : insideCollapsibleUserMessage && /show more|expand/i.test(label) ? "collapsed_user_message" : /^(show more|expand)(?:\s|$)/i.test(label) ? "unverified_expansion_control" : undefined;
       if (kind) results.push({ kind, ...(messageId ? { message_id: messageId } : {}), label, aria_label: element.getAttribute("aria-label"), data_testid: element.getAttribute("data-testid") });
     }
   }

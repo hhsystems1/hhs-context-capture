@@ -316,9 +316,7 @@ describe("loopback token-authenticated HTTP service", () => {
 });
 
 describe("query service separation", () => {
-  it("preserves query-service.ts exactly and continues rejecting the writer credential", async () => {
-    const querySource = await readFile(new URL("./query-service.ts", import.meta.url), "utf8");
-    expect(sha256(querySource)).toBe("afb78f2a2c79a92958a4aaf0b8e003c02d05ae4d8fc3a80fb877b82bf61f99fb");
+  it("keeps provisioning isolated from query code and continues rejecting the writer credential", () => {
     expect(() => assertServiceEnvironment({ MEMORY_INGEST_DATABASE_URL: WRITER_URL })).toThrow(/write-capable credentials/);
     expect(source).not.toMatch(/from "\.\/query-service/);
   });

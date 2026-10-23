@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { requestDiscoveryModel, modelLinkingObservations, restoreLinkingRefs, LINKING_REQUEST_VERSION, standardProviderFailureCode } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -7,8 +8,8 @@ const ROOT = process.cwd();
 const PROVIDER = "openrouter";
 const RUNNER_VERSION = "hhs-oversized-linker/0.1.0";
 const MODELS = [
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "nvidia/nemotron-3-super-120b-a12b:free"
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free"
 ];
 
 const runDirectory = flag("run-dir");
@@ -44,7 +45,7 @@ const validRefs = new Set(
 const existingAttempts = fs.readdirSync(runDirectory)
   .filter((name) =>
     name.startsWith("parent-link-attempt-")
-    && name.endsWith("-raw.json")
+    && /-(raw|error|output|request)\.json$/.test(name)
   )
   .map((name) => Number(name.split("-")[3]))
   .filter(Number.isFinite);
@@ -65,6 +66,8 @@ const systemPrompt = [
   "Do not rewrite, remove, combine, or invent observations.",
   "Your only task is to identify meaningful relationships among the existing observation_ref values.",
   "Prioritize relationships across different chunk prefixes, while also including important within-chunk relationships.",
+  "Return at most 48 high-value relationships. Existing within-chunk relationships are already retained separately; this is a sparse set of additional connections, not every possible pair.",
+  "Keep each payload to one short relationship explanation of at most 120 characters. Do not repeat observation statements or evidence.",
   "Preserve chronology, corrections, rejection, approval, dependency, implementation, production, supersession, and refinement relationships.",
   "Do not claim that an assistant proposal was approved unless an existing user-authored observation establishes approval.",
   "Return only valid JSON with exactly one top-level key named links.",
@@ -74,23 +77,35 @@ const systemPrompt = [
   "Do not include self-links or duplicate links."
 ].join("\n\n");
 
+const linkingObservations = modelLinkingObservations(merged.observations, 16);
+const issuedRefs = new Set(linkingObservations.map(row => row.observation_ref));
+fs.writeFileSync(attemptBase + '-request.json', JSON.stringify({ request_version: LINKING_REQUEST_VERSION,
+  retained_observations: merged.observations.length, linking_anchors: linkingObservations.length }) + '\n', { flag: 'wx' });
 const userPrompt =
+  "These are representative linking anchors selected across the source chunks. All other validated observations and existing within-chunk links are retained locally. Do not claim a complete relationship graph.\n\n"
+  +
   "Create the relationship graph for these validated observations:\n\n"
   + JSON.stringify({
     source_conversation_id:
       parentExchange.selection[0].source_conversation_id,
     title: parentExchange.selection[0].title,
-    observations: merged.observations
+    observations: linkingObservations
   });
 
 let result;
+const providerAttempts = [];
 for (const model of MODELS) {
   result = await callModel(model, systemPrompt, userPrompt);
-  if (result.ok) break;
+  if (result.ok) { providerAttempts.push({ model, category: 'content_received' }); break; }
+  providerAttempts.push({ model, ...result.error });
+  if (['provider_auth', 'provider_credit', 'provider_policy'].includes(standardProviderFailureCode([result.error]))) break;
   console.log("Moving on from " + model + ".");
 }
 
+fs.writeFileSync(attemptBase + '-provider-attempts.json', JSON.stringify({ attempts: providerAttempts }, null, 2) + '\n', { flag: 'wx' });
+
 if (!result?.ok) {
+  fs.writeFileSync(attemptBase + '-error.json', JSON.stringify({ ...(result?.error ?? { category: 'provider_error' }), attempts: providerAttempts }, null, 2) + '\n', { flag: 'wx' });
   console.error("STOP: all linker models failed.");
   process.exit(7);
 }
@@ -102,6 +117,11 @@ fs.writeFileSync(
 );
 console.log("MODEL USED:", result.model);
 console.log("raw response saved:", rawPath);
+if (result.data.choices?.[0]?.finish_reason === 'length') {
+  fs.writeFileSync(attemptBase + '-error.json', JSON.stringify({ category: 'output_truncated' }) + '\n', { flag: 'wx' });
+  console.error('STOP: truncated relationships cannot be accepted as complete.');
+  process.exit(8);
+}
 
 let candidate;
 try {
@@ -126,7 +146,7 @@ try {
 }
 
 const suppliedLinks = Array.isArray(candidate.links)
-  ? candidate.links
+  ? restoreLinkingRefs(candidate.links.filter(link => issuedRefs.has(link?.from_observation_ref) && issuedRefs.has(link?.to_observation_ref)), merged.observations)
   : [];
 const seen = new Set();
 const links = [];
@@ -233,6 +253,8 @@ fs.writeFileSync(
     runner_version: RUNNER_VERSION,
     attempt: attemptNumber,
     observations: merged.observations.length,
+    relationship_coverage: 'representative_anchors',
+    linking_anchors: linkingObservations.length,
     generated_links: links.length,
     validated: true
   }, null, 2) + "\n",
@@ -245,69 +267,8 @@ console.log("links:", finalOutput.links.length);
 console.log("DATABASE WRITES: NONE");
 
 async function callModel(model, system, user) {
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    console.log("Trying " + model + " - attempt " + attempt + "/3");
-    try {
-      const response = await fetch(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: "Bearer " + process.env.OPENROUTER_API_KEY,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: "system", content: system },
-              { role: "user", content: user }
-            ],
-            temperature: 0.1
-          })
-        }
-      );
-      const data = await response.json();
-      const error = data?.error;
-      const responseContent =
-        data?.choices?.[0]?.message?.content;
-
-      if (response.ok && !error && responseContent) {
-        return {
-          ok: true,
-          model,
-          data,
-          content: responseContent
-        };
-      }
-
-      const message = error?.message ?? ("HTTP " + response.status);
-      console.log("Model failed: " + message);
-      if (
-        attempt === 3
-        || !(
-          response.status === 429
-          || response.status === 502
-          || response.status === 503
-          || /overload|temporar|rate.?limit/i.test(message)
-        )
-      ) {
-        return { ok: false, model, error: data };
-      }
-    } catch (error) {
-      console.log("Request error: " + error.message);
-      if (attempt === 3) {
-        return {
-          ok: false,
-          model,
-          error: { message: error.message }
-        };
-      }
-    }
-
-    const waitMs = attempt * 5000;
-    console.log("Waiting " + waitMs / 1000 + "s before retry...");
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-  }
+  return requestDiscoveryModel(model, system, user, { env: { ...process.env,
+    HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS: process.env.HHS_RECONSTRUCTION_REQUEST_TIMEOUT_MS ?? '360000' }, fetch, maxTokens: 16384 });
 }
 
 function flag(name) {

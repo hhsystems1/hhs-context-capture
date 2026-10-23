@@ -2,8 +2,8 @@
  * Deterministic reconstruction control-plane read model.
  *
  * Conversation/evidence authority remains memory_v1. Workflow facts are
- * overlaid only from canonical persisted observations or explicitly validated
- * discovery receipts. This module performs no writes.
+ * overlaid from persisted discovery observations, validated discovery receipts,
+ * and immutable reconciliation/observation lineage. This module performs no writes.
  */
 import pg from "pg";
 import { sha256 } from "@hhs/memory-schema";
@@ -18,6 +18,15 @@ import {
 export const RECONSTRUCTION_INVENTORY_SCHEMA = "hhs-reconstruction-inventory/0.1.0";
 export const DEFAULT_RECONSTRUCTION_BATCH_SIZE = 10;
 export const EXPECTED_CLEAN_CORPUS_SIZE = 995;
+
+export function assertExpectedCleanCorpusSize(observed: number, expected: number): void {
+  if (!Number.isInteger(expected) || expected < 0) {
+    throw new Error("Expected corpus size must be a non-negative integer.");
+  }
+  if (observed !== expected) {
+    throw new Error(`Canonical clean corpus count mismatch: expected ${expected}, observed ${observed}.`);
+  }
+}
 
 export type EvidenceStatus = "healthy" | "evidence_incomplete";
 export type DiscoveryStatus = "unprocessed" | "pilot_discovery_processed" | "discovery_processed";
@@ -44,6 +53,7 @@ export interface CanonicalInventoryRow {
   nonempty_canonical_text_count: number;
   empty_canonical_text_count: number;
   persisted_observations_count: number;
+  reconciled_observations_count: number;
   persisted_links_count: number;
   persisted_first_processed_at: string | null;
   persisted_latest_processed_at: string | null;
@@ -82,6 +92,7 @@ export interface ReconstructionInventoryEntry {
   verification_status: string;
   discovery_status: DiscoveryStatus;
   observations_count: number;
+  reconciled_observations_count: number;
   links_count: number;
   processed: boolean;
   reconciliation_status: ReconciliationStatus;
@@ -145,11 +156,18 @@ export async function loadReconstructionInventory(
   receipts: DiscoveryReceipt[],
   generatedAt = new Date().toISOString(),
   batchSize = DEFAULT_RECONSTRUCTION_BATCH_SIZE,
-  pool: pg.Pool = createPool("reader")
+  pool: pg.Pool = createPool("reader"),
+  boundedStatusRead = false
 ): Promise<ReconstructionInventorySnapshot> {
   const ownsPool = arguments.length < 5;
   try {
-    const rows = await readOnlyTransaction(pool, workspaceId, (client) => loadCanonicalInventoryRows(client, workspaceId));
+    const rows = await readOnlyTransaction(pool, workspaceId, async (client) => {
+      if (boundedStatusRead) {
+        await client.query("set local statement_timeout = '5000ms'");
+        await client.query("set local lock_timeout = '2000ms'");
+      }
+      return loadCanonicalInventoryRows(client, workspaceId);
+    });
     return buildReconstructionInventory(workspaceId, rows, receipts, generatedAt, batchSize);
   } finally {
     if (ownsPool) await pool.end();
@@ -172,6 +190,7 @@ export async function loadCanonicalInventoryRows(client: DbClient, workspaceId: 
     nonempty_canonical_text_count: Number(row.nonempty_canonical_text_count),
     empty_canonical_text_count: Number(row.empty_canonical_text_count),
     persisted_observations_count: Number(row.persisted_observations_count),
+    reconciled_observations_count: Number(row.reconciled_observations_count),
     persisted_links_count: Number(row.persisted_links_count),
     persisted_first_processed_at: isoOrNull(row.persisted_first_processed_at),
     persisted_latest_processed_at: isoOrNull(row.persisted_latest_processed_at)
@@ -220,9 +239,6 @@ export function buildReconstructionInventory(
   if (!Number.isInteger(batchSize) || batchSize < 1) throw new Error("Batch size must be a positive integer.");
   const sourceIds = rows.map((row) => row.source_conversation_id);
   if (new Set(sourceIds).size !== rows.length) throw new Error("Canonical corpus contains duplicate source_conversation_id values.");
-  if (rows.length !== EXPECTED_CLEAN_CORPUS_SIZE) {
-    throw new Error(`Canonical clean corpus count mismatch: expected ${EXPECTED_CLEAN_CORPUS_SIZE}, observed ${rows.length}.`);
-  }
   const rowIds = new Set(sourceIds);
   for (const receipt of receipts) {
     const missing = receipt.source_conversation_ids.filter((id) => !rowIds.has(id));
@@ -249,6 +265,9 @@ export function buildReconstructionInventory(
     const artifactObservations = receipt?.observations_by_source[row.source_conversation_id] ?? 0;
     const artifactLinks = receipt?.links_by_source[row.source_conversation_id] ?? 0;
     const persisted = row.persisted_observations_count > 0;
+    // A reconciliation is distinct from discovery persistence and promotion.
+    // Require complete coverage; one reconciled observation cannot certify the rest.
+    const reconciled = persisted && row.reconciled_observations_count === row.persisted_observations_count;
     const processed = Boolean(receipt) || persisted;
     const observationsCount = persisted ? row.persisted_observations_count : artifactObservations;
     const linksCount = persisted ? row.persisted_links_count : artifactLinks;
@@ -273,7 +292,8 @@ export function buildReconstructionInventory(
       verification_status: row.verification_status,
       discovery_status: receipt ? "pilot_discovery_processed" : persisted ? "discovery_processed" : "unprocessed",
       observations_count: observationsCount, links_count: linksCount, processed,
-      reconciliation_status: persisted ? "reconciled" : receipt ? "awaiting_reconciliation" : "not_started",
+      reconciled_observations_count: row.reconciled_observations_count,
+      reconciliation_status: reconciled ? "reconciled" : processed ? "awaiting_reconciliation" : "not_started",
       evidence_issue: reasons.length > 0, evidence_issue_reason: reasons,
       batch_number: Math.floor(index / batchSize) + 1, batch_position: (index % batchSize) + 1,
       first_processed_at: persisted ? row.persisted_first_processed_at : receipt?.first_processed_at ?? null,
@@ -355,7 +375,7 @@ function summarize(conversations: ReconstructionInventoryEntry[], batches: Recon
     unprocessed: conversations.filter((row) => !row.processed).length,
     awaiting_reconciliation: conversations.filter((row) => row.reconciliation_status === "awaiting_reconciliation").length,
     observations_awaiting_reconciliation: conversations.filter((row) => row.reconciliation_status === "awaiting_reconciliation")
-      .reduce((sum, row) => sum + row.observations_count, 0),
+      .reduce((sum, row) => sum + row.observations_count - row.reconciled_observations_count, 0),
     reconciled: conversations.filter((row) => row.reconciliation_status === "reconciled").length,
     evidence_issues: evidenceIssues.length,
     zero_evidence: evidenceIssues.filter((row) => row.evidence_block_count === 0).length,
@@ -373,7 +393,7 @@ function nullableString(value: unknown): string | null { return value === null |
 function iso(value: unknown): string { return value instanceof Date ? value.toISOString() : String(value); }
 function isoOrNull(value: unknown): string | null { return value === null || value === undefined ? null : iso(value); }
 
-const CANONICAL_INVENTORY_SQL = `
+export const CANONICAL_INVENTORY_SQL = `
 with clean as (
   select c.source_conversation_id,c.conversation_id,c.title_representation->>'value' title,
     sv.source_family,sv.source_version_id,sv.capture_version_id,sv.verification_status,
@@ -395,17 +415,36 @@ with clean as (
   from clean cl left join memory_v1.messages m on m.workspace_id=$1 and m.conversation_id=cl.conversation_id
     and (m.source_version_id=cl.source_version_id or m.capture_version_id=cl.capture_version_id)
   group by cl.source_version_id
+), block_memberships as (
+  -- Keep the original source-version OR capture-version membership, deduplicated
+  -- when both identities match. Two equality joins avoid a corpus-wide pair scan.
+  select cl.source_version_id,b.content_block_id
+  from clean cl join memory_v1.content_blocks b
+    on b.workspace_id=$1 and b.source_version_id=cl.source_version_id
+  union
+  select cl.source_version_id,b.content_block_id
+  from clean cl join memory_v1.content_blocks b
+    on b.workspace_id=$1 and b.capture_version_id=cl.capture_version_id
 ), block_stats as (
   select cl.source_version_id,count(distinct b.content_block_id)::int evidence_block_count,
     count(*) filter(where rep->>'representation_kind'='canonical_text')::int canonical_text_representation_count,
     count(*) filter(where rep->>'representation_kind'='canonical_text' and length(rep->>'value')>0)::int nonempty_canonical_text_count,
     count(*) filter(where rep->>'representation_kind'='canonical_text' and length(rep->>'value')=0)::int empty_canonical_text_count
-  from clean cl left join memory_v1.content_blocks b on b.workspace_id=$1
-    and (b.source_version_id=cl.source_version_id or b.capture_version_id=cl.capture_version_id)
+  from clean cl left join block_memberships bm on bm.source_version_id=cl.source_version_id
+  left join memory_v1.content_blocks b on b.workspace_id=$1 and b.content_block_id=bm.content_block_id
   left join lateral jsonb_array_elements(b.representations) rep on true
   group by cl.source_version_id
 ), observation_stats as (
   select cl.conversation_id,count(distinct o.observation_id)::int persisted_observations_count,
+    count(distinct o.observation_id) filter(where exists (
+      select 1 from memory_v1.reconciliation_observations ro
+      join memory_v1.reconciliations r
+        on r.workspace_id=ro.workspace_id and r.reconciliation_id=ro.reconciliation_id
+        and r.pipeline_version=ro.pipeline_version
+      where ro.workspace_id=$1 and ro.workspace_id=o.workspace_id
+        and ro.observation_id=o.observation_id and ro.observation_pipeline_version=o.pipeline_version
+        and r.payload->>'temporal_status' is distinct from 'rejected'
+    ))::int reconciled_observations_count,
     min(o.created_at) persisted_first_processed_at,max(o.created_at) persisted_latest_processed_at
   from clean cl left join memory_v1.observations o on o.workspace_id=$1 and o.conversation_id=cl.conversation_id
   group by cl.conversation_id
@@ -419,6 +458,7 @@ with clean as (
 )
 select cl.*,ms.message_count,ms.user_message_count,ms.assistant_message_count,ms.first_message_at,ms.latest_message_at,
   bs.evidence_block_count,bs.canonical_text_representation_count,bs.nonempty_canonical_text_count,bs.empty_canonical_text_count,
-  os.persisted_observations_count,os.persisted_first_processed_at,os.persisted_latest_processed_at,ls.persisted_links_count
+  os.persisted_observations_count,os.reconciled_observations_count,
+  os.persisted_first_processed_at,os.persisted_latest_processed_at,ls.persisted_links_count
 from clean cl join message_stats ms using(source_version_id) join block_stats bs using(source_version_id)
 join observation_stats os using(conversation_id) join link_stats ls using(conversation_id)`;

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { modelDiscoveryExchange, restoreModelEvidenceRefs, requestDiscoveryModel } from "./reconstruction-provider.mjs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { jsonrepair } from "jsonrepair";
@@ -7,8 +8,8 @@ const ROOT = process.cwd();
 const PROVIDER = "openrouter";
 const RUNNER_VERSION = "hhs-oversized-nemotron-runner/0.1.0";
 const MODELS = [
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "nvidia/nemotron-3-super-120b-a12b:free"
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free"
 ];
 
 const runDirectory = flag("run-dir");
@@ -24,11 +25,12 @@ const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 
 const pending = manifest.chunks.find((chunk) => {
   const number = String(chunk.chunk_number).padStart(3, "0");
-  return !fs.existsSync(path.join(runDirectory, "chunk-" + number + "-output.json"));
+  return !fs.existsSync(path.join(runDirectory, "chunk-" + number + "-output.json"))
+    && !fs.existsSync(path.join(runDirectory, "chunk-" + number + "-model.json"));
 });
 
 if (!pending) {
-  console.log("ALL CHUNKS VALIDATED");
+  console.log("NO CHUNKS REQUIRE GENERATION; resume/revalidate cached artifacts through the oversized orchestrator.");
   process.exit(0);
 }
 
@@ -62,11 +64,14 @@ console.log("attempt:", attemptNumber);
 const systemPrompt = [
   "You are the semantic discovery worker for the HHS Company Reconstruction pipeline.",
   "Analyze this chronological CHUNK of one larger conversation.",
+  "Rows marked derived_fragment are partial exact views of one canonical evidence row; do not treat fragment boundaries as new messages. Cite only the issued evidence_ref. Do not invent fragment offsets or metadata.",
   "Extract every distinct, meaningful, evidence-supported observation in this chunk.",
   "Do not assume this chunk contains the beginning or end of the conversation.",
   "Preserve historical states, changes, corrections, rejected approaches, unresolved questions, and attribution.",
   "Never convert an assistant proposal into a user decision.",
   "A user decision, requirement, preference, instruction, rejection, approval, or commitment requires user-authored evidence.",
+  "When describing assistant planning, assistant inference, or assistant interpretation, do not phrase it as a user decision, requirement, preference, instruction, rejection, approval, or commitment unless cited user-authored evidence directly supports that claim.",
+  "If assistant-authored text refers to user preferences but no user-authored evidence supports the preference, describe it as assistant-inferred context or omit the unsupported preference clause.",
   "Use only evidence_ref values present in this child exchange.",
   "Return only valid JSON with no Markdown or surrounding prose.",
   "The object must contain exactly:",
@@ -78,6 +83,7 @@ const systemPrompt = [
   }),
   "Each observation requires observation_ref, source_conversation_id, observation_kind, statement, payload, attribution, confidence, and evidence.",
   "Every observation must repeat ALL required fields. Never inherit fields from a preceding observation.",
+  "Each element of observations[] must be one complete standalone observation object. Never split one observation across two adjacent JSON objects.",
   "The attribution object must contain both subject and claim_type.",
   "confidence must be a JSON number from 0 through 1.",
   "evidence must be a non-empty array of objects shaped exactly as { evidence_ref: valid_reference }.",
@@ -91,7 +97,7 @@ const systemPrompt = [
 
 const userPrompt =
   "Deeply digest this bounded conversation chunk and return the required discovery JSON:\n\n"
-  + JSON.stringify(exchange);
+  + JSON.stringify(modelDiscoveryExchange(exchange));
 
 let modelResult;
 
@@ -118,6 +124,12 @@ fs.writeFileSync(
 );
 console.log("MODEL USED:", modelResult.model);
 console.log("raw response saved:", rawPath);
+if (modelResult.data.choices?.[0]?.finish_reason === "length") {
+  fs.writeFileSync(errorPath, JSON.stringify({ category: "model_output_truncated", finish_reason: "length",
+    completion_tokens: modelResult.data.usage?.completion_tokens ?? null }) + "\n", { flag: "wx" });
+  console.error("STOP: truncated chunk output requires subdivision, not partial persistence.");
+  process.exit(11);
+}
 
 let output;
 let jsonRepaired = false;
@@ -133,6 +145,7 @@ try {
     fs.writeFileSync(
       errorPath,
       JSON.stringify({
+        category: "malformed_model_json",
         message: "Model response could not be repaired as JSON.",
         initial_cause: String(initialError),
         repair_cause: String(repairError)
@@ -185,6 +198,7 @@ for (const observation of output.observations ?? []) {
 }
 
 const normalizedStatements = new Map();
+output = restoreModelEvidenceRefs(output, exchange);
 
 for (const observation of output.observations ?? []) {
   const key =
@@ -281,13 +295,11 @@ if (validation.status !== 0) {
   process.exit(9);
 }
 
-fs.copyFileSync(
-  attemptOutputPath,
-  canonicalOutputPath,
-  fs.constants.COPYFILE_EXCL
-);
+const canonicalModelPath = path.join(runDirectory, "chunk-" + chunkNumber + "-model.json");
+if (fs.existsSync(canonicalModelPath)) throw new Error("Validated chunk receipt already exists; resume through the oversized orchestrator.");
+const temporaryModel = `${canonicalModelPath}.tmp-${process.pid}`;
 fs.writeFileSync(
-  path.join(runDirectory, "chunk-" + chunkNumber + "-model.json"),
+  temporaryModel,
   JSON.stringify({
     provider: PROVIDER,
     model: modelResult.model,
@@ -298,6 +310,11 @@ fs.writeFileSync(
   }, null, 2) + "\n",
   { flag: "wx" }
 );
+fs.renameSync(temporaryModel, canonicalModelPath);
+// Publish the canonical output last, after its validated attempt receipt exists.
+const temporaryOutput = `${canonicalOutputPath}.tmp-${process.pid}`;
+fs.copyFileSync(attemptOutputPath, temporaryOutput, fs.constants.COPYFILE_EXCL);
+fs.renameSync(temporaryOutput, canonicalOutputPath);
 
 console.log("CHUNK VALIDATED:", pending.chunk_number + "/" + pending.chunk_count);
 console.log("observations:", output.observations?.length ?? 0);
@@ -317,64 +334,7 @@ function nextAttemptNumber(directory, number) {
 }
 
 async function callModel(model, system, user) {
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    console.log("Trying " + model + " - attempt " + attempt + "/3");
-    try {
-      const response = await fetch(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: "Bearer " + process.env.OPENROUTER_API_KEY,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: "system", content: system },
-              { role: "user", content: user }
-            ],
-            temperature: 0.2
-          })
-        }
-      );
-      const data = await response.json();
-      const embeddedError = data?.error;
-      if (response.ok && !embeddedError) {
-        const responseContent = data?.choices?.[0]?.message?.content;
-        if (responseContent) {
-          return { ok: true, model, data, content: responseContent };
-        }
-      }
-
-      const message =
-        embeddedError?.message
-        ?? ("HTTP " + response.status);
-      console.log("Model failed: " + message);
-      const retryable =
-        response.status === 429
-        || response.status === 502
-        || response.status === 503
-        || /overload|temporar|rate.?limit/i.test(message);
-
-      if (!retryable || attempt === 3) {
-        return { ok: false, model, error: data };
-      }
-    } catch (error) {
-      console.log("Request error: " + error.message);
-      if (attempt === 3) {
-        return {
-          ok: false,
-          model,
-          error: { message: error.message }
-        };
-      }
-    }
-
-    const waitMs = attempt * 5000;
-    console.log("Waiting " + waitMs / 1000 + "s before retry...");
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-  }
+  return requestDiscoveryModel(model, system, user, { env: process.env, fetch, maxTokens: 8192 });
 }
 
 function flag(name) {

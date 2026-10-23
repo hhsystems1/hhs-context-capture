@@ -28,7 +28,7 @@ async function status(): Promise<void> {
   let databaseState: "ready" | "degraded";
   try {
     const store = new MissionControlStore(required("MEMORY_WORKSPACE_ID"), required("MEMORY_REPORT_DATABASE_URL"));
-    try { report = await store.snapshot(); databaseState = "ready"; } finally { await store.close(); }
+    try { report = await store.statusSummary(); databaseState = "ready"; } finally { await store.close(); }
   } catch { databaseState = "degraded"; }
   const memory = report?.memory as Record<string, number> | undefined;
   const operations = report?.operations as Array<Record<string, unknown>> | undefined;
@@ -49,8 +49,9 @@ async function status(): Promise<void> {
   for (const [name, item] of system) console.log(`${mark(item.state)} ${name}: ${item.detail}`);
   console.log("");
   console.log(`Latest operation: ${latest ? `${latest.operation_ref} · ${latest.status} · ${latest.last_successful_stage}` : "none"}`);
-  console.log(`Needs You: ${Number(report?.needs_you ?? 0)}`);
-  console.log(`Memory: ${Number(memory?.messages ?? 0)} messages · ${Number(memory?.blocks ?? 0)} blocks · ${Number(memory?.proposed ?? 0)} proposed · ${Number(memory?.approved ?? 0)} approved`);
+  console.log(`Needs You: ${!report ? "unavailable" : Number(report.needs_you ?? 0)}`);
+  console.log(`Review queue: ${!report ? "unavailable" : report.review_queue_state === "deferred_from_fast_status" ? "deferred from fast status" : "included"}`);
+  console.log(`Memory: ${!report ? "unavailable" : `${Number(memory?.messages ?? 0)} messages · ${Number(memory?.blocks ?? 0)} blocks · ${Number(memory?.proposed ?? 0)} proposed · ${Number(memory?.approved ?? 0)} approved`}`);
 }
 
 async function up(): Promise<void> {

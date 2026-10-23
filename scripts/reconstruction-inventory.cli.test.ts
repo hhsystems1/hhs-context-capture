@@ -154,6 +154,20 @@ describe("reconstruction inventory CLI receipt loading", () => {
     expect(result.stderr).not.toContain(NO_DATABASE_ENV);
   });
 
+  it("validates an explicit expected corpus size before opening the database", () => {
+    const result = runCli([
+      "report",
+      "--workspace",
+      "proof-workspace-5plus2-db",
+      "--expected-corpus-size",
+      "not-a-number"
+    ]);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/--expected-corpus-size must be a non-negative integer/);
+    expect(result.stderr).not.toContain(NO_DATABASE_ENV);
+  });
+
   it("still requires an explicit workspace and a known command", () => {
     expect(runCli(["report"]).stderr).toMatch(/--workspace is required/);
     expect(runCli(["reconcile", "--workspace", "proof-workspace-5plus2-db"]).stderr).toMatch(/Usage: reconstruction-inventory\.ts <json\|report>/);

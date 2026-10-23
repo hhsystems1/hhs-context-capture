@@ -1,14 +1,18 @@
 import fs from "node:fs";
+import { LINKING_REQUEST_VERSION, standardProviderFailureCode } from './reconstruction-provider.mjs';
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 const ROOT = process.cwd();
 const RUN_DIR = required("run-dir");
 const WORKSPACE = flag("workspace") ?? process.env.MEMORY_WORKSPACE_ID;
-const MAX_ATTEMPTS = Number(flag("max-attempts") ?? 2);
+const MAX_ATTEMPTS = Number(flag("max-attempts") ?? 3);
 const MAX_DEPTH = Number(flag("max-depth") ?? 3);
 const MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const PROVIDER = "openrouter";
+const OPERATION_ID = flag("operation-id");
+if (OPERATION_ID && !/^operation_[0-9a-f]{32}$/.test(OPERATION_ID)) throw new Error("Invalid operation identity");
+let stopCategory = "reconstruction_failed";
 const VERSION = "hhs-oversized-orchestrator/0.1.0";
 
 if (!WORKSPACE) throw new Error("--workspace or MEMORY_WORKSPACE_ID is required.");
@@ -17,40 +21,86 @@ if (!Number.isInteger(MAX_ATTEMPTS) || MAX_ATTEMPTS < 1) throw new Error("Invali
 if (!Number.isInteger(MAX_DEPTH) || MAX_DEPTH < 1) throw new Error("Invalid --max-depth.");
 
 console.log("=== RESUMABLE OVERSIZED RECONSTRUCTION ===");
-processRun(RUN_DIR, 0);
-finalize(RUN_DIR);
+try {
+  processRun(RUN_DIR, 0);
+  stopCategory = "reconstruction_failed";
+  finalize(RUN_DIR);
+} catch (error) {
+  if (OPERATION_ID) {
+    const source = read(path.join(RUN_DIR, "manifest.json")).source_conversation_id;
+    writeIfMissing(path.join(RUN_DIR, "failure-" + OPERATION_ID + ".json"), {
+      workspace: WORKSPACE, operation_id: OPERATION_ID, source_conversation_id: source,
+      failure_code: stopCategory, recorded_at: new Date().toISOString()
+    });
+  }
+  throw error;
+}
 console.log("DATABASE WRITES: NONE");
 
 function processRun(directory, depth) {
   const manifest = read(path.join(directory, "manifest.json"));
   for (const chunk of manifest.chunks) {
+    stopCategory = "reconstruction_failed";
     const number = pad(chunk.chunk_number);
     const output = path.join(directory, `chunk-${number}-output.json`);
-    if (fs.existsSync(output)) {
+    if (resumeValidatedOutput(directory, `chunk-${number}`, path.join(directory, chunk.input_file))) {
       console.log(`SKIP ${chunk.chunk_number}/${chunk.chunk_count}`);
       continue;
     }
 
+    let remainingAttempts = Math.max(0, MAX_ATTEMPTS - attempts(directory, number));
     while (
       !fs.existsSync(output)
-      && attempts(directory, number) < MAX_ATTEMPTS
+      && remainingAttempts-- > 0
     ) {
       const result = run(process.execPath, [
         "scripts/run-oversized-chunk-nemotron.mjs", "--run-dir", directory
       ]);
-      if (result.status === 0 && fs.existsSync(output)) break;
-      if (result.status !== 8) {
+      if (result.status === 0 && resumeValidatedOutput(directory, `chunk-${number}`, path.join(directory, chunk.input_file))) break;
+      stopCategory = chunkFailureCategory(directory, number);
+      if (result.status === 11) break; // truncation requests immediate evidence-preserving subdivision
+      if (![8, 9].includes(result.status)) {
         throw new Error(`Chunk ${number} stopped with exit ${result.status}; review required.`);
+      }
+
+      if (result.status === 8) {
+        console.error(
+          `Chunk ${number} returned unrecoverable model JSON; preserving attempt and retrying/splitting.`
+        );
+      }
+
+      if (result.status === 9) {
+        console.error(
+          `Chunk ${number} failed trusted validation; preserving attempt and retrying/splitting.`
+        );
       }
     }
 
-    if (fs.existsSync(output)) continue;
+    if (resumeValidatedOutput(directory, `chunk-${number}`, path.join(directory, chunk.input_file))) continue;
 
+    stopCategory = chunkFailureCategory(directory, number);
     if (depth >= MAX_DEPTH) throw new Error(`Chunk ${number} reached split-depth limit.`);
     const subrun = prepareSubrun(directory, chunk, depth + 1);
     processRun(subrun, depth + 1);
+    stopCategory = "reconstruction_failed";
     merge(directory, chunk, subrun);
   }
+}
+
+function chunkFailureCategory(directory, number) {
+  const pattern = new RegExp("^chunk-" + number + "-attempt-(\\d+)-(?:openrouter-raw|output|error)\\.json$");
+  const ids = fs.readdirSync(directory).map(name => name.match(pattern)?.[1]).filter(Boolean).map(Number);
+  const latest = Math.max(0, ...ids);
+  const base = path.join(directory, "chunk-" + number + "-attempt-" + pad(latest));
+  if (fs.existsSync(base + "-openrouter-raw.json") && read(base + "-openrouter-raw.json").choices?.[0]?.finish_reason === "length") return "model_output_truncated";
+  if (fs.existsSync(base + "-error.json")) {
+    const error = read(base + "-error.json");
+    if (error.category === 'provider_error' && [502, 503, 504].includes(error.provider_error_code ?? error.http_status)) return 'provider_unavailable';
+    if (["model_output_truncated", "malformed_model_json", "request_timeout", "source_deadline", "rate_limited", "provider_unavailable", "incomplete_response"].includes(error.category)) return error.category;
+    if (error.message === "Model response could not be repaired as JSON.") return "malformed_model_json";
+    return "reconstruction_failed"; // An unrecognized provider/runtime error is not evidence validation.
+  }
+  return fs.existsSync(base + "-output.json") ? "evidence_validation" : "reconstruction_failed";
 }
 
 function prepareSubrun(directory, chunk, depth) {
@@ -58,18 +108,18 @@ function prepareSubrun(directory, chunk, depth) {
   const subrun = path.join(directory, `chunk-${number}-subrun`);
   if (fs.existsSync(path.join(subrun, "manifest.json"))) return subrun;
   const input = path.join(directory, chunk.input_file);
-  const target = Math.max(12000, Math.floor(chunk.evidence_characters / 2));
+  const target = Math.max(1024, Math.floor(chunk.evidence_characters / 2));
   const result = capture("npx", [
     "tsx", "--env-file=.env.memory-v1.local",
     "scripts/understanding-discovery.ts", "export-chunks",
     "--workspace", WORKSPACE, "--exchange", input,
-    "--max-evidence-characters", String(target)
+    "--max-evidence-characters", String(target), "--subdivide-messages"
   ]);
   const bundle = JSON.parse(result.stdout);
   if (bundle.chunks.length < 2) {
-    throw new Error(`Chunk ${number} is one unsplittable message; quarantined.`);
+    throw new Error(`Chunk ${number} is one unsplittable evidence view; quarantined.`);
   }
-  fs.mkdirSync(subrun);
+  fs.mkdirSync(subrun, { recursive: true });
   write(path.join(subrun, "parent-input.json"), bundle.parent_exchange);
   const selection = bundle.parent_exchange.selection?.[0];
   const manifest = {
@@ -127,19 +177,18 @@ function merge(directory, chunk, subrun) {
     exchange_id: parent.exchange_id, observations, links
   });
   validate(parentInput, merged);
-  copy(merged, path.join(directory, `chunk-${number}-output.json`));
   writeIfMissing(path.join(directory, `chunk-${number}-model.json`), {
     provider: PROVIDER, model: MODEL, runner_version: VERSION,
     composition: `${manifest.chunk_count} automatically validated subchunks`,
     merged_artifact: path.basename(merged), validated: true
   });
-  console.log(`PROMOTED ${chunk.chunk_number}/${chunk.chunk_count}`);
+  copy(merged, path.join(directory, `chunk-${number}-output.json`));
+  console.log(`CHUNK ASSEMBLED ${chunk.chunk_number}/${chunk.chunk_count}`);
 }
 
 function finalize(directory) {
-  const finalOutput = path.join(directory, "parent-output.json");
-  if (fs.existsSync(finalOutput)) return;
   const parentInput = path.join(directory, "parent-input.json");
+  if (resumeValidatedOutput(directory, "parent", parentInput)) return;
   const parent = read(parentInput);
   const manifest = read(path.join(directory, "manifest.json"));
   const merged = path.join(directory, "parent-deterministic-merged-output.json");
@@ -168,35 +217,124 @@ function finalize(directory) {
   }
   validate(parentInput, merged);
   for (let index = linkerAttempts(directory); index < MAX_ATTEMPTS; index += 1) {
+    const existingErrors = new Set(fs.readdirSync(directory).filter(name => /^parent-link-attempt-\d+-error\.json$/.test(name)));
     const result = run(process.execPath, [
       "scripts/run-oversized-linker-nemotron.mjs", "--run-dir", directory
     ]);
-    if (result.status === 0 && fs.existsSync(finalOutput)) return;
-    if (result.status !== 8) throw new Error(`Linker stopped with exit ${result.status}.`);
+    if (result.status === 0 && resumeValidatedOutput(directory, "parent", parentInput)) return;
+    // Classify only diagnostics created by this call. A stale provider error
+    // cannot turn a later spawn/validation/unknown failure into a safe retry.
+    const freshErrors = fs.readdirSync(directory).filter(name => /^parent-link-attempt-\d+-error\.json$/.test(name) && !existingErrors.has(name));
+    stopCategory = "reconstruction_failed";
+    if (freshErrors.length === 1) {
+      const failure = read(path.join(directory, freshErrors[0]));
+      stopCategory = standardProviderFailureCode(failure.attempts ?? [failure]) ?? "reconstruction_failed";
+    }
+    if (![8, 9].includes(result.status)) throw new Error(`Linker stopped with exit ${result.status}.`);
   }
   throw new Error("Linker attempt limit reached.");
 }
 
-function validate(exchange, output) {
+function validate(exchange, output, model = MODEL, version = VERSION) {
   const result = run("npx", [
     "tsx", "--env-file=.env.memory-v1.local",
     "scripts/understanding-discovery.ts", "validate",
+    "--workspace", WORKSPACE,
     "--exchange", exchange, "--output", output,
-    "--provider", PROVIDER, "--model", MODEL,
-    "--runner-version", VERSION
+    "--provider", PROVIDER, "--model", model,
+    "--runner-version", version
   ]);
-  if (result.status !== 0) throw new Error(`Validation failed: ${output}`);
+  if (result.status !== 0) {
+    stopCategory = "evidence_validation";
+    throw new Error(`Validation failed: ${output}`);
+  }
+}
+
+// Revalidate cached artifacts before skipping. Recover a torn publication only
+// from its existing validated attempt/receipt; never guess a model or evidence.
+function resumeValidatedOutput(directory, prefix, input) {
+  const output = path.join(directory, `${prefix}-output.json`);
+  const modelFile = path.join(directory, `${prefix}-model.json`);
+  if (!fs.existsSync(output) && !fs.existsSync(modelFile)) {
+    // Revalidate exact preserved chunk attempts after a validator repair before
+    // spending another attempt or splitting. Parent linker policy is separate.
+    if (prefix === "parent") return false;
+    const pattern = new RegExp("^" + prefix + "-attempt-(\\d+)-openrouter-raw\\.json$");
+    for (const name of fs.readdirSync(directory).sort().reverse()) {
+      const match = name.match(pattern);
+      if (!match) continue;
+      const attempted = path.join(directory, prefix + "-attempt-" + match[1] + "-output.json");
+      if (!fs.existsSync(attempted)) continue;
+      const raw = read(path.join(directory, name));
+      if (typeof raw.model !== "string" || !raw.model.trim()) continue;
+      if (raw.error || raw.choices?.[0]?.finish_reason === "length" || raw.usage?.cost > 0) continue;
+      const version = "hhs-oversized-nemotron-runner/0.1.0";
+      const checked = run("npx", ["tsx", "--env-file=.env.memory-v1.local",
+        "scripts/understanding-discovery.ts", "validate", "--workspace", WORKSPACE,
+        "--exchange", input, "--output", attempted, "--provider", PROVIDER,
+        "--model", raw.model, "--runner-version", version]);
+      if (checked.status !== 0) continue;
+      writeIfMissing(modelFile, { provider: PROVIDER, model: raw.model, runner_version: version,
+        attempt: Number(match[1]), validated: true, recovered_from_attempt: true,
+        ...(typeof raw.json_repaired === "boolean" ? { json_repaired: raw.json_repaired } : {}) });
+      copy(attempted, output);
+      return true;
+    }
+    return false;
+  }
+  let receipt;
+  let source = output;
+  if (fs.existsSync(modelFile)) {
+    receipt = read(modelFile);
+    if (!fs.existsSync(output)) {
+      source = receipt.merged_artifact
+        ? path.join(directory, receipt.merged_artifact)
+        : path.join(directory, prefix === "parent"
+          ? `parent-link-attempt-${pad(receipt.attempt)}-output.json`
+          : `${prefix}-attempt-${pad(receipt.attempt)}-output.json`);
+    }
+  } else {
+    const pattern = prefix === "parent"
+      ? /^parent-link-attempt-(\d+)-raw\.json$/
+      : new RegExp(`^${prefix}-attempt-(\\d+)-openrouter-raw\\.json$`);
+    for (const name of fs.readdirSync(directory).sort()) {
+      const match = name.match(pattern);
+      if (!match) continue;
+      const attempted = path.join(directory, prefix === "parent"
+        ? `parent-link-attempt-${match[1]}-output.json`
+        : `${prefix}-attempt-${match[1]}-output.json`);
+      if (!fs.existsSync(attempted) || !fs.readFileSync(attempted).equals(fs.readFileSync(output))) continue;
+      const raw = read(path.join(directory, name));
+      const model = raw.model;
+      if (typeof model !== "string" || !model.trim()) continue;
+      receipt = { provider: PROVIDER, model, attempt: Number(match[1]), validated: true, recovered_from_attempt: true,
+        ...(typeof raw.json_repaired === "boolean" ? { json_repaired: raw.json_repaired } : {}),
+        runner_version: prefix === "parent" ? "hhs-oversized-linker/0.1.0" : "hhs-oversized-nemotron-runner/0.1.0" };
+      break;
+    }
+  }
+  if (receipt?.validated !== true || typeof receipt.model !== "string" || !receipt.model.trim()
+      || typeof receipt.runner_version !== "string" || !fs.existsSync(source)) {
+    throw new Error(`Incomplete validated model receipt for ${prefix}; review required.`);
+  }
+  validate(input, source, receipt.model, receipt.runner_version);
+  writeIfMissing(modelFile, receipt);
+  copy(source, output);
+  return true;
 }
 
 function attempts(directory, number) {
-  const pattern = new RegExp(`^chunk-${number}-attempt-(\\d+)-openrouter-raw\\.json$`);
+  const pattern = new RegExp(`^chunk-${number}-attempt-(\\d+)-(?:openrouter-raw|output)\\.json$`);
   return new Set(fs.readdirSync(directory).map((name) => name.match(pattern)?.[1]).filter(Boolean)).size;
 }
 function linkerAttempts(directory) {
-  return fs.readdirSync(directory).filter((name) => /^parent-link-attempt-\d+-raw\.json$/.test(name)).length;
+  // A concrete input-policy repair gets its own bounded budget. Old attempts
+  // remain immutable; even a torn request counts against this policy's budget.
+  return fs.readdirSync(directory).filter(name => /^parent-link-attempt-\d+-request\.json$/.test(name)
+    && read(path.join(directory, name)).request_version === LINKING_REQUEST_VERSION).length;
 }
 function run(command, args) {
-  return spawnSync(command, args, { cwd: ROOT, env: process.env, stdio: "inherit" });
+  return spawnSync(command, args, { cwd: ROOT, env: { ...process.env, MEMORY_WORKSPACE_ID: WORKSPACE }, stdio: "inherit" });
 }
 function capture(command, args) {
   const result = spawnSync(command, args, { cwd: ROOT, env: process.env, encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
@@ -204,6 +342,10 @@ function capture(command, args) {
   return result;
 }
 function write(file, value) {
+  if (fs.existsSync(file)) {
+    if (JSON.stringify(read(file)) !== JSON.stringify(value)) throw new Error(`Immutable artifact collision: ${file}`);
+    return;
+  }
   const temporary = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", { flag: "wx" });
   fs.renameSync(temporary, file);

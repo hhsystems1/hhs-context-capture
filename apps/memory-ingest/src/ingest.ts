@@ -3,6 +3,7 @@ import type pg from "pg";
 import { loadApprovedArchive, type ApprovedArchiveLocation, type CapturedMessage, type ContentBlock, type Representation, type VerifiedArchive } from "./archive.js";
 import { deterministicMessageRanges } from "./chunking.js";
 import { createPool, immutableInsert, readOnlyTransaction, transaction, type DbClient } from "./db.js";
+import { adaptCapture, CAPTURE_PIPELINE_VERSION } from "./capture-source-version.js";
 
 export class SimulatedInterruption extends Error { constructor() { super("Simulated interruption after committed checkpoint."); } }
 export class SimulatedFailure extends Error { constructor() { super("Simulated ingestion failure after committed checkpoint."); } }
@@ -12,6 +13,8 @@ export interface IngestOptions extends ApprovedArchiveLocation {
   retryOf?: { ingestionRunId: string; pipelineVersion: string };
   interruptAfterChunks?: number;
   failAfterChunks?: number;
+  /** Existing pool injection permits an always-rolled-back database proof. */
+  pool?: pg.Pool;
 }
 export interface IngestResult {
   workspaceId: string;
@@ -27,13 +30,14 @@ export async function ingestApprovedCapture(options: IngestOptions): Promise<Ing
   const archive = await loadApprovedArchive(options);
   const ids = buildIds(options.workspaceId, options.pipelineVersion, archive);
   const ranges = deterministicMessageRanges(archive.normalized.messages);
-  const pool = createPool("writer");
+  const pool = options.pool ?? createPool("writer");
   try {
     const existing = await readOnlyTransaction(pool, options.workspaceId, async (client) =>
       (await client.query("select status from memory_v1.ingestion_runs where workspace_id=$1 and ingestion_run_id=$2 and pipeline_version=$3", [options.workspaceId, ids.run, options.pipelineVersion])).rows[0]);
     if (existing?.status === "completed") {
       await assertCompletion(pool, options.workspaceId, ids.run, options.pipelineVersion);
       await attestCompletedGeneration(pool, options.workspaceId, ids.run, options.pipelineVersion);
+      await publishCaptureSourceVersion(pool, archive, options, ids);
       return result(options, ids, true, ranges.length, ranges.length);
     }
 
@@ -63,14 +67,49 @@ export async function ingestApprovedCapture(options: IngestOptions): Promise<Ing
     });
     await assertCompletion(pool, options.workspaceId, ids.run, options.pipelineVersion);
     await attestCompletedGeneration(pool, options.workspaceId, ids.run, options.pipelineVersion);
+    await publishCaptureSourceVersion(pool, archive, options, ids);
     return result(options, ids, false, resumedFromChunk, ranges.length);
-  } finally { await pool.end(); }
+  } finally { if (!options.pool) await pool.end(); }
+}
+
+export async function ensureIngestWorkspace(client: DbClient, workspaceId: string): Promise<void> {
+  const prior = await client.query("select status from memory_v1.workspaces where workspace_id=$1", [workspaceId]);
+  if (prior.rowCount) {
+    if (prior.rows[0]?.status !== "active") throw new Error("Ingest workspace is not active.");
+    return; // Names and isolation keys belong to the existing workspace owner.
+  }
+  await immutableInsert(client, "workspaces", "workspace_id", immutable("workspace", workspaceId, workspaceId, {
+    workspace_id: workspaceId, name: "HHS Memory Vertical Slice V1", isolation_key: workspaceId, status: "active"
+  }));
+}
+
+// Publish discoverability only after the original ingest completion/attestation.
+async function publishCaptureSourceVersion(pool: pg.Pool, archive: VerifiedArchive, options: IngestOptions, ids: ReturnType<typeof buildIds>) {
+  if (archive.normalized.platform.id !== "chatgpt") return;
+  await transaction(pool, options.workspaceId, client => publishCaptureSourceVersionFromClient(client, archive, options, ids));
+}
+export async function publishCaptureSourceVersionFromClient(client: DbClient, archive: VerifiedArchive, options: IngestOptions, ids = buildIds(options.workspaceId, options.pipelineVersion, archive)) {
+  const { bundle } = adaptCapture(archive.normalized, {
+    workspaceId: options.workspaceId, manifestSha256: archive.manifestSha256,
+    sourceSystemId: ids.system, sourceAccountId: ids.account, ingestionRunId: ids.run
+  });
+  const version = bundle.source_versions[0]!;
+  const prior = await client.query("select content_sha256,capture_version_id,source_family from memory_v1.source_versions where workspace_id=$1 and source_version_id=$2", [options.workspaceId, version.source_version_id]);
+  if (prior.rowCount) {
+    if (prior.rows[0]?.content_sha256 !== archive.manifestSha256 || prior.rows[0]?.capture_version_id !== ids.capture || prior.rows[0]?.source_family !== "browser_capture") throw new Error("Capture source-version identity collision.");
+    return version.source_version_id;
+  }
+  // Reuse the verified source foundation; do not duplicate its source records.
+  const row = { ...version, source_record_id: ids.conversationSource, pipeline_version: CAPTURE_PIPELINE_VERSION,
+    source_container_sha256: null, created_at: version.source_observed_at };
+  await immutableInsert(client, "source_versions", "source_version_id", { ...row, record_sha256: sha256(row) });
+  return version.source_version_id;
 }
 
 async function persistSourceFoundation(pool: pg.Pool, archive: VerifiedArchive, options: IngestOptions, ids: ReturnType<typeof buildIds>, expectedChunks: number): Promise<void> {
   await transaction(pool, options.workspaceId, async (client) => {
     const n = archive.normalized;
-    await immutableInsert(client, "workspaces", "workspace_id", immutable("workspace", options.workspaceId, options.workspaceId, { workspace_id: options.workspaceId, name: "HHS Memory Vertical Slice V1", isolation_key: options.workspaceId, status: "active" }));
+    await ensureIngestWorkspace(client, options.workspaceId);
     const priorSystem = await client.query("select kind from memory_v1.source_systems where workspace_id=$1 and source_system_id=$2", [options.workspaceId, ids.system]);
     if (!priorSystem.rowCount) {
       await immutableInsert(client, "source_systems", "source_system_id", immutable("source_system", options.workspaceId, n.platform.id, { workspace_id: options.workspaceId, source_system_id: ids.system, kind: "ai_conversation_archive", adapter_contract: `${n.platform.id}/${n.capture.adapter_version}` }));

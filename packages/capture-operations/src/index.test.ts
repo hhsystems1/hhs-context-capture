@@ -59,3 +59,33 @@ describe("privacy and restart-safe cache", () => {
     expect(stored.operations[0]?.operation_id).toBe(base.operation_id);
   });
 });
+
+
+describe('safe capture-failure transport',()=>{
+ it('keeps only canonical stage/reason across the JSON boundary and existing metadata guard',async()=>{
+  const {captureFailure,safeCaptureFailure,captureStep}=await import('./index.js');
+  const original=captureFailure('collector_delivery','http_401');
+  const roundTrip={diagnostic:JSON.parse(JSON.stringify(original.diagnostic)),error:'PRIVATE transcript token'};
+  const diagnostic=safeCaptureFailure(roundTrip,'extension_channel');
+  expect(diagnostic).toMatchObject({stage:'collector_delivery',reason_code:'http_401',safe_error_code:'pairing_failed'});
+  expect(validateSafeMetadata(diagnostic)).toEqual(diagnostic);
+  await expect(captureStep('page_extraction',()=>{throw new TypeError('private content and URL');})).rejects.toMatchObject({diagnostic:{stage:'page_extraction',reason_code:'type_error'}});
+  expect(JSON.stringify(safeCaptureFailure(new Error('Bearer secret C:\\private\\text'),'page_extraction'))).not.toMatch(/Bearer|private|secret/);
+ });
+ it('rejects forged, extra and sensitive diagnostic fields rather than passing arbitrary error text',async()=>{
+  const {captureFailure,safeCaptureFailure}=await import('./index.js');
+  const original=captureFailure('collector_delivery','http_400').diagnostic;
+  for(const diagnostic of [{...original,stage:'C:\\private'},{...original,reason_code:'Bearer private'},{...original,safe_error_summary:'raw private detail'},{...original,transcript:'private'},{...original,safe_error_code:'anything'}]){
+   const safe=safeCaptureFailure({diagnostic},'extension_channel');expect(safe.reason_code).toBe('local_failure');expect(safe.stage).toBe('extension_channel');expect(validateSafeMetadata(safe)).toEqual(safe);
+  }
+ });
+});
+
+
+it('classifies actual DOMException instances and identity mismatch without raw browser error text',async()=>{
+ const {safeCaptureFailure,captureFailure}=await import('./index.js');
+ const dom=safeCaptureFailure(new DOMException('PRIVATE browser content','NotAllowedError'),'page_extraction');
+ expect(dom.reason_code).toBe('dom_error');expect(validateSafeMetadata(dom)).toEqual(dom);expect(JSON.stringify(dom)).not.toContain('PRIVATE');
+ const mismatch=safeCaptureFailure(captureFailure('identity_read','identity_mismatch'),'page_extraction');
+ expect(mismatch).toMatchObject({stage:'identity_read',reason_code:'identity_mismatch',safe_error_code:'identity_mismatch'});expect(validateSafeMetadata(mismatch)).toEqual(mismatch);
+});

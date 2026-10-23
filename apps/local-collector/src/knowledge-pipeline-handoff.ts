@@ -20,6 +20,9 @@ type Delivery = {
   handoff_id: string | null;
   parent_job_id: string | null;
   ingest_job_id: string | null;
+  source_version_id?: string;
+  source_conversation_id?: string;
+  delivered_at?: string;
 };
 
 type HandoffRecord = VerifiedCaptureHandoff & {
@@ -35,6 +38,7 @@ export function knowledgeHandoffIdempotencyKey(input: Pick<VerifiedCaptureHandof
 
 export class KnowledgePipelineHandoffOutbox {
   private readonly directory: string;
+  private deliveryTail: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: {
     archiveRoot: string;
@@ -44,8 +48,10 @@ export class KnowledgePipelineHandoffOutbox {
     requestedPipeline: string;
     maxDeliveryAttempts?: number;
     fetchImpl?: typeof fetch;
+    deliverImpl?: (record: VerifiedCaptureHandoff) => Promise<Record<string, unknown>>;
     now?: () => Date;
   }) {
+    if (options.deliverImpl && options.endpoint) throw new Error("Choose one capture handoff destination.");
     this.directory = path.join(options.archiveRoot, "operations", "knowledge-pipeline-handoffs");
   }
 
@@ -86,7 +92,7 @@ export class KnowledgePipelineHandoffOutbox {
       await this.write(file, record);
     }
 
-    return this.deliver(file, record);
+    return this.deliver(file);
   }
 
   async flush(): Promise<void> {
@@ -95,20 +101,47 @@ export class KnowledgePipelineHandoffOutbox {
     for (const name of files) {
       const file = path.join(this.directory, name);
       const record = JSON.parse(await readFile(file, "utf8")) as HandoffRecord;
+      if (record.workspace_id !== this.options.workspaceId || record.requested_pipeline !== this.options.requestedPipeline) continue;
       if (record.delivery.status === "delivered" || record.delivery.status === "delivery_failed") continue;
       if (record.delivery.next_attempt_at && Date.parse(record.delivery.next_attempt_at) > this.now().getTime()) continue;
-      await this.deliver(file, record);
+      await this.deliver(file);
     }
   }
 
-  private async deliver(file: string, record: HandoffRecord): Promise<HandoffRecord> {
+  private deliver(file: string): Promise<HandoffRecord> {
+    const delivery = this.deliveryTail.then(async () => this.deliverOnce(file, JSON.parse(await readFile(file, "utf8"))));
+    this.deliveryTail = delivery.catch(() => undefined);
+    return delivery;
+  }
+
+  async status() {
+    let names: string[];
+    try { names = await readdir(this.directory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
+    const records = await Promise.all(names.filter(name => /^[a-f0-9]{64}\.json$/.test(name)).map(async name => JSON.parse(await readFile(path.join(this.directory, name), "utf8")) as HandoffRecord));
+    const scoped = records.filter(record => record.workspace_id === this.options.workspaceId && record.requested_pipeline === this.options.requestedPipeline);
+    const latest = scoped.filter(record => record.delivery.status === "delivered" && record.delivery.source_conversation_id)
+      .sort((a, b) => (b.delivery.delivered_at ?? "").localeCompare(a.delivery.delivered_at ?? "") || a.capture_id.localeCompare(b.capture_id))[0];
+    return { configured: Boolean(this.options.deliverImpl || (this.options.endpoint && this.options.serviceToken)),
+      pending: scoped.filter(record => ["pending", "retrying"].includes(record.delivery.status)).length,
+      delivered: scoped.filter(record => record.delivery.status === "delivered").length,
+      failed: scoped.filter(record => record.delivery.status === "delivery_failed").length,
+      ...(latest ? { source_conversation_id: latest.delivery.source_conversation_id, source_version_id: latest.delivery.source_version_id } : {}) };
+  }
+
+  private async deliverOnce(file: string, record: HandoffRecord): Promise<HandoffRecord> {
     if (record.delivery.status === "delivered" || record.delivery.status === "delivery_failed") return record;
-    if (!this.options.endpoint || !this.options.serviceToken) return record;
+    if (!this.options.deliverImpl && (!this.options.endpoint || !this.options.serviceToken)) return record;
+    if (record.workspace_id !== this.options.workspaceId || record.requested_pipeline !== this.options.requestedPipeline) throw new Error("Capture handoff scope mismatch.");
 
     const attempts = record.delivery.attempts + 1;
     try {
-      const response = await (this.options.fetchImpl || fetch)(this.options.endpoint, {
+      let body: Record<string, unknown>;
+      if (this.options.deliverImpl) body = await this.options.deliverImpl(record);
+      else {
+      const response = await (this.options.fetchImpl || fetch)(this.options.endpoint!, {
         method: "POST",
+        signal: AbortSignal.timeout(30000), redirect: "error",
         headers: { authorization: `Bearer ${this.options.serviceToken}`, "content-type": "application/json" },
         body: JSON.stringify({
           capture_id: record.capture_id,
@@ -120,12 +153,16 @@ export class KnowledgePipelineHandoffOutbox {
           idempotency_key: record.idempotency_key,
         }),
       });
-      const body = await response.json() as Record<string, unknown>;
+      body = await response.json() as Record<string, unknown>;
       if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `HHS Core returned HTTP ${response.status}`);
+      }
       record.delivery = {
         status: "delivered", attempts, next_attempt_at: null, last_error: null,
         handoff_id: String(body.handoff_id || ""), parent_job_id: String(body.parent_job_id || ""),
         ingest_job_id: String(body.ingest_job_id || ""),
+        delivered_at: this.now().toISOString(),
+        ...(typeof body.source_version_id === "string" ? { source_version_id: body.source_version_id } : {}),
+        ...(typeof body.source_conversation_id === "string" ? { source_conversation_id: body.source_conversation_id } : {}),
       };
     } catch (error) {
       const max = this.options.maxDeliveryAttempts ?? 20;

@@ -166,6 +166,76 @@ describe("provider-neutral discovery validation", () => {
     expect(result.issues.some((issue) => issue.problem.includes("requires user-authored evidence"))).toBe(true);
   });
 
+  it("retains assistant pricing with a per-user billing unit without inventing user authority", () => {
+    const statement = "Business seats cost $25/user/month, requiring a two-seat minimum.";
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({
+      observation_kind: "pricing_detail", statement,
+      attribution: { subject: "assistant", claim_type: "pricing_information" },
+      evidence: [{ evidence_ref: "ev-assistant" }]
+    })]), TRUSTED_MODEL);
+    expect(result.issues).toEqual([]);
+    expect(result.valid?.observations[0]?.statement).toBe(statement);
+  });
+
+  it.each([
+    "Stephen decided to buy seats at $25/user/month.",
+    "The user requires a plan at $25/user/month.",
+    "The operator instructed the team to buy $25/user/month seats."
+  ])("still rejects explicit user authority beside a billing unit: %s", statement => {
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({
+      observation_kind: "pricing_detail", statement,
+      attribution: { subject: "assistant", claim_type: "pricing_information" },
+      evidence: [{ evidence_ref: "ev-assistant" }]
+    })]), TRUSTED_MODEL);
+    expect(result.issues.some(issue => issue.problem.includes("requires user-authored evidence"))).toBe(true);
+  });
+
+  it("still requires user evidence for a user-attributed purchase commitment", () => {
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({
+      observation_kind: "commitment", statement: "Buy seats at $25/user/month.",
+      attribution: { subject: "user", claim_type: "commitment" }, evidence: [{ evidence_ref: "ev-assistant" }]
+    })]), TRUSTED_MODEL);
+    expect(result.issues.some(issue => issue.problem.includes("requires user-authored evidence"))).toBe(true);
+  });
+
+  it.each([
+    "The assistant acknowledges relying on outdated saved context and making assumptions, which caused user frustration, and commits to resetting based on the user's current stack instead of older planning.",
+    "The assistant acknowledges pulling from older saved context and filling gaps with assumptions, which caused user frustration, and commits to resetting around the user's current stack instead of outdated planning.",
+    "The assistant commits to helping the user keep context current."
+  ])("retains assistant-owned commitments as assistant history: %s", statement => {
+    const item = observation({ observation_kind: "assistant self-correction", statement,
+      attribution: { subject: "assistant", claim_type: "self-correction" }, evidence: [{ evidence_ref: "ev-assistant" }] });
+    const original = JSON.stringify(item);
+    const result = validateDiscoveryOutput(EXCHANGE, output([item]), TRUSTED_MODEL);
+    expect(result.issues).toEqual([]);
+    expect(result.valid?.observations[0]?.statement).toBe(statement);
+    expect(JSON.stringify(item)).toBe(original);
+  });
+
+  it.each([
+    "The assistant acknowledges relying on old context, which caused user frustration, and commits to following what Stephen decided.",
+    "The assistant acknowledges relying on the user's decision, and commits to changing the stack.",
+    "The assistant acknowledges that the user is frustrated, and commits to changing the user's stack.",
+    "The assistant says Stephen commits to resetting the user's stack.",
+    "The assistant commits to implementing the user's requirements.",
+    "The assistant commits to carrying out the decision by Stephen.",
+    "Stephen as well as the assistant commits to resetting the stack.",
+    "The assistant commits together with Stephen to resetting the stack.",
+    "The assistant acknowledges relying on old context, which caused user frustration, and commits with the user to resetting the stack.",
+    "The assistant acknowledges relying on old context, and the user commits to changing the stack."
+  ])("does not exempt mixed or unresolved user authority under an assistant label: %s", statement => {
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({ observation_kind: "assistant self-correction", statement,
+      attribution: { subject: "assistant", claim_type: "self-correction" }, evidence: [{ evidence_ref: "ev-assistant" }] })]), TRUSTED_MODEL);
+    expect(result.issues.some(issue => issue.problem.includes("requires user-authored evidence"))).toBe(true);
+  });
+
+  it("keeps user-attributed commitments protected even when their statement names the assistant", () => {
+    const result = validateDiscoveryOutput(EXCHANGE, output([observation({ observation_kind: "commitment",
+      statement: "The assistant commits to helping the user keep context current.",
+      attribution: { subject: "user", claim_type: "commitment" }, evidence: [{ evidence_ref: "ev-assistant" }] })]), TRUSTED_MODEL);
+    expect(result.issues.some(issue => issue.problem.includes("requires user-authored evidence"))).toBe(true);
+  });
+
   it("does not mistake Product Direction for a user directive", () => {
     const result = validateDiscoveryOutput(EXCHANGE, output([observation({
       observation_kind: "team_structure",

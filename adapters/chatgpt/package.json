@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/adapter.ts",
     "./inventory": "./src/inventory-adapter.ts",
-    "./discovery": "./src/discovery-adapter.ts"
+    "./discovery": "./src/discovery-adapter.ts",
+    "./structure": "./src/structure.ts"
   },
   "dependencies": {
     "@hhs/canonical-schema": "*",
